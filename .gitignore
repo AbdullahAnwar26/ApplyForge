@@ -1,0 +1,46 @@
+# Python / Django
+backend/venv/
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+*.log
+.pytest_cache/
+
+# Collector runtime data (personal LinkedIn session + uploaded resumes -
+# never belongs in version control)
+backend/browser_profile/
+backend/media/
+
+# Node / React
+frontend/node_modules/
+frontend/dist/
+frontend/.npm/
+
+# Environment Variables
+.env
+.env.local
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# AI tooling configs / working files - not application source
+.claude/
+.cline/
+_bmad/
+_bmad-output/
+
+# Internal engineering journals - kept locally, not published
+PROJECT_CONTEXT.md
+docs/APPLYFORGE_END_STATE_AUDIT.md
+COMMIT_PLAN.md
+
+# One-off debug artifacts from manual troubleshooting
+backend/debug_page*.html
+backend/linkedin_search_debug*.html
+backend/post_identity_debug.txt
