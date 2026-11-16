@@ -124,6 +124,8 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "tracker",
+    # Integrated LinkedIn collector (Milestone 6). Calls tracker ingestion
+    # in-process; never makes HTTP requests to this backend.
     "collector",
     "corsheaders",
 ]
@@ -344,4 +346,53 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
+
+# ---------------------------------------------------------------------------
+# Application generation: local Ollama / Qwen only (no fallback provider).
+# OpenAI-compatible chat completions; thinking is always disabled.
+# The base URL must point at this machine (localhost / 127.0.0.1 / ::1).
+# ---------------------------------------------------------------------------
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.3"))
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "768"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+
+# Prompt input caps (characters). Ollama's default context window is small;
+# longer inputs are cut explicitly and reported instead of silently dropped.
+GENERATION_MAX_JD_CHARS = int(os.getenv("GENERATION_MAX_JD_CHARS", "6000"))
+GENERATION_MAX_RESUME_CHARS = int(os.getenv("GENERATION_MAX_RESUME_CHARS", "6000"))
+
+# ---------------------------------------------------------------------------
+# LinkedIn collector (Milestone 6). Runs are user-initiated and small.
+# ---------------------------------------------------------------------------
+
+COLLECTOR_DEFAULT_POSTS_PER_RUN = int(os.getenv("COLLECTOR_DEFAULT_POSTS_PER_RUN", "20"))
+COLLECTOR_MAX_POSTS_PER_RUN = int(os.getenv("COLLECTOR_MAX_POSTS_PER_RUN", "50"))
+
+# Local, per-user data kept OUTSIDE the repository (and outside OneDrive):
+# the browser profile holds the LinkedIn session; the debug folder holds
+# sanitized diagnostic HTML. Default: %LOCALAPPDATA%\ApplyForge\...
+_LOCAL_DATA_ROOT = Path(
+    os.getenv("LOCALAPPDATA") or (Path.home() / ".local" / "share")
+) / "ApplyForge"
+COLLECTOR_BROWSER_PROFILE_DIR = Path(
+    os.getenv("COLLECTOR_BROWSER_PROFILE_DIR", _LOCAL_DATA_ROOT / "browser_profile")
+)
+COLLECTOR_DEBUG_DIR = Path(os.getenv("COLLECTOR_DEBUG_DIR", _LOCAL_DATA_ROOT / "debug"))
+COLLECTOR_DEBUG_FILES_KEPT = int(os.getenv("COLLECTOR_DEBUG_FILES_KEPT", "5"))
+
+# Browser behaviour. Visible by default so the user can see what happens.
+# Pacing is a fixed, conservative rate limit (no randomisation).
+COLLECTOR_HEADLESS = env_bool("COLLECTOR_HEADLESS", False)
+COLLECTOR_ACTION_DELAY_SECONDS = float(os.getenv("COLLECTOR_ACTION_DELAY_SECONDS", "4"))
+COLLECTOR_PAGE_TIMEOUT_SECONDS = float(os.getenv("COLLECTOR_PAGE_TIMEOUT_SECONDS", "30"))
+COLLECTOR_MAX_SCROLLS_PER_KEYWORD = int(os.getenv("COLLECTOR_MAX_SCROLLS_PER_KEYWORD", "8"))
+COLLECTOR_LOGIN_TIMEOUT_SECONDS = int(os.getenv("COLLECTOR_LOGIN_TIMEOUT_SECONDS", "600"))
+
+# Post-attribute inventory (diagnostic, off by default). When enabled, one JSON
+# report of attribute NAMES and validated public post URNs is written to
+# COLLECTOR_DEBUG_DIR during a collection run. See collector/linkedin/inventory.py.
+COLLECTOR_ATTRIBUTE_INVENTORY = env_bool("COLLECTOR_ATTRIBUTE_INVENTORY", False)
 

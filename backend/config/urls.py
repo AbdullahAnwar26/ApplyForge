@@ -7,7 +7,9 @@ from django.urls import include, path
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/', include('tracker.api.urls')),
-    path('api/v1/collector/', include('collector.urls')),
+    # DEFERRED TO PHASE 6c: path('api/v1/collector/', include('collector.urls')).
+    # The collector app exists (Phase 6a) but has no API endpoints yet; use the
+    # `collect_linkedin` management command. See docs/PROJECT_SPEC.md.
 ]
 
 if settings.DEBUG:

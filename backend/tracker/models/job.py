@@ -16,6 +16,19 @@ class JobStatus(models.TextChoices):
     SKIPPED = 'SKIPPED', 'Skipped'
     APPLIED = 'APPLIED', 'Applied'
 
+class ScreeningOutcome(models.TextChoices):
+    """Automatic screening verdict. Kept separate from the user-driven JobStatus."""
+    SHORTLISTED = 'SHORTLISTED', 'Shortlisted'
+    REJECTED = 'REJECTED', 'Rejected'
+    NEEDS_REVIEW = 'NEEDS_REVIEW', 'Needs review'
+
+class ScreeningReason(models.TextChoices):
+    KEYWORD_MATCH = 'KEYWORD_MATCH', 'Keyword match'
+    NO_KEYWORD_MATCH = 'NO_KEYWORD_MATCH', 'No keyword match'
+    EXPERIENCE_ABOVE_LIMIT = 'EXPERIENCE_ABOVE_LIMIT', 'Experience above limit'
+    EXPERIENCE_UNKNOWN = 'EXPERIENCE_UNKNOWN', 'Experience unknown'
+    POSSIBLE_DUPLICATE = 'POSSIBLE_DUPLICATE', 'Possible duplicate'
+
 class JobOpportunity(models.Model):
     title = models.CharField(max_length=255, db_index=True)
     normalized_title = models.CharField(max_length=255, db_index=True)
@@ -40,6 +53,12 @@ class JobOpportunity(models.Model):
     status = models.CharField(max_length=50, choices=JobStatus.choices, default=JobStatus.DISCOVERED, db_index=True)
 
     contacts = models.ManyToManyField(Contact, related_name='jobs', blank=True)
+
+    # Screening results (migration 0008). NULL outcome = not screened yet.
+    screening_outcome = models.CharField(max_length=20, choices=ScreeningOutcome.choices, blank=True, null=True, db_index=True)
+    screening_reason = models.CharField(max_length=40, choices=ScreeningReason.choices, blank=True, null=True)
+    screening_details = models.JSONField(default=dict, blank=True)
+    screened_at = models.DateTimeField(blank=True, null=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
