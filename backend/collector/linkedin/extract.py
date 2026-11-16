@@ -10,7 +10,7 @@ synthetic pages.
 import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from lxml import html as lxml_html
 
@@ -212,6 +212,47 @@ def _post_url(container):
     return urn, (f"{S.BASE_URL}/feed/update/{urn}/" if urn else _permalink(container))
 
 
+def _is_internal_link(href):
+    if href.startswith("/") and not href.startswith("//"):
+        return True
+    parts = urlsplit(href)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and (host == "linkedin.com" or host.endswith(".linkedin.com"))
+
+
+def _belongs_to(element, container):
+    """True when ``element`` is part of ``container``'s own post: not inside a post
+    nested in it (a reshare) and not inside the post text (author-supplied links)."""
+    for ancestor in element.iterancestors():
+        if ancestor is container:
+            return True
+        view = ancestor.get("data-view-name")
+        if view == S.DVN_POST or view == "feed-commentary":
+            return False
+    return False
+
+
+def _encoded_link_urn(container, now=None):
+    """Current layout fallback: the post URN from percent-encoded LinkedIn links in
+    the post's own header/actions (seen on group posts, e.g. a ``...Urn=urn%3Ali%3A...``
+    query value). Only when exactly one plausible post URN is found; ambiguity or
+    anything implausible gives None rather than a possibly wrong URL."""
+    found = set()
+    for link in container.xpath(".//a[@href]"):
+        href = (link.get("href") or "").strip()
+        if "%" not in href or not _is_internal_link(href) or not _belongs_to(link, container):
+            continue
+        decoded = href
+        for _ in range(2):  # at most double-encoded
+            decoded = unquote(decoded)
+        for match in _URN.finditer(decoded):
+            found.add(f"urn:li:{_CANONICAL_TYPES[match.group(1).lower()]}:{match.group(2)}")
+    if len(found) != 1:
+        return None
+    urn = found.pop()
+    return urn if posted_at_from_urn(urn, now) is not None else None
+
+
 def _legacy_post(container, now):
     urn, url = _post_url(container)
     label = _field(container, S.POST_TIME)
@@ -309,6 +350,9 @@ def _sdui_post(container, now, author_name=None):
         or next((t for t, _in_actor in header), None)
 
     urn, url = _post_url(container)  # normally none in this layout
+    if url is None:
+        urn = _encoded_link_urn(container, now)  # group posts
+        url = f"{S.BASE_URL}/feed/update/{urn}/" if urn else None
     label = paragraphs[time_index][1] if time_index is not None else None
     posted_at = posted_at_from_urn(urn, now) if urn else None
     if posted_at is None and label is not None:
@@ -352,7 +396,7 @@ def _dvn_post(container, now):
     )
     return RawPost(
         text=text or fallback.text,
-        url=fallback.url,  # normally None: this layout exposes no post URL
+        url=fallback.url,  # normally None; group posts may carry an encoded URN
         author_name=fallback.author_name,
         author_headline=fallback.author_headline,
         posted_at=fallback.posted_at,
@@ -365,7 +409,8 @@ def extract_posts(html, now=None):
 
     Layouts, in order: legacy selectors; the current layout via its
     data-view-name hooks; the current layout via the "Feed post" heading.
-    Current-layout posts have no URL.
+    Current-layout posts have no URL, except group posts whose links carry an
+    encoded post URN (see _encoded_link_urn).
     """
     root = _parse(html)
     containers, build = _first(root, S.POST_CONTAINER), _legacy_post

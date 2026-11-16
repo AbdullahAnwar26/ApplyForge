@@ -581,8 +581,8 @@ most 5 posts. They wrote only to the scratch database
   - Company only from explicit evidence, never the author.
 - **Post URLs.**
   - None in normal search results; `componentkey` is opaque (inventory v2/v3).
-  - **Group posts** carry their post URN percent-encoded in links (seen 1 of 9):
-    a possible future URL source, not implemented.
+  - **Group posts** carry their post URN percent-encoded in links (seen 1 of 9);
+    recovered since 6c (see "Group-post URLs" below).
 - **Diagnostics.**
   - `collect_linkedin --inventory-only` and `--attribute-inventory` (inventory
     v3: attribute names, public post URNs, allowlisted structural values,
@@ -633,10 +633,26 @@ most 5 posts. They wrote only to the scratch database
   check-then-insert on the RUNNING row, not a database lock; fine for a single
   local user. Live LinkedIn has not been exercised through the API.
 
+### Group-post URLs [Verified offline; NOT yet verified on live LinkedIn]
+
+- Current layout only, and only when no `data-urn`/permalink exists:
+  `_encoded_link_urn` reads post URNs (`activity`, `ugcPost`, `share`) from
+  percent-encoded (up to double-encoded) **LinkedIn-internal** `<a href>` links
+  that belong to the post itself.
+- Ignored: links inside the post text (`feed-commentary`), links inside a nested
+  (reshared) `feed-full-update`, external or non-HTTPS links, other URN types.
+- Accepted only when exactly **one** distinct URN is found and its embedded
+  timestamp is plausible (2010 … now + 1 day); otherwise no URL (never a guess).
+- The URL becomes `https://www.linkedin.com/feed/update/<urn>/`, so dedupe and
+  ingestion match by URL; the URN also supplies `posted_at` for group posts,
+  which show no time label.
+- Limitation: the exact link shape is inferred from the inventory (attribute
+  `href`, method `url`, one URN in 3 links); fixtures use fictional shapes.
+
 ### Next phases
 
-- **Optional.** Post URLs for group posts, from the percent-encoded URN in their
-  links.
+- **Live check of group-post URLs** in the next authorised validation run
+  (scratch database, which first needs the `collector/0001` migration).
 
 ---
 
