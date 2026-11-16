@@ -396,3 +396,10 @@ COLLECTOR_LOGIN_TIMEOUT_SECONDS = int(os.getenv("COLLECTOR_LOGIN_TIMEOUT_SECONDS
 # COLLECTOR_DEBUG_DIR during a collection run. See collector/linkedin/inventory.py.
 COLLECTOR_ATTRIBUTE_INVENTORY = env_bool("COLLECTOR_ATTRIBUTE_INVENTORY", False)
 
+# Collector API (Phase 6c): synchronous runs with a strict cap (the request waits
+# for the browser), one run at a time; a RUNNING row older than the stale limit
+# (e.g. after a crash) no longer blocks new runs.
+COLLECTOR_API_DEFAULT_POSTS_PER_RUN = int(os.getenv("COLLECTOR_API_DEFAULT_POSTS_PER_RUN", "5"))
+COLLECTOR_API_MAX_POSTS_PER_RUN = int(os.getenv("COLLECTOR_API_MAX_POSTS_PER_RUN", "10"))
+COLLECTOR_STALE_RUN_MINUTES = int(os.getenv("COLLECTOR_STALE_RUN_MINUTES", "30"))
+

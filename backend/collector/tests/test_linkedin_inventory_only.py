@@ -4,7 +4,7 @@ collect_linkedin --inventory-only: one results page, one inventory report, exit.
 Offline only (fake browser, or real Chromium with every request served locally).
 Command tests are SimpleTestCase, so ANY database query raises - that is how
 "no database access" is enforced, not just asserted. Post parsing, payload
-building, validation, run_collection and ingest_job are additionally replaced
+building, validation, run recording, run_collection and ingest_job are additionally replaced
 by tripwires that fail the test if called.
 """
 
@@ -49,7 +49,9 @@ KEYWORD = "Python Backend Developer"
 POST = urn_for(seq=44)
 RESULTS = page(container_attrs=f'componentkey="expanded{POST}FeedType_MAIN"')
 TRIPWIRES = (
-    "collector.management.commands.collect_linkedin.run_collection",
+    "collector.management.commands.collect_linkedin.record_collection",
+    "collector.runs.record_collection",
+    "collector.runs.run_collection",
     "collector.service.run_collection",
     "collector.service.ingest_job",
     "tracker.ingestion.ingest_job",

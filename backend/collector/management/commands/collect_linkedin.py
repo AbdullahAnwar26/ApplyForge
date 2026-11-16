@@ -8,6 +8,9 @@ python manage.py collect_linkedin --inventory-only --keywords "<one keyword>" [-
 writes one post-attribute inventory report, and exits: no post parsing, no
 ingestion, no database access.
 
+Every collection is recorded as a CollectorRun (run history, Phase 6c);
+``--inventory-only`` records nothing.
+
 Collects recruiter hiring posts and ingests them through the existing tracker
 ingestion and screening (in-process, no HTTP). ``linkedin`` (default) drives
 a visible Chromium window with the session saved by ``linkedin_login``;
@@ -29,7 +32,9 @@ from collector.linkedin.browser import default_browser
 from collector.linkedin.source import LinkedInPostSource
 from collector.posts import _EMAIL as POST_EMAIL
 from collector.posts import _PHONE as POST_PHONE
-from collector.service import CollectionInputError, run_collection
+from collector.models import CollectorRunTrigger
+from collector.runs import record_collection
+from collector.service import CollectionInputError
 from collector.sources import JsonFilePostSource, SourceError
 
 SOURCES = ("linkedin", "file")
@@ -106,16 +111,19 @@ class Command(BaseCommand):
             keywords = [k for value in options["keywords"] for k in value.split(",")]
 
         try:
-            result = run_collection(source, keywords=keywords, profile=profile, limit=options["limit"])
-        except ScreeningInputError as exc:
-            raise CommandError(exc.message)
-        except CollectionInputError as exc:
-            raise CommandError(exc.message)
+            run, result = record_collection(
+                source, trigger=CollectorRunTrigger.COMMAND,
+                keywords=keywords, profile=profile, limit=options["limit"],
+            )
+        except (ScreeningInputError, CollectionInputError) as exc:
+            raise CommandError(f"{exc.message} (collector run {exc.run.pk} recorded as FAILED)")
 
         if options["json"]:
-            self._write(json.dumps(result.as_dict(), indent=2, ensure_ascii=False, default=str))
+            data = {"run_id": run.pk, "run_status": run.status, **result.as_dict()}
+            self._write(json.dumps(data, indent=2, ensure_ascii=False, default=str))
         else:
             self._report(result, options["verbosity"])
+            self._write(f"Collector run {run.pk}: {run.status}.")
         if options["attribute_inventory"]:
             self._report_inventory(source)
         if result.source_error:

@@ -99,7 +99,7 @@ These rules are fixed. Later milestones must not contradict them.
 |---|---|
 | `config/settings.py` | Env-driven settings. SQLite by default; PostgreSQL via `DATABASE_URL`. CORS for Vite dev ports. `API_TOKEN`. Celery/Redis. Logging. Production hardening when `DEBUG=False`. |
 | `config/celery.py` | Celery app with autodiscovery. No tasks exist yet. |
-| `config/urls.py` | `admin/` and `api/v1/` → `tracker.api.urls`. The `api/v1/collector/` route is **deferred to Phase 6c** (see §5). |
+| `config/urls.py` | `admin/`, `api/v1/` → `tracker.api.urls`, and (Phase 6c) `api/v1/collector/` → `collector.urls`. |
 | `tracker/models/` | `Profile`, `Skill`, `SkillCategory`, `Resume`, `Company`, `Contact`, `JobOpportunity`, `JobSource`, `JobStatus`, `ScreeningOutcome`, `ScreeningReason`, `Application`, `ApplicationStatus`, `ApplicationChannel`, `ApplicationEvent`. |
 | `tracker/migrations/` | `0001`–`0008`. **Milestone 3** added `0008_jobopportunity_screening` (four additive fields; see below). The models and migrations are consistent (`makemigrations --check` reports no changes). |
 | `tracker/admin.py` | Admin registrations for the models. |
@@ -110,7 +110,7 @@ These rules are fixed. Later milestones must not contradict them.
 | `tracker/applications.py` | **Milestone 4:** application creation, status-change rules and event recording. Reusable by generation (Milestone 5). |
 | `tracker/generation.py` | **Milestone 5:** local Ollama/Qwen client (stdlib `urllib`, loopback URLs only), grounded prompt, output parsing and validation, `generate_for_application`. |
 | `tracker/tests/` | `test_api_foundation.py` (M1), `test_profile_skill_api.py` and `test_resume_api.py` (M2), `test_screening.py` and `test_jobs_api.py` (M3), `test_applications_api.py` (M4), `test_generation.py` (M5), `test_linkedin_post_urls.py` (6a), `helpers.py`. 227 tests. |
-| `collector/` | **Milestone 6.** Phase 6a: registered app, `posts.py` (post parsing), `sources.py` (source interface, offline JSON-file and static sources), `service.py` (`run_collection`), `collect_linkedin` command. Phase 6b: `linkedin/` (`selectors.py`, `extract.py`, `diagnostics.py`, `browser.py`, `source.py`) and the `linkedin_login` command. `tests/` has 95 tests (synthetic fixtures; real Chromium only with offline request interception). No models, migrations or API yet. |
+| `collector/` | **Milestone 6.** Phase 6a: registered app, `posts.py` (post parsing), `sources.py` (source interface, offline JSON-file and static sources), `service.py` (`run_collection`), `collect_linkedin` command. Phase 6b: `linkedin/` (`selectors.py`, `extract.py`, `diagnostics.py`, `browser.py`, `source.py`) and the `linkedin_login` command. `tests/` (synthetic fixtures; real Chromium only with offline request interception). Phase 6c: `models.py` (`CollectorRun`), `migrations/0001_initial.py`, `runs.py` (`record_collection`), `api.py` + `urls.py` (`api/v1/collector/runs/`), `admin.py`. |
 
 Existing data-integrity constraints:
 
@@ -125,7 +125,6 @@ Existing data-integrity constraints:
 - **Verified live LinkedIn collection.** The Phase 6b browser source is
   implemented and tested offline only. Its selectors have not yet been checked
   against the real LinkedIn site.
-- The collector API with `CollectorRun` (Phase 6c). See §5.
 - Batch generation (Celery). Profile, skill and resume endpoints exist as of
   Milestone 2; jobs, ingestion, screening, companies and contacts as of
   Milestone 3; application tracking as of Milestone 4; single-application
@@ -593,10 +592,49 @@ most 5 posts. They wrote only to the scratch database
   jobs (ids 3 and 5) and one truncated text (id 2), before the fixes. They are
   left as evidence and are not production data.
 
+### Phase 6c — run history and API [Verified offline]
+
+- **Model** `collector.CollectorRun` (migration `collector/0001_initial`, one
+  additive table, depends on `tracker/0008`): `status` (RUNNING, SUCCEEDED,
+  PARTIAL, FAILED), `trigger` (command, api), `source`, `profile` (SET_NULL),
+  `keywords`, `limit`, `counts`, `job_ids` (created or matched), `error`,
+  `started_at`, `finished_at`. Run metadata only: no post text, authors,
+  headlines, URLs or contact details.
+- **Recording** (`collector/runs.py`, `record_collection`): wraps
+  `run_collection` unchanged. A RUNNING row is written before the source is
+  used and finished afterwards; both writes happen outside the browser session.
+  SUCCEEDED = no source error and no failed posts; PARTIAL = source failed after
+  some posts, or some posts failed to ingest; FAILED = invalid input, source
+  failed before any post, or an unexpected error (recorded, then re-raised).
+- **Command.** `collect_linkedin` records every collection (trigger `command`)
+  and prints the run id (`run_id`/`run_status` in `--json`). Exit behaviour is
+  unchanged. `--inventory-only` records nothing and still has no database access.
+- **API** (`/api/v1/collector/runs/`, token auth):
+  - `GET runs/` newest first; filters `status`, `trigger`, `profile`; optional
+    pagination. `GET runs/{id}/`. Runs are read-only (no PATCH/PUT/DELETE).
+  - `POST runs/` starts a LinkedIn run and waits for it. Body (all optional):
+    `keywords` (≤10 strings), `limit` (1..`COLLECTOR_API_MAX_POSTS_PER_RUN`, 10;
+    default `COLLECTOR_API_DEFAULT_POSTS_PER_RUN`, 5), `profile`. Unknown fields are rejected, so
+    there is no file source over HTTP. 201 SUCCEEDED; 502 PARTIAL/FAILED (with
+    `detail`; saved jobs are kept); 400 invalid input (with `run` when the
+    service recorded a FAILED run); 409 while another run is RUNNING; 500 for an
+    unexpected error (recorded FAILED; details only in the server log).
+    Throttle `collector-run` (6/min) on POST only.
+  - One run at a time: a per-process lock plus the RUNNING-row check. RUNNING
+    rows older than `COLLECTOR_STALE_RUN_MINUTES` (30) are marked FAILED
+    ("Abandoned") and stop blocking.
+- **Databases.** Applied to the development database `backend/db.sqlite3`
+  only (its first migration; it was empty). The scratch evidence database
+  (`%LOCALAPPDATA%\ApplyForge\live-test.sqlite3`) was **not** migrated and
+  has no `collector_collectorrun` table, so a guarded live run against it now
+  needs that migration (or another scratch database) first.
+- **Limitations.** API runs are synchronous: the request waits for the browser
+  (visible window unless `COLLECTOR_HEADLESS`). The cross-process guard is a
+  check-then-insert on the RUNNING row, not a database lock; fine for a single
+  local user. Live LinkedIn has not been exercised through the API.
+
 ### Next phases
 
-- **6c.** The `CollectorRun` model and migration, `api/v1/collector/runs/`
-  (throttle `collector-run`, strict limit), and restoring the URL include.
 - **Optional.** Post URLs for group posts, from the percent-encoded URN in their
   links.
 
@@ -611,7 +649,7 @@ most 5 posts. They wrote only to the scratch database
 | 3 | Ingestion and screening services: idempotent dedupe (rule 5), keyword relevance → experience eligibility → duplicates (rules 1–4), an additive migration for screening outcomes/reasons, and the jobs API | **Done (uncommitted in working tree)** |
 | 4 | Application tracking API: statuses, events, the manual-send workflow (rule 9), dashboard summary | **Done (uncommitted in working tree)** |
 | 5 | Generation via local Ollama/Qwen (rules 6–8, 10): grounded prompts, clear failure that changes only `last_error`, throttled endpoint, editable drafts, `SENT` → job `APPLIED` | **Done (uncommitted; verified with a simulated Ollama only)**. Batch generation through Celery is deferred. |
-| 6 | Integrated LinkedIn collector (rule 12): 6a parsing, service, command and offline tests; 6b Playwright browser source; 6c `CollectorRun` and API | **6a and 6b done (uncommitted):** browser source validated live into the scratch database and hardened. 6c pending. |
+| 6 | Integrated LinkedIn collector (rule 12): 6a parsing, service, command and offline tests; 6b Playwright browser source; 6c `CollectorRun` and API | **6a, 6b and 6c done:** browser source validated live into the scratch database and hardened; 6c run history and API verified offline. |
 | 7 | React + Vite frontend dashboard | Planned |
 | 8 | PostgreSQL as the default, deployment hardening, `.env.example` completeness | Planned |
 
