@@ -26,6 +26,7 @@ import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/Dialog";
 import { Field, FormErrors } from "../../components/Field";
+import { TechnicalDetails } from "../../components/TechnicalDetails";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyState, ErrorState, Skeleton } from "../../components/States";
 import { useToast } from "../../components/Toast";
@@ -284,7 +285,8 @@ function Overview({ application, job }: { application: ApplicationDetail; job: J
       </div>
       {application.last_error && (
         <div className="notice notice--error" role="note">
-          <strong>Last generation error:</strong> {application.last_error}
+          <strong>The last draft generation failed.</strong> Earlier drafts were kept.
+          <TechnicalDetails text={application.last_error} />
         </div>
       )}
       <dl className="details">

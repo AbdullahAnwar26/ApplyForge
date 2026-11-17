@@ -9,6 +9,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { useId, useState, type ReactNode } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 
+import { applicationKeys } from "../../api/applications";
 import { isApiError } from "../../api/errors";
 import { jobKeys, JOBS_PAGE_SIZE, listCompanies, listJobs, companyKeys, screenAllJobs } from "../../api/jobs";
 import { listSkills, skillKeys } from "../../api/resources";
@@ -129,6 +130,7 @@ function ScreenAllAction({ profile }: { profile: Profile }) {
     onSuccess: (result) => {
       setSummary(result);
       void queryClient.invalidateQueries({ queryKey: jobKeys.all });
+      void queryClient.invalidateQueries({ queryKey: applicationKeys.all }); // they show screening outcomes
       notify(`Screened ${result.screened} job${result.screened === 1 ? "" : "s"}`, "success");
     },
   });

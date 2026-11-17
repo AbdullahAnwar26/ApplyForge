@@ -1,6 +1,7 @@
 /** Plain-language explanations of collector run states, counts and start errors. */
 
 import { isApiError } from "../../api/errors";
+import { publicMessage } from "../../lib/diagnostics";
 import type { CollectorCounts, CollectorRunStatus } from "../../api/types";
 
 export const STATUS_EXPLANATION: Record<CollectorRunStatus, string> = {
@@ -22,13 +23,17 @@ export const COUNT_LABELS: { key: keyof CollectorCounts; label: string; help: st
   { key: "failed", label: "Failed", help: "Posts that could not be saved because of an error." },
 ];
 
-const MAX_ERROR_CHARS = 300;
+export const INTERNAL_ERROR_TEXT = "An internal error occurred; the details are in the backend log.";
 
-/** Run errors are shown as short plain text only. */
+/**
+ * A run error or post reason fit for the UI: the collector's own messages (e.g. "Not
+ * logged in to LinkedIn…", "1 post(s) failed to ingest.") are shown cleaned (no URLs or
+ * OS error codes); raw exception text ("OperationalError: …") is replaced by a plain
+ * explanation. Use <TechnicalDetails> next to it when the original is worth keeping.
+ */
 export function shortError(text: string | null | undefined): string | null {
-  if (!text) return null;
-  const clean = text.replace(/\s+/g, " ").trim();
-  return clean.length > MAX_ERROR_CHARS ? `${clean.slice(0, MAX_ERROR_CHARS)}…` : clean;
+  if (!text || !text.trim()) return null;
+  return publicMessage(text) ?? INTERNAL_ERROR_TEXT;
 }
 
 export interface StartProblem {

@@ -15,13 +15,15 @@ import { Link } from "react-router-dom";
 
 import { collectorKeys, DEFAULT_RUN_LIMIT, MAX_KEYWORDS, MAX_RUN_LIMIT, parseKeywords, startRun, validateRunInput } from "../../api/collector";
 import { isApiError } from "../../api/errors";
-import { jobKeys } from "../../api/jobs";
+import { companyKeys, jobKeys } from "../../api/jobs";
 import type { CollectorRun, CollectorRunInput, CollectorRunResult, Profile } from "../../api/types";
 import { useApi } from "../../auth/TokenProvider";
 import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { Dialog } from "../../components/Dialog";
 import { Field } from "../../components/Field";
+import { TechnicalDetails } from "../../components/TechnicalDetails";
+import { isExceptionText } from "../../lib/diagnostics";
 import { splitList } from "../../lib/format";
 import { RunCounts, RunOutcomes } from "./RunParts";
 import { describeStartError, shortError, STATUS_EXPLANATION } from "./runText";
@@ -136,7 +138,12 @@ function ResultView({ outcome, onRefresh }: { outcome: Finished; onRefresh: () =
           <Link to={`/collector/runs/${run.id}`}>View run details</Link>
         </div>
         <p className="muted">{STATUS_EXPLANATION[run.status]}</p>
-        {(detail || run.error) && <p className="notice notice--warning">{shortError(detail || run.error)}</p>}
+        {(detail || run.error) && (
+          <div className="notice notice--warning">
+            {shortError(detail || run.error)}
+            {isExceptionText(detail || run.error) && <TechnicalDetails text={detail || run.error} />}
+          </div>
+        )}
         <RunCounts counts={run.counts} />
         <RunOutcomes outcomes={outcomes} />
       </div>
@@ -176,6 +183,7 @@ export function StartRunPanel({ profile, runningRun, onRefresh }: { profile: Pro
   const finished = () => {
     void queryClient.invalidateQueries({ queryKey: collectorKeys.all });
     void queryClient.invalidateQueries({ queryKey: jobKeys.all });
+    void queryClient.invalidateQueries({ queryKey: companyKeys.all }); // runs can create companies (filters)
   };
 
   const mutation = useMutation({

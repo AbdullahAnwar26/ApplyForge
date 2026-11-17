@@ -16,6 +16,8 @@ import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyState, ErrorState, Skeleton } from "../../components/States";
+import { TechnicalDetails } from "../../components/TechnicalDetails";
+import { isExceptionText } from "../../lib/diagnostics";
 import { formatDateTime } from "../../lib/format";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
@@ -118,9 +120,10 @@ function RunContent() {
         </div>
         <p>{STATUS_EXPLANATION[data.status]}</p>
         {data.error && (
-          <p className="notice notice--warning">
+          <div className="notice notice--warning">
             <strong>Reported problem:</strong> {shortError(data.error)}
-          </p>
+            {isExceptionText(data.error) && <TechnicalDetails text={data.error} />}
+          </div>
         )}
         <RunCounts counts={data.counts} />
       </section>

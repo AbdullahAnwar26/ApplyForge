@@ -4,11 +4,12 @@
  * clicks "Screen"; the job status is the user's own decision.
  */
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useId, useState, type ReactNode } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
 
 import { isApiError } from "../../api/errors";
+import { applicationKeys } from "../../api/applications";
 import { companyKeys, getCompany, getJob, jobKeys, screenJob, updateJobStatus } from "../../api/jobs";
 import { listSkills, skillKeys } from "../../api/resources";
 import { JOB_STATUSES, type JobDetail, type JobStatus, type Profile, type ScreeningDetails } from "../../api/types";
@@ -26,6 +27,16 @@ import { RequireProfile } from "../../profile/ProfileControls";
 import { StartApplication } from "../applications/StartApplication";
 
 const DESCRIPTION_PREVIEW_CHARS = 1500;
+
+/**
+ * After a job status change or screening: every job query (lists, counts, other jobs'
+ * details whose duplicate candidates may change) and every application query
+ * (applications show the job's status and screening outcome).
+ */
+export function invalidateAfterJobChange(queryClient: QueryClient): void {
+  void queryClient.invalidateQueries({ queryKey: jobKeys.all });
+  void queryClient.invalidateQueries({ queryKey: applicationKeys.all });
+}
 
 /** Only http(s) links are ever rendered as links. */
 export function safeHttpUrl(value: string | null | undefined): string | null {
@@ -164,7 +175,7 @@ function ScreeningPanel({ job, profile }: { job: JobDetail; profile: Profile }) 
     mutationFn: () => screenJob(api, job.id, profile.id),
     onSuccess: (updated) => {
       queryClient.setQueryData(jobKeys.detail(job.id), updated);
-      void queryClient.invalidateQueries({ queryKey: jobKeys.lists() });
+      invalidateAfterJobChange(queryClient);
       const outcome = updated.screening_outcome ? SCREENING_OUTCOME[updated.screening_outcome].label : "Not screened";
       notify(`Screened: ${outcome}`, "success");
     },
@@ -232,7 +243,7 @@ function StatusControl({ job }: { job: JobDetail }) {
     mutationFn: (status: JobStatus) => updateJobStatus(api, job.id, status),
     onSuccess: (updated) => {
       queryClient.setQueryData(jobKeys.detail(job.id), updated);
-      void queryClient.invalidateQueries({ queryKey: jobKeys.lists() });
+      invalidateAfterJobChange(queryClient);
       notify(`Status: ${JOB_STATUS[updated.status].label}`, "success");
     },
   });

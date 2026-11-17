@@ -493,3 +493,26 @@
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
+
+/* --- Technical details (collapsed backend diagnostics) ---------------------------------- */
+.tech-details {
+  margin-top: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.tech-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.tech-details code {
+  display: block;
+  margin-top: var(--space-1);
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+}
