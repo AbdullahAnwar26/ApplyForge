@@ -1,0 +1,151 @@
+/*
+ * ApplyForge design tokens.
+ * Warm paper-like neutrals, an ink sidebar and a deep teal accent; status colours
+ * are shared by every badge, notice and indicator. Light by default, dark via the
+ * OS setting or data-theme="dark" on <html> (data-theme="light" forces light).
+ */
+:root {
+  color-scheme: light;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --sidebar-width: 232px;
+  --topbar-height: 56px;
+  --content-max: 1200px;
+
+  --bg: #f6f5f1;
+  --surface: #ffffff;
+  --surface-sunken: #efede7;
+  --surface-hover: #f3f1ec;
+  --text: #1d2126;
+  --text-muted: #5e646d;
+  --text-faint: #8a9099;
+  --border: #e1ded6;
+  --border-strong: #c9c5bb;
+  --shadow: 0 1px 2px rgb(29 33 38 / 6%), 0 6px 20px rgb(29 33 38 / 6%);
+  --overlay: rgb(16 19 24 / 45%);
+
+  --accent: #0f6e68;
+  --accent-hover: #0b5a55;
+  --accent-text: #ffffff;
+  --accent-soft: #e0f0ee;
+  --focus: #0f6e68;
+
+  --sidebar-bg: #171b21;
+  --sidebar-text: #c5cbd3;
+  --sidebar-muted: #8b939e;
+  --sidebar-hover: #222831;
+  --sidebar-active-bg: #263039;
+  --sidebar-active-text: #ffffff;
+  --sidebar-active-bar: #4fd1c5;
+
+  /* Status tones: soft background + readable text + solid dot. */
+  --neutral-bg: #eceae4;
+  --neutral-text: #4d535b;
+  --neutral-dot: #8a9099;
+  --info-bg: #e3edfb;
+  --info-text: #1f4f96;
+  --info-dot: #3576d6;
+  --success-bg: #e2f3e8;
+  --success-text: #1b6b3a;
+  --success-dot: #2c9a57;
+  --warning-bg: #fbf0d7;
+  --warning-text: #7c5300;
+  --warning-dot: #d29a14;
+  --danger-bg: #fbe5e3;
+  --danger-text: #a3231b;
+  --danger-dot: #d4473d;
+  --accent-bg: #dff0ee;
+  --accent-tone-text: #0b5a55;
+  --accent-dot: #13968d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111418;
+    --surface: #181c22;
+    --surface-sunken: #14171c;
+    --surface-hover: #1f242b;
+    --text: #e4e7eb;
+    --text-muted: #a0a7b1;
+    --text-faint: #767e89;
+    --border: #2a3038;
+    --border-strong: #3a424c;
+    --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px rgb(0 0 0 / 30%);
+    --overlay: rgb(0 0 0 / 60%);
+    --accent: #4fc4b9;
+    --accent-hover: #6fd6cc;
+    --accent-text: #0b1f1d;
+    --accent-soft: #163331;
+    --focus: #6fd6cc;
+    --sidebar-bg: #0c0f12;
+    --sidebar-hover: #171b21;
+    --sidebar-active-bg: #1d242c;
+    --neutral-bg: #252a31;
+    --neutral-text: #c0c6ce;
+    --info-bg: #182a44;
+    --info-text: #9fc2f5;
+    --success-bg: #15301f;
+    --success-text: #8fdcaa;
+    --warning-bg: #3a2d0f;
+    --warning-text: #f1cf7a;
+    --danger-bg: #3d1a18;
+    --danger-text: #ffa49c;
+    --accent-bg: #133331;
+    --accent-tone-text: #8ae0d6;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111418;
+  --surface: #181c22;
+  --surface-sunken: #14171c;
+  --surface-hover: #1f242b;
+  --text: #e4e7eb;
+  --text-muted: #a0a7b1;
+  --text-faint: #767e89;
+  --border: #2a3038;
+  --border-strong: #3a424c;
+  --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px rgb(0 0 0 / 30%);
+  --overlay: rgb(0 0 0 / 60%);
+  --accent: #4fc4b9;
+  --accent-hover: #6fd6cc;
+  --accent-text: #0b1f1d;
+  --accent-soft: #163331;
+  --focus: #6fd6cc;
+  --sidebar-bg: #0c0f12;
+  --sidebar-hover: #171b21;
+  --sidebar-active-bg: #1d242c;
+  --neutral-bg: #252a31;
+  --neutral-text: #c0c6ce;
+  --info-bg: #182a44;
+  --info-text: #9fc2f5;
+  --success-bg: #15301f;
+  --success-text: #8fdcaa;
+  --warning-bg: #3a2d0f;
+  --warning-text: #f1cf7a;
+  --danger-bg: #3d1a18;
+  --danger-text: #ffa49c;
+  --accent-bg: #133331;
+  --accent-tone-text: #8ae0d6;
+}
