@@ -11,8 +11,10 @@ from dotenv import load_dotenv
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load environment variables from project root .env file
-load_dotenv(BASE_DIR.parent / ".env")
+# Load environment variables from the project root .env file. Real environment
+# variables always win (override=False). APPLYFORGE_DOTENV can point elsewhere
+# (tests use a non-existent path to prove behaviour without any .env).
+load_dotenv(os.getenv("APPLYFORGE_DOTENV") or (BASE_DIR.parent / ".env"))
 
 # ---------------------------------------------------------------------------
 # Environment helpers
@@ -45,6 +47,45 @@ def env_list(name, default=None):
     ]
 
 
+def env_path(name, default):
+    """An absolute directory path from the environment, else ``default``.
+
+    Relative paths are refused: they would depend on the working directory of
+    whatever process (runserver, gunicorn, collectstatic) loads the settings.
+    """
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return Path(default)
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"{name} must be an absolute path (got {value!r}).")
+    return path
+
+
+def env_proxy_ssl_header(name):
+    """``SECURE_PROXY_SSL_HEADER`` from "HTTP_<HEADER>,<value>", or None when unset.
+
+    Only set this when the app is reachable exclusively through a reverse proxy
+    that terminates HTTPS and always sets/overwrites that header itself;
+    otherwise clients could forge it. Malformed values stop startup.
+    """
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if (
+        len(parts) != 2
+        or not parts[0].startswith("HTTP_")
+        or not parts[0][5:]
+        or not all(ch.isupper() or ch.isdigit() or ch == "_" for ch in parts[0])
+        or not parts[1]
+    ):
+        raise RuntimeError(
+            f"{name} must look like 'HTTP_X_FORWARDED_PROTO,https' (got {value!r})."
+        )
+    return (parts[0], parts[1])
+
+
 # ---------------------------------------------------------------------------
 # Security / environment
 # ---------------------------------------------------------------------------
@@ -54,7 +95,10 @@ SECRET_KEY = os.getenv(
     "django-insecure-local-development-key",
 )
 
-DEBUG = env_bool("DEBUG", True)
+# Fails closed: DEBUG is on only when explicitly enabled (DEBUG=True in the
+# environment or the local .env). Missing or unrecognised values mean False,
+# which also activates the production checks and hardening below.
+DEBUG = env_bool("DEBUG", False)
 
 if not DEBUG and SECRET_KEY == "django-insecure-local-development-key":
     raise RuntimeError(
@@ -89,6 +133,10 @@ if not DEBUG and API_TOKEN == "local-dev-token":
 
 CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", [])
 
+# Behind a trusted HTTPS reverse proxy, e.g. SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
+# (needed for SECURE_SSL_REDIRECT to work there). Unset = no forwarded header is trusted.
+SECURE_PROXY_SSL_HEADER = env_proxy_ssl_header("SECURE_PROXY_SSL_HEADER")
+
 # ---------------------------------------------------------------------------
 # Production-only hardening.
 #
@@ -106,7 +154,8 @@ if not DEBUG:
     SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(
         "SECURE_HSTS_INCLUDE_SUBDOMAINS", True
     )
-    SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", True)
+    # Preloading is hard to undo (browser preload lists); opt in explicitly.
+    SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", False)
     SECURE_CONTENT_TYPE_NOSNIFF = True
     X_FRAME_OPTIONS = "DENY"
 
@@ -277,9 +326,15 @@ USE_TZ = True
 # ---------------------------------------------------------------------------
 
 STATIC_URL = "static/"
+# Where `manage.py collectstatic` gathers static files (admin, DRF) for the
+# web server. Default: backend/staticfiles (git-ignored). Absolute paths only.
+STATIC_ROOT = env_path("STATIC_ROOT", BASE_DIR / "staticfiles")
 
 MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "media"
+# Uploaded resumes (personal data). Default for local development: backend/media
+# (git-ignored). In deployment point this at a persistent, backed-up volume.
+# Absolute paths only. Media is served by Django only when DEBUG=True.
+MEDIA_ROOT = env_path("MEDIA_ROOT", BASE_DIR / "media")
 
 
 # ---------------------------------------------------------------------------

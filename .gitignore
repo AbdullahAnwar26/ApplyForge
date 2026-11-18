@@ -15,6 +15,7 @@ backend/__pycache__/
 # never belongs in version control)
 backend/browser_profile/
 backend/media/
+backend/staticfiles/
 
 # Node / React
 frontend/node_modules/
