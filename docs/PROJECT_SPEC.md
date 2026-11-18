@@ -89,9 +89,10 @@ These rules are fixed. Later milestones must not contradict them.
   (`https://github.com/AbdullahAnwar26/ApplyForge.git`).
 - Python 3.12.10 virtual environment at the repository-root `.venv/` (ignored
   by `.gitignore`).
-- Dependencies are pinned in `backend/requirements.txt`: Django 5.0.3,
-  DRF 3.15.1, Celery 5.3.6, redis 5.0.3, psycopg2-binary, dj-database-url,
-  django-cors-headers, python-dotenv, pypdf, python-docx, playwright, and others.
+- Dependencies are pinned in `backend/requirements.txt`: Django 5.2.19 LTS,
+  DRF 3.18.3, Celery 5.3.6, redis 5.0.3, gunicorn 27.0.1, psycopg2-binary,
+  dj-database-url, django-cors-headers, python-dotenv, pypdf, python-docx,
+  playwright, and others (upgraded in Milestone 8.2).
 
 ### Backend (`backend/`)
 
@@ -99,7 +100,7 @@ These rules are fixed. Later milestones must not contradict them.
 |---|---|
 | `config/settings.py` | Env-driven settings. SQLite by default; PostgreSQL via `DATABASE_URL`. CORS for Vite dev ports. `API_TOKEN`. Celery/Redis. Logging. Production hardening when `DEBUG=False`. |
 | `config/celery.py` | Celery app with autodiscovery. No tasks exist yet. |
-| `config/urls.py` | `admin/`, `api/v1/` → `tracker.api.urls`, and (Phase 6c) `api/v1/collector/` → `collector.urls`. |
+| `config/urls.py` | `admin/`, `api/v1/health/` (Milestone 8.3, unauthenticated), `api/v1/` → `tracker.api.urls`, and (Phase 6c) `api/v1/collector/` → `collector.urls`. |
 | `tracker/models/` | `Profile`, `Skill`, `SkillCategory`, `Resume`, `Company`, `Contact`, `JobOpportunity`, `JobSource`, `JobStatus`, `ScreeningOutcome`, `ScreeningReason`, `Application`, `ApplicationStatus`, `ApplicationChannel`, `ApplicationEvent`. |
 | `tracker/migrations/` | `0001`–`0008`. **Milestone 3** added `0008_jobopportunity_screening` (four additive fields; see below). The models and migrations are consistent (`makemigrations --check` reports no changes). |
 | `tracker/admin.py` | Admin registrations for the models. |
@@ -132,8 +133,12 @@ Existing data-integrity constraints:
 - A live Ollama installation. Ollama was not installed on the development
   machine during Milestone 5, so generation is verified with a simulated
   Ollama only.
-- Frontend (`frontend/`).
 - `PROJECT_CONTEXT.md`. It is gitignored and was lost.
+- A deployed server. Milestone 8.4c added the deployment configuration and
+  runbook (`deploy/`), but nothing has been provisioned or deployed. Backups
+  and database restore (Milestone 8.4d) do not exist yet.
+
+The React + Vite frontend (`frontend/`) was added in Milestone 7.
 
 ### Screening fields (migration 0008, Milestone 3)
 
@@ -666,11 +671,56 @@ most 5 posts. They wrote only to the scratch database
 | 4 | Application tracking API: statuses, events, the manual-send workflow (rule 9), dashboard summary | **Done (uncommitted in working tree)** |
 | 5 | Generation via local Ollama/Qwen (rules 6–8, 10): grounded prompts, clear failure that changes only `last_error`, throttled endpoint, editable drafts, `SENT` → job `APPLIED` | **Done (uncommitted; verified with a simulated Ollama only)**. Batch generation through Celery is deferred. |
 | 6 | Integrated LinkedIn collector (rule 12): 6a parsing, service, command and offline tests; 6b Playwright browser source; 6c `CollectorRun` and API | **6a, 6b and 6c done:** browser source validated live into the scratch database and hardened; 6c run history and API verified offline. |
-| 7 | React + Vite frontend dashboard | Planned |
-| 8 | PostgreSQL as the default, deployment hardening, `.env.example` completeness | Planned |
+| 7 | React + Vite frontend dashboard | **Done** (frontend `17420d2`, integration hardening `16c2ba0`). |
+| 8 | Production readiness: settings hardening, dependency upgrades, health check, PostgreSQL, private deployment, backups | **8.1–8.3 done** (`ba57c62`). **8.4b** PostgreSQL rehearsal passed (PostgreSQL 18.6; all migrations, checks and 557 backend tests). **8.4c** private/VPN deployment configuration and runbook written; not yet used on a server. **8.4d** backup/restore: planned. |
 
 Order may be adjusted, but each milestone should leave `manage.py check`,
 `makemigrations --check` and the test suite passing.
+
+### Deployment: private/VPN server (Milestone 8.4c) [Configuration only; not yet deployed]
+
+The configuration and the full runbook are in `deploy/`; `deploy/README.md` is
+authoritative.
+
+- **Topology.** A single Linux host reachable only over a VPN, with these layers:
+  - **nginx** listens on the VPN address and allows only the VPN subnet. It
+    terminates HTTPS and serves the React build from the release's
+    `frontend/dist` (SPA fallback to `index.html`) and Django static files from
+    `STATIC_ROOT`. It proxies `/api/` to Gunicorn.
+  - **Gunicorn** listens on `127.0.0.1:8000`, with 1 `gthread` worker × 8
+    threads and a 900-second timeout. It runs under the sandboxed systemd unit
+    `applyforge`, as user `applyforge`.
+  - **PostgreSQL** runs on localhost. The first deployment starts from an empty
+    database.
+- **One worker on purpose.** The throttles (`LocMemCache`) and the collector
+  lock are per process.
+- **Configuration.**
+  - Settings come only from `/etc/applyforge/applyforge.env` (example:
+    `deploy/env.production.example`, placeholders only).
+  - `APPLYFORGE_DOTENV` points to a path that does not exist, so a development
+    `.env` is never loaded.
+  - `deploy/preflight.py` runs before the service starts and before every
+    management command, and refuses to continue on an unsafe configuration
+    (`DEBUG`, placeholder secrets, `.env` present, wrong proxy or HSTS
+    settings). It never touches the database.
+- **Edge rules.**
+  - `X-Forwarded-Proto` is overwritten with `https`, never appended.
+  - `/admin` and `/media` answer 404 at nginx.
+  - Uploads are capped at 12 MB at nginx; the application's resume limit is
+    10 MB.
+  - HSTS is one year, without `includeSubDomains` and without `preload`.
+- **Disabled features.** The collector (`POST /api/v1/collector/…`) and draft
+  generation (`POST /api/v1/applications/<id>/generate`) are disabled: nginx
+  answers 403 with a JSON `detail`, and the service may only reach localhost.
+  The 900-second timeouts are already configured for when these features are
+  deliberately enabled.
+- **Releases.**
+  - Each release goes in `/srv/applyforge/releases/<commit>` with its own
+    `.venv`; an atomic `current` symlink selects the active one.
+  - Media and static files live under `/var/lib/applyforge/`, outside the
+    releases.
+  - A code rollback switches the symlink back. It never restores or migrates
+    the database; that is a separate, explicit decision (Milestone 8.4d).
 
 ---
 

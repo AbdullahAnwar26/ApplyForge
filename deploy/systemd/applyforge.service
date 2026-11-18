@@ -1,0 +1,100 @@
+# ApplyForge API (Gunicorn) - private/VPN deployment, Milestone 8.4c.
+#
+# Install:  sudo install -m 0644 deploy/systemd/applyforge.service /etc/systemd/system/
+#           sudo systemctl daemon-reload
+# Logs:     journalctl -u applyforge
+# See deploy/README.md for the full runbook.
+#
+# Paths:
+#   /srv/applyforge/current          -> symlink to /srv/applyforge/releases/<commit>
+#                                       (code + per-release .venv; root-owned, read-only here)
+#   /etc/applyforge/applyforge.env   production settings and secrets (root:applyforge 0640)
+#   /var/lib/applyforge/media        uploaded resumes - the ONLY writable path
+#   /var/lib/applyforge/static       collected static files (written by collectstatic, not by this service)
+
+[Unit]
+Description=ApplyForge API (Gunicorn)
+Documentation=file:///srv/applyforge/current/deploy/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+# Stop retrying after 5 failed starts within 5 minutes (e.g. the preflight keeps
+# failing). With RestartSec=5 the default limit (5 per 10 s) would never trigger.
+# After fixing the cause: systemctl reset-failed applyforge && systemctl start applyforge
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=applyforge
+Group=applyforge
+WorkingDirectory=/srv/applyforge/current/backend
+
+# --- Environment -------------------------------------------------------------
+# Never load a development .env: settings.py reads the file named by
+# APPLYFORGE_DOTENV, and this path must not exist. The production env file sets
+# the same value; deploy/preflight.py refuses to start if it is missing, if the
+# named file exists, or if a .env is present in the release.
+Environment=APPLYFORGE_DOTENV=/nonexistent/applyforge-no-dotenv
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Values in the EnvironmentFile override the Environment= lines above.
+EnvironmentFile=/etc/applyforge/applyforge.env
+
+# Fail closed before Gunicorn starts: DEBUG must be explicitly false, secrets and
+# DATABASE_URL must be real values, HTTPS settings must match this deployment.
+# The preflight does not connect to the database.
+ExecStartPre=/srv/applyforge/current/.venv/bin/python /srv/applyforge/current/deploy/preflight.py
+ExecStart=/srv/applyforge/current/.venv/bin/gunicorn --config /srv/applyforge/current/deploy/gunicorn.conf.py
+
+# Restarts are full restarts (systemctl restart), never HUP reloads: a reload
+# would keep the old release's working directory.
+Restart=on-failure
+RestartSec=5
+# Longer than Gunicorn's graceful_timeout (120 s) so in-flight requests can finish.
+TimeoutStartSec=60
+TimeoutStopSec=150
+KillMode=mixed
+KillSignal=SIGTERM
+
+# --- Filesystem --------------------------------------------------------------
+UMask=0027
+ProtectSystem=strict
+ReadWritePaths=/var/lib/applyforge/media
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+
+# --- Privileges --------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+# --- Network -----------------------------------------------------------------
+# Gunicorn listens on 127.0.0.1 and PostgreSQL is expected on 127.0.0.1. With the
+# collector and generation disabled, the service needs no other network access, so
+# everything else is denied (this also blocks LinkedIn and remote Ollama). If the
+# database moves to another host, add its address to IPAddressAllow.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

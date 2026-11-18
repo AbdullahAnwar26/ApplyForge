@@ -1,0 +1,71 @@
+#!/bin/sh
+# Run a Django management command for one ApplyForge release, as the `applyforge`
+# user, with exactly the service's production environment - without ever loading
+# the secrets into an administrator's shell. Milestone 8.4c; see deploy/README.md.
+#
+# Usage (as root):
+#   applyforge-manage <release-dir> <manage.py arguments...>
+# Examples:
+#   applyforge-manage /srv/applyforge/releases/<commit> check --deploy
+#   applyforge-manage /srv/applyforge/releases/<commit> migrate --plan
+#   applyforge-manage /srv/applyforge/releases/<commit> collectstatic --noinput
+#
+# The release directory is explicit (not `current`) so a NEW release can be
+# checked, migrated and have its static files collected before traffic is
+# switched to it. deploy/preflight.py runs first; the command does not run if it fails.
+#
+# Sandbox: same environment file, dotenv guard and network restriction
+# (localhost only) as the service. Writable: STATIC_ROOT (collectstatic) and
+# MEDIA_ROOT only.
+set -eu
+
+ENV_FILE=/etc/applyforge/applyforge.env
+SERVICE_USER=applyforge
+WRITABLE="/var/lib/applyforge/static /var/lib/applyforge/media"
+
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 <release-dir> <manage.py arguments...>" >&2
+    exit 2
+fi
+if [ "$(id -u)" -ne 0 ]; then
+    echo "$0: run as root (sudo); the command itself runs as $SERVICE_USER." >&2
+    exit 2
+fi
+
+RELEASE=$(readlink -f -- "$1")
+shift
+case "$RELEASE" in
+    /srv/applyforge/releases/*) ;;
+    *) echo "$0: release must be under /srv/applyforge/releases/" >&2; exit 2 ;;
+esac
+PYTHON="$RELEASE/.venv/bin/python"
+if [ ! -x "$PYTHON" ] || [ ! -f "$RELEASE/backend/manage.py" ] || [ ! -f "$RELEASE/deploy/preflight.py" ]; then
+    echo "$0: $RELEASE is not a complete release (backend/, deploy/, .venv/)." >&2
+    exit 2
+fi
+if [ ! -f "$ENV_FILE" ]; then
+    echo "$0: $ENV_FILE is missing." >&2
+    exit 2
+fi
+
+run() {
+    systemd-run --quiet --pipe --wait --collect --service-type=exec \
+        --uid="$SERVICE_USER" --gid="$SERVICE_USER" \
+        -p WorkingDirectory="$RELEASE/backend" \
+        -p Environment=APPLYFORGE_DOTENV=/nonexistent/applyforge-no-dotenv \
+        -p Environment=PYTHONDONTWRITEBYTECODE=1 \
+        -p Environment=PYTHONUNBUFFERED=1 \
+        -p EnvironmentFile="$ENV_FILE" \
+        -p UMask=0022 \
+        -p NoNewPrivileges=yes \
+        -p PrivateTmp=yes \
+        -p ProtectHome=yes \
+        -p ProtectSystem=strict \
+        -p ReadWritePaths="$WRITABLE" \
+        -p IPAddressAllow=localhost \
+        -p IPAddressDeny=any \
+        "$PYTHON" "$@"
+}
+
+run "$RELEASE/deploy/preflight.py"
+run "$RELEASE/backend/manage.py" "$@"
