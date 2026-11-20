@@ -82,10 +82,11 @@ These are prepared outside this milestone. This runbook does not install or conf
 - **Server.** **Ubuntu 26.04 LTS** is the validated platform (Milestone 8.4e: systemd 259, nginx 1.28.3, PostgreSQL 18.6, age 1.2.1). Another current Ubuntu LTS or Debian stable host needs systemd ≥ 247 and nginx ≥ 1.19.4 (for `ssl_reject_handshake`), and the 8.4e checks repeated (`deploy/PRODUCTION_READINESS.md`).
 - **Python: the distribution's `python3`** (3.14.4 on Ubuntu 26.04; 3.12 or later is required) plus `python3-venv`. Ubuntu 26.04 has no `python3.12` package; don't install another interpreter. The full backend suite passes on 3.14.4 (Linux) and 3.12 (Windows development).
 - **Readiness check.** After provisioning, and before every deployment, run the read-only host check: `sudo python3 -I "$REL/deploy/host_check.py" --release "$REL"` (section 13.1).
-- **PostgreSQL 14 or later** on the same host, listening on `localhost` only. The Milestone 8.4b rehearsal used PostgreSQL 18.6.
+- **PostgreSQL 14 or later** on the same host, listening on `localhost` only, on the **default port 5432**. The Milestone 8.4b rehearsal used PostgreSQL 18.6. The backup tool runs `pg_dump`, `createdb`, `psql` and `pg_restore` with a scrubbed environment (no `PG*` variables) through the default Unix socket, so it reaches only a cluster on port 5432.
 - **A working VPN.** The server needs a fixed VPN address (example: `10.99.0.1`), and clients need a known subnet (example: `10.99.0.0/24`). The host firewall must not expose ports 80 or 443 on any public interface. nginx binds to the VPN address only, but the firewall is the primary control.
 - **Name resolution.** A private host name (example: `applyforge.vpn.example`) must resolve to the VPN address for VPN clients, through internal DNS or a hosts file.
 - **TLS certificate.** You need a certificate and key for that host name, typically from a private CA that the client devices trust. Install them as `/etc/ssl/applyforge/applyforge.crt` (`0644`) and `/etc/ssl/applyforge/applyforge.key` (`0600`, `root`).
+  - **The private CA must issue RFC 5280-conformant certificates.** The CA certificate needs `basicConstraints = critical, CA:TRUE` and `keyUsage = critical, keyCertSign, cRLSign`. The server certificate needs `subjectAltName = DNS:<host name>`, `extendedKeyUsage = serverAuth`, and subject/authority key identifiers. Strict clients reject a CA without `keyUsage`, even though curl and browsers may accept it: in the 8.4e rehearsal, Python 3.13+ failed with "CA cert does not include key usage extension". Check with `openssl verify -x509_strict -CAfile ca.crt applyforge.crt`.
 - **Admin workstation.** Git, Node.js LTS (to build the frontend) and `scp`/`ssh` access to the server over the VPN.
 
 Do **not** install Chromium or Playwright browsers, and do not run `playwright install`. Do not install Ollama, configure LinkedIn credentials or copy a browser profile to the server.
@@ -788,21 +789,54 @@ sudo ls -lR /var/lib/applyforge/media-restore-20261118 | head
 - **Release compatibility.** The manifest records the release that wrote the backup; run that release or a newer one.
 - **Data loss window.** Everything written after the backup's timestamp is missing.
 
-**Switching production** to restored data, including **transferring ownership**, is a future operational gate that is **separately authorized** and **never automated**:
+**Switching production** to restored data, including **transferring ownership**, is an operational gate that is **separately authorized** and **never automated**.
 
-1. Take a fresh backup of the current state.
-2. Stop ApplyForge.
-3. Transfer ownership deliberately, as `postgres`, for the one database being switched:
-   ```bash
-   sudo -u postgres psql -d applyforge_restore_20261118 -c 'REASSIGN OWNED BY applyforge_restore TO applyforge'
-   sudo -u postgres psql -c 'ALTER DATABASE applyforge_restore_20261118 OWNER TO applyforge'
-   ```
-   `REASSIGN OWNED` also reassigns **every other database** the restore role owns, so drop or separately review other restore databases first.
-4. Change the media ownership: `sudo chown -R applyforge:applyforge /var/lib/applyforge/media-restore-20261118`.
-5. Point `DATABASE_URL` and `MEDIA_ROOT` in `/etc/applyforge/applyforge.env` at the restored database and directory, leaving the old ones in place.
-6. Run the preflight and `migrate --plan` (section 7), then start the service and run the health checks (section 8.1).
+The switch works by **renaming**: the restored database becomes `applyforge` and the restored directory becomes `/var/lib/applyforge/media`, while the current ones are kept under `*-pre-restore-*` names. The environment file, the service sandbox and `backup.conf` therefore stay correct without edits.
 
-Keep the previous data until the switch has proven itself.
+> **Don't point `DATABASE_URL`/`MEDIA_ROOT` at the restored names instead.** The 8.4f dress rehearsal tested that approach, which an earlier version of this section described, and it fails on three counts:
+> - the service sandbox allows writes only to `/var/lib/applyforge/media`, so the preflight refuses to start (`MEDIA_ROOT is not writable by this user`);
+> - `backup.conf` keeps naming the old database and directory, so nightly backups would capture the abandoned data;
+> - the restored database has PostgreSQL's default PUBLIC rights.
+
+```bash
+STAMP=$(date -u +%Y%m%d_%H%M%S)
+NEW=applyforge_restore_20261118                    # the validated restore copy (database)
+NEWMEDIA=/var/lib/applyforge/media-restore-20261118 # the validated restore copy (media)
+
+# 1. A fresh backup of the current state (section 12.4), then stop backups and the service.
+sudo systemctl start applyforge-backup.service
+sudo systemctl stop applyforge-backup.timer applyforge
+
+# 2. REASSIGN OWNED also reassigns EVERY other database the restore role owns: this must list only $NEW.
+sudo -u postgres psql -Atc "SELECT datname FROM pg_database WHERE pg_get_userbyid(datdba) = 'applyforge_restore'"
+
+# 3. Swap the databases by name and transfer ownership (as postgres). RENAME fails while any session is
+#    connected to either database (e.g. monitoring); this must print nothing:
+sudo -u postgres psql -Atc "SELECT datname, usename, application_name FROM pg_stat_activity WHERE datname IN ('applyforge', '$NEW')"
+sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+ALTER DATABASE applyforge RENAME TO applyforge_pre_restore_$STAMP;
+ALTER DATABASE $NEW RENAME TO applyforge;
+ALTER DATABASE applyforge OWNER TO applyforge;
+REVOKE CONNECT, TEMPORARY ON DATABASE applyforge FROM PUBLIC;
+SQL
+sudo -u postgres psql -d applyforge -c 'REASSIGN OWNED BY applyforge_restore TO applyforge'
+
+# 4. Swap the media directories and transfer ownership.
+sudo mv -T /var/lib/applyforge/media "/var/lib/applyforge/media-pre-restore-$STAMP"
+sudo mv -T "$NEWMEDIA" /var/lib/applyforge/media
+sudo chown -R applyforge:applyforge /var/lib/applyforge/media && sudo chmod 0750 /var/lib/applyforge/media
+
+# 5. Preflight and migration plan (section 7) against the current release, then start.
+sudo applyforge-manage /srv/applyforge/current check --deploy
+sudo applyforge-manage /srv/applyforge/current migrate --plan    # restored from an older release? migrations may be listed
+sudo systemctl reset-failed applyforge                           # a failed start earlier must not block this one
+sudo systemctl start applyforge && sudo systemctl start applyforge-backup.timer
+# health checks: section 8.1; then a backup, verified offline (section 12.6)
+```
+
+**Rollback of the switch:** stop the service and reverse the renames: `applyforge` → a new `applyforge_restore_*` name, `applyforge_pre_restore_$STAMP` → `applyforge`, and the same for the media directories. Then start again. Keep the `*-pre-restore-*` database and directory until the switch has proven itself; then drop them deliberately (`sudo -u postgres dropdb applyforge_pre_restore_$STAMP`).
+
+**Rehearsed on 2026-11-20** (section 12.10): from the start of the restore to healthy on the restored data took about 11 s of tool time for a small fictional dataset. The service was unavailable for about 8 s during the switch, most of it the preflight and `check --deploy`. Real-data timings must come from the first production drill.
 
 ### 12.8 Disaster recovery on a new server
 
@@ -885,6 +919,26 @@ These cannot be validated with stand-in tools and must be checked on the actual 
   - **Fixed afterwards:** the rehearsal found restored media subdirectories at `0700` instead of `0750` (the process umask). Directories are now set to `0750` explicitly, with regression tests.
   - **Still to do on the production host:** peer and `pg_ident` behaviour, the identity and `pg_shdepend` queries on its PostgreSQL version, and the PUBLIC-privilege hardening in section 12.6.
 - **tmpfiles.d.** Creation as root, and the cleanup age of the work directory.
+- **End-to-end dress rehearsal — 2026-11-20.** A fresh, disposable Ubuntu 26.04 WSL instance ran sections 2–13 in order with the commit `948f58b` release, fictional data and secrets, a stand-in private CA and a loopback NFSv4.2 share (`sync`, `root_squash`, mounted `hard` from fstab).
+  - **Passed:**
+    - deployment and the full section 8.1 table;
+    - the host check (0 failures; only the firewall warning remains, which WSL's shared network namespace cannot exercise);
+    - the first backup through the real unit: 1.5 s, with a **client-visible outage of about 1 s** (nginx 502s);
+    - offline verification by an unprivileged account with both the primary and the escrow identity;
+    - a restore drill into new targets, identical to the backup; a record written after the backup was absent, which proves the recovery point;
+    - the corrected switch procedure (section 12.7): about 11 s from restore to healthy, about 8 s unavailable;
+    - upgrade and rollback (sections 9–10): about 1 s outage each;
+    - recovery from unplanned instance restarts (all services, and the NFS mount through systemd).
+  - **Defects found and fixed:**
+    - the documented switch procedure could not work: the preflight refused it, and the procedure also left backups pointing at the old data and PUBLIC rights restored;
+    - `host_check.py` reported the tracked `.env.example` templates as a `.env`;
+    - `host_check.py` did not report a failed `applyforge.service`;
+    - the runbook now requires RFC 5280-conformant private-CA certificates, PostgreSQL on port 5432, and a delayed check after certificate reloads.
+  - **Deviations:**
+    - PostgreSQL ran on port 55432 with a default-socket link, because WSL shares one network namespace;
+    - `createuser --pwprompt` and `sudoedit` were replaced by non-interactive equivalents;
+    - the VPN address was a loopback alias;
+    - the NFS server ran in the same instance.
 
 ---
 
@@ -931,7 +985,7 @@ Set journald's `SystemMaxUse=` so logs cannot fill `/var`. Alert at least on: `a
 - **PostgreSQL major upgrade.** A separate, planned change: back up, verify the archive offline, upgrade with `pg_upgradecluster`, run the host check, take a new backup.
 - **Python.** Release virtualenvs use the system interpreter. After a Python patch update, run `sudo "$REL/.venv/bin/pip" check` and the health checks. A new Python minor version needs a new release (section 5).
 - **Dependencies.** Change `backend/requirements.txt`, regenerate `backend/constraints.txt` in a fresh venv (`pip freeze`), run the backend tests and `pip-audit`, and ship a new release.
-- **Certificate renewal.** Install the new certificate and key with the same paths and modes, run `sudo nginx -t && sudo systemctl reload nginx`, then check the expiry from a VPN client.
+- **Certificate renewal.** Install the new certificate and key with the same paths and modes, run `sudo nginx -t && sudo systemctl reload nginx`, then check the expiry from a VPN client with a **new** connection, a few seconds later. `reload` returns before the old nginx workers have exited, and they keep serving the previous certificate until then. The 8.4f dress rehearsal saw a check fail for that reason right after a reload.
 - **Quarterly restore drill.** Restore the latest archive into a new database and directory (section 12.6), validate it (section 12.7), then drop the copy (`sudo -u postgres dropdb <copy>`) and remove the directory.
 - **Releases.** Keep two or three; delete older ones (section 9).
 

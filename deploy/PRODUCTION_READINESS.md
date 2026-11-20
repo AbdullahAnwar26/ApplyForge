@@ -14,6 +14,8 @@ What exists now:
 
 The first deployment can proceed once the blockers in section 8 are closed and the authorizations in section 9 are given.
 
+**Update after the 2026-11-20 dress rehearsal (Step 1.1).** The runbook was executed end to end, sections 2–13 in order, on a fresh disposable Ubuntu 26.04 instance with fictional data (section 3a). The deployment procedure, backup, offline verification, restore, upgrade and rollback all worked as written. The documented **switch-to-restored-data** procedure did not work at all; it has been rewritten and the new version rehearsed successfully. Smaller defects were fixed in `host_check.py` and the runbook. The verdict stands: the remaining blockers all need real infrastructure.
+
 ## 2. Selected architecture
 
 | Layer | Decision | Why |
@@ -34,7 +36,7 @@ The first deployment can proceed once the blockers in section 8 are closed and t
 | Backend suite | Ubuntu 26.04, Python 3.14.4, pinned constraints | 557 OK (12 browser tests skipped by design) |
 | Backup tool suite (`deploy/backup/tests`) | Ubuntu 26.04, as root and as a normal user | 152 OK each (4 root-only skips as root, none as a normal user) |
 | Mutation check (safety mechanisms disabled one at a time) | Ubuntu 26.04 | 36 of 36 mutants killed |
-| Host-check suite (`deploy/tests/test_host_check.py`) | Ubuntu 26.04 | 20 OK (1 opt-in real-host smoke skipped) |
+| Host-check suite (`deploy/tests/test_host_check.py`) | Ubuntu 26.04 | 24 OK after the dress-rehearsal fixes (1 opt-in real-host smoke skipped) |
 | nginx + Gunicorn end to end (`deploy/tests/stack_test.sh`) | nginx 1.28.3, Gunicorn, Django production mode | **61/61** |
 | Application unit sandbox (transient unit with `applyforge.service`'s directives) | systemd 259 | `Type=notify` ready, health 200, exposure 1.2; writes, outbound IP, user namespaces and other users' processes denied |
 | Backup unit sandbox + capability set | systemd 259 | everything the tool needs works; the negative control without DAC/KILL fails as expected; exposure 2.7 |
@@ -45,6 +47,63 @@ The first deployment can proceed once the blockers in section 8 are closed and t
 | Earlier milestones (still valid) | 8.4d real-age suite; PostgreSQL backup → restore rehearsal | identical data after restore |
 
 Disposable resources used in 8.4e were uniquely named (`af84e-*`) and removed after each run, with two exceptions: the 8.4e runtime venv (`/var/lib/af84e-112002412667ce/`), which is kept for reruns, and the protected and retained 8.4d resources, which were not touched. Packages installed for the NFS and SMB tests were purged afterwards.
+
+## 3a. End-to-end dress rehearsal (2026-11-20)
+
+**Environment.**
+
+- A new WSL instance, `af84f-dress-11200405d0b3`: Ubuntu 26.04.1, systemd 259, nginx 1.28.3, PostgreSQL 18.6, age 1.2.1, Python 3.14.4.
+- The default distribution and its PostgreSQL were never used, and the instance is stopped, kept for inspection.
+- The release was built from commit `948f58b`: `git archive`, and a frontend `npm ci` with lint, typecheck, 277 tests and build, plus checksums.
+
+**Simulated, not verified.**
+
+| Real-world element | Stand-in |
+|---|---|
+| VPN address | loopback alias `127.0.0.2` |
+| VPN subnet | `127.0.0.0/29` |
+| Private DNS | `/etc/hosts` |
+| Private CA | a local CA |
+| NAS | loopback NFSv4.2 in the same instance |
+| Offline machine | a separate unprivileged account |
+| Firewall | none: it would affect the other WSL distros, which share the network namespace |
+
+PostgreSQL ran on port 55432, linked to the default socket, for the same reason.
+
+| Runbook step | Result | Measured |
+|---|---|---|
+| 2–8 provision, install, preflight, migrate, start | 24/24 | venv + wheel install 94 s; migrate 2.1 s; start to ready 0.8 s; exposure 1.2 |
+| 8.1 health table (server side and "VPN client"; outside client 403; not reachable from Windows) | 24/24 | |
+| 13.1 host check | 0 failures (after fixes); 1 warning (firewall) | |
+| 12.2–12.6 keys (primary + escrow), NFS + fstab, tool, units, `probe-destination`, restore role, PUBLIC revocation | 15/15 | |
+| 12.4 first backup through the unit; offline verification (both identities); manual 12.9 check; timer | 14/14 | unit 1.54 s; **client-visible outage 1.06 s** (502) |
+| 12.6 restore drill + 12.7 validation + recovery point | 12/12 | restore 0.46 s; data and media identical; a post-backup write is absent (RPO = capture time) |
+| 12.7 switch **as documented** | **failed** (see the defect below); rolled back cleanly | |
+| 12.7 switch, **corrected** (rename-based), timed as DR | 17/17 | restore 2.45 s; unavailable during the switch 7.68 s; restore start to healthy 10.88 s |
+| 9 upgrade to a second release; 10 rollback | 20/20 | outage 0.97 s / 1.07 s |
+| Unplanned instance restarts (WSL idle shutdown) | all services and the NFS mount came back through systemd | |
+
+Timings are for a few KB of fictional data on local disks. Production timings must come from the first production drill (U11).
+
+**Defects found.**
+
+1. **High – documented production-switch procedure (runbook 12.7) cannot work.** It pointed `DATABASE_URL`/`MEDIA_ROOT` at the restored names.
+   - The service sandbox allows writes only to `/var/lib/applyforge/media`, so the preflight refused to start, and the start limit was then exhausted.
+   - `backup.conf` would keep backing up the old database and media.
+   - The restored database gets default PUBLIC rights.
+
+   **Fixed** by a rename-based procedure (restored copy → canonical names; old ones kept as `*-pre-restore-*`), with `reset-failed`, the timer stopped and a rollback path. Rehearsed: 17/17.
+2. **Medium – `host_check.py` failed every `git archive` release.** It reported the tracked `.env.example` templates as a `.env`. **Fixed:** only `.env` fails, the templates are allowed, and other `.env.*` files warn. Regression tests fail on the old code.
+3. **Medium – `host_check.py` did not report a failed `applyforge.service`** (it was only INFO). **Fixed:** failed is now FAIL; a failed backup unit is WARN. Tests added.
+4. **Medium – private-CA certificate profile undocumented.** Strict clients (Python 3.13+) rejected a CA without `keyUsage`, while curl accepted it. The runbook now specifies an RFC 5280 profile and an `openssl verify -x509_strict` check.
+5. **Low – PostgreSQL port assumption undocumented.** The backup tool scrubs `PG*` and uses the default socket, so the cluster must be on 5432. Documented.
+6. **Low – certificate check right after `nginx reload`** can still see the old certificate. The runbook now says to check with a new connection a few seconds later.
+
+**Environment artifacts (not product defects).**
+
+- WSL's pre-systemd `mount -a` fails on the NFS entry. Real hosts don't have that step; `mountFsTab = false` emulates them.
+- With the NFS server in the same instance, a `hard` mount delays shutdown by 60 s unless it is unmounted first. A real NAS is separate, but note B4.
+- WSL idle-stops instances and was suspended once (about 20 min) by the host.
 
 ## 4. Verified requirements
 
@@ -63,6 +122,10 @@ Disposable resources used in 8.4e were uniquely named (`af84e-*`) and removed af
 | V11 | The RENAME_NOREPLACE fallback works where hard links don't | vfat probe |
 | V12 | Encryption, verification and restore with real age and PostgreSQL | 8.4d real-age suite and rehearsal |
 | V13 | The host check never reads secrets and runs only read-only commands | dedicated tests |
+| V14 | The runbook deploys a release from scratch on a fresh Ubuntu 26.04 instance, and `host_check.py` passes there | dress rehearsal (3a) |
+| V15 | First backup through the real unit with the real `Type=notify` app: about 1 s client-visible outage; offline verification by a separate account with primary and escrow identities | dress rehearsal |
+| V16 | Restore → validate → rename-based switch → backups capture the live data; rollback paths for the switch and for code | dress rehearsal |
+| V17 | Services and the NFS backup mount recover after an unplanned restart | dress rehearsal |
 
 ## 5. Unverified requirements (need the real host or real infrastructure)
 
@@ -73,12 +136,12 @@ Disposable resources used in 8.4e were uniquely named (`af84e-*`) and removed af
 | U3 | Host firewall default-deny; 80/443 only on the VPN interface; SSH only via VPN | host check (nftables/ufw) + an external scan from outside the VPN (authorized) |
 | U4 | Private DNS name, certificate from the private CA, client trust, expiry monitoring | host check (expiry, host name) + client checks |
 | U5 | Production PostgreSQL: roles, `pg_hba`, peer/`pg_ident`, PUBLIC revocation, connection limits, the restore tool's identity and `pg_shdepend` queries | host check + one authorized restore drill on the host |
-| U6 | The real `applyforge.service` (`Type=notify`) inside the backup maintenance window, a failed start, shutdown behaviour | first authorized backup run + journal review |
+| U6 | The real `applyforge.service` inside the backup maintenance window **on the production host**, and shutdown behaviour. Rehearsed locally: the window (about 1 s outage) and failed starts with `reset-failed` recovery | first authorized backup run + journal review |
 | U7 | The real backup storage: export options, root squashing, snapshots, capacity, durability promises of the NAS, behaviour when unreachable | `probe-destination` + a full backup → offline verify → restore drill |
 | U8 | `RequiresMountsFor` / automount on the real mount | first backup run |
 | U9 | Monitoring and alerting (unit failures, health, disk, certificate) | operator setup (runbook 13.2) |
 | U10 | Offline age key custody and the offline copy of the hash index | operator procedure (runbook 12.2, 12.4) |
-| U11 | Restore time on real data volumes (the RTO) | restore drill |
+| U11 | Restore and switch time on real data volumes (the RTO). Rehearsed: about 11 s for a tiny fictional dataset, which says nothing about real volumes | restore drill on the production host |
 
 ## 6. Host and PostgreSQL requirements
 
@@ -128,12 +191,12 @@ Disposable resources used in 8.4e were uniquely named (`af84e-*`) and removed af
 1. **B1 – No production host.** Provision Ubuntu 26.04 per runbook sections 2–3. Then run `host_check.py` until there are no `FAIL` lines.
 2. **B2 – Network access controls unverified.** Set up the VPN, the firewall default-deny and the private DNS. Verify from a VPN client and from outside the VPN (U2, U3).
 3. **B3 – TLS.** Issue a certificate from the private CA, distribute the CA to clients, and monitor expiry (U4).
-4. **B4 – Backup storage.** Provision NFSv4.1+ with a `sync` export restricted to the server, and snapshots. Run `probe-destination`. Then do the first backup, offline verify and restore drill (U7, U8, U11).
+4. **B4 – Backup storage.** Provision NFSv4.1+ with a `sync` export restricted to the server, and snapshots. Run `probe-destination`. Then do the first backup, offline verify and restore drill (U7, U8, U11). Also test the shutdown/reboot behaviour of the `hard` mount with the real NAS (the rehearsal saw a 60 s shutdown delay when the NFS server went away first).
 5. **B5 – Key custody.** Generate the age key pair offline with a second (escrow) recipient. Store the private keys offline, and keep the offline hash record (U10).
 6. **B6 – Production PostgreSQL hardening and drill.** Create the roles and `pg_hba`, revoke PUBLIC, and run a restore drill on the host (U5).
 7. **B7 – First real maintenance window.** Run the first backup with ApplyForge running and review the journal (U6).
 8. **B8 – Monitoring and alerting** for runbook 13.2 (U9).
-9. **B9 – Commit the 8.4e changes** (they are uncommitted local changes), and push the local commits when authorized.
+9. **B9 – Source control.** The 8.4e changes are committed (`948f58b`). Commit the dress-rehearsal fixes (runbook 12.7 switch procedure, `host_check.py`) and push the local commits when authorized. **Use only the corrected 12.7 procedure** for any switch to restored data.
 
 ## 9. Authorizations needed
 

@@ -66,6 +66,10 @@ INSTALLED_COPIES = [
     ("/etc/nginx/snippets/applyforge-security-headers.conf", "deploy/nginx/snippets/applyforge-security-headers.conf"),
     ("/etc/nginx/snippets/applyforge-proxy.conf", "deploy/nginx/snippets/applyforge-proxy.conf"),
 ]
+# Tracked, placeholder-only templates that every release built with git archive contains
+# (.env.example at the repository root and in frontend/). Only a real `.env` is loaded on the
+# server (settings.py via APPLYFORGE_DOTENV; preflight.py refuses one); found in the 8.4f dress rehearsal.
+TRACKED_ENV_TEMPLATES = {".env.example"}
 NGINX_SITE = "/etc/nginx/sites-available/applyforge.conf"
 NGINX_ENABLED = "/etc/nginx/sites-enabled/applyforge.conf"
 NGINX_DEFAULT_SITE = "/etc/nginx/sites-enabled/default"
@@ -399,7 +403,7 @@ def check_release(host, r, release):
         r.ok(f"{release} -> {real}")
     else:
         r.warn(f"{release} resolves to {real}, not /srv/applyforge/releases/<full commit hash>")
-    writable, not_root, dotenv = [], [], []
+    writable, not_root, dotenv, env_variants = [], [], [], []
     for dirpath, dirnames, filenames in host.walk(real):
         for entry in dirnames + filenames:
             path = f"{dirpath}/{entry}"
@@ -407,8 +411,10 @@ def check_release(host, r, release):
                 st = host.lstat(path)
             except OSError:
                 continue
-            if entry == ".env" or entry.startswith(".env."):
+            if entry == ".env":
                 dotenv.append(path)
+            elif entry.startswith(".env.") and entry not in TRACKED_ENV_TEMPLATES:
+                env_variants.append(path)
             if st.st_uid != 0:
                 not_root.append(path)
             if not stat.S_ISLNK(st.st_mode) and stat.S_IMODE(st.st_mode) & 0o022:
@@ -418,6 +424,9 @@ def check_release(host, r, release):
                            (writable, "group/world-writable release files")):
         if found:
             r.fail(f"{len(found)} {message}, e.g. {found[0]}")
+    if env_variants:
+        r.warn(f"{len(env_variants)} .env.* file(s) in the release, e.g. {env_variants[0]}: not loaded on the "
+               "server, but they may hold secrets - releases are built with git archive and should not contain them")
     if not (dotenv or not_root or writable):
         r.ok("release tree is root-owned, not group/world-writable, and has no .env")
     for required in ("frontend/dist/index.html", "deploy/preflight.py", ".venv/bin/gunicorn"):
@@ -676,6 +685,14 @@ def check_units(host, r):
         rc, enabled, _ = host.run(["systemctl", "is-enabled", unit])
         rc, active, _ = host.run(["systemctl", "is-active", unit])
         r.info(f"{unit}: {enabled.strip() or 'unknown'}, {active.strip() or 'unknown'}")
+        # Found in the 8.4f dress rehearsal: a unit stuck in "failed" (e.g. its start limit was hit
+        # after preflight refusals) went unreported. Inactive is fine before go-live; failed is not.
+        if active.strip() == "failed":
+            if unit == "applyforge.service":
+                r.fail("applyforge.service is in the failed state: read journalctl -u applyforge, fix the cause, "
+                       "then systemctl reset-failed applyforge && systemctl start applyforge")
+            else:
+                r.warn(f"{unit} is in the failed state (the last run failed): journalctl -u {unit.split('.')[0]}")
     rc, out, _ = host.run(["systemd-analyze", "security", "--no-pager", "applyforge.service"])
     exposure = re.search(r"Overall exposure level for \S+: ([\d.]+) (\w+)", out)
     if exposure:

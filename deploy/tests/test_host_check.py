@@ -198,6 +198,8 @@ class HostCheckTests(unittest.TestCase):
         rel = f"/srv/applyforge/releases/{SHA}"
         self.rel = rel
         for p, text, mode in (("frontend/dist/index.html", "<!doctype html>", 0o644),
+                              (".env.example", "SECRET_KEY=<placeholder>\n", 0o644),           # tracked templates,
+                              ("frontend/.env.example", "VITE_API_BASE_URL=\n", 0o644),       # in every release
                               ("deploy/preflight.py", "# preflight", 0o644),
                               (".venv/bin/gunicorn", "#!python", 0o755),
                               (".venv/bin/python", "#!python", 0o755),
@@ -291,6 +293,28 @@ class HostCheckTests(unittest.TestCase):
         self.write(f"{self.rel}/backend/.env", "fictional")
         self.assertEqual(self.check(), 1)
         self.assertTrue(any(".env file inside the release" in l for l in self.lines("FAIL")))
+
+    def test_tracked_env_templates_are_not_flagged(self):
+        # Regression (8.4f dress rehearsal): .env.example files from git archive were reported as a .env.
+        self.assertEqual(self.check(), 0, self.out)
+        self.assertFalse(any(".env" in l for l in self.lines("FAIL") + self.lines("WARN")), self.out)
+
+    def test_other_env_variants_warn(self):
+        self.write(f"{self.rel}/frontend/.env.production", "VITE_X=fictional")
+        self.assertEqual(self.check(), 0)
+        self.assertTrue(any(".env.production" in l for l in self.lines("WARN")), self.out)
+        self.assertFalse(any(".env" in l for l in self.lines("FAIL")))
+
+    def test_failed_application_unit_fails(self):
+        # Regression (8.4f dress rehearsal): a failed applyforge.service was reported only as INFO.
+        self.host.overrides["systemctl is-active applyforge.service"] = (3, "failed\n", "")
+        self.assertEqual(self.check(), 1)
+        self.assertTrue(any("applyforge.service is in the failed state" in l for l in self.lines("FAIL")), self.out)
+
+    def test_failed_backup_unit_warns(self):
+        self.host.overrides["systemctl is-active applyforge-backup.service"] = (3, "failed\n", "")
+        self.assertEqual(self.check(), 0)
+        self.assertTrue(any("applyforge-backup.service is in the failed state" in l for l in self.lines("WARN")))
 
     def test_writable_release_file_fails(self):
         os.chmod(self.path(f"{self.rel}/deploy/preflight.py"), 0o666)
