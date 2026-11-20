@@ -1,0 +1,16 @@
+# Daily ApplyForge backup (Milestone 8.4d). Enable only after a manual backup and a
+# successful `applyforge-backup verify` on the offline machine (deploy/README.md 12.4, 12.6):
+#   sudo install -m 0644 deploy/systemd/applyforge-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now applyforge-backup.timer
+
+[Unit]
+Description=Daily ApplyForge encrypted backup
+
+[Timer]
+# Low-traffic hour: ApplyForge is stopped briefly while the database and media are captured.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

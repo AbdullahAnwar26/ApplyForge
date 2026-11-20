@@ -49,4 +49,6 @@ ApplyForge's first production target is a **private server reachable only over a
 - The production environment comes from a systemd environment file (example: [`deploy/env.production.example`](deploy/env.production.example), placeholders only). A development `.env` is never loaded there.
 - The frontend is built on the workstation (`npm run build`), and `frontend/dist` is copied to the server.
 - In this first configuration, `/admin` is blocked, `/media` is never served, and the LinkedIn collector and draft generation are disabled.
-- Backups and database restore are not covered yet. They are planned as Milestone 8.4d.
+- **Backups** are encrypted with age to public keys only; the private key stays offline. They're written to mounted off-host storage and kept for 30 days by default, always keeping the 7 newest. Each archive's SHA-256 is recorded in a root-only local index, because age doesn't prove who created an archive.
+- **Restores** need that hash from an independent record. They go only into a **new** database and media directory, and the dump is loaded by a dedicated, isolated non-superuser restore role, never the production owner. Switching the application to restored data is a separate manual step, unrelated to code rollback.
+- See section 12 of the runbook.

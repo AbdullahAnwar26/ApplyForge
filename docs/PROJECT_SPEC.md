@@ -135,8 +135,10 @@ Existing data-integrity constraints:
   Ollama only.
 - `PROJECT_CONTEXT.md`. It is gitignored and was lost.
 - A deployed server. Milestone 8.4c added the deployment configuration and
-  runbook (`deploy/`), but nothing has been provisioned or deployed. Backups
-  and database restore (Milestone 8.4d) do not exist yet.
+  runbook (`deploy/`), but nothing has been provisioned or deployed.
+- A real backup or restore. Milestone 8.4d added the backup tool and its tests
+  (fictional data and stand-in tools only); `age` is not installed on the
+  development machine, and no PostgreSQL restore rehearsal has been run.
 
 The React + Vite frontend (`frontend/`) was added in Milestone 7.
 
@@ -672,7 +674,7 @@ most 5 posts. They wrote only to the scratch database
 | 5 | Generation via local Ollama/Qwen (rules 6–8, 10): grounded prompts, clear failure that changes only `last_error`, throttled endpoint, editable drafts, `SENT` → job `APPLIED` | **Done (uncommitted; verified with a simulated Ollama only)**. Batch generation through Celery is deferred. |
 | 6 | Integrated LinkedIn collector (rule 12): 6a parsing, service, command and offline tests; 6b Playwright browser source; 6c `CollectorRun` and API | **6a, 6b and 6c done:** browser source validated live into the scratch database and hardened; 6c run history and API verified offline. |
 | 7 | React + Vite frontend dashboard | **Done** (frontend `17420d2`, integration hardening `16c2ba0`). |
-| 8 | Production readiness: settings hardening, dependency upgrades, health check, PostgreSQL, private deployment, backups | **8.1–8.3 done** (`ba57c62`). **8.4b** PostgreSQL rehearsal passed (PostgreSQL 18.6; all migrations, checks and 557 backend tests). **8.4c** private/VPN deployment configuration and runbook written; not yet used on a server. **8.4d** backup/restore: planned. |
+| 8 | Production readiness: settings hardening, dependency upgrades, health check, PostgreSQL, private deployment, backups | **8.1–8.3 done** (`ba57c62`). **8.4b** PostgreSQL rehearsal passed (PostgreSQL 18.6; all migrations, checks and 557 backend tests). **8.4c** private/VPN deployment configuration and runbook written; not yet used on a server. **8.4d** encrypted backup and restore tool, documentation and 140 tests written, including two security corrective passes; real `age` 1.2.1 integration validated (2026-11-19); real PostgreSQL 18.6 backup/restore rehearsal passed (2026-11-20, disposable objects, **tmpfs** destination - NFS/SMB and the systemd recovery path not yet validated). |
 
 Order may be adjusted, but each milestone should leave `manage.py check`,
 `makemigrations --check` and the test suite passing.
@@ -721,6 +723,112 @@ authoritative.
     releases.
   - A code rollback switches the symlink back. It never restores or migrates
     the database; that is a separate, explicit decision (Milestone 8.4d).
+
+### Backup and restore (Milestone 8.4d) [Tested with fictional data only; no real rehearsal yet]
+
+`deploy/backup/afbackup.py` (installed as `applyforge-backup`) is described in
+section 12 of `deploy/README.md`, which is authoritative.
+
+- **Encryption and trust.**
+  - Archives are encrypted with `age` to public X25519 recipients only.
+  - The private identity stays offline.
+  - The tool refuses a recipients file that contains a private key.
+  - age does not prove who created an archive, and the share controls what it
+    returns on reads. So the trusted SHA-256 is computed from age's output as
+    it streams through the tool, never from a read-back of the share.
+  - That hash is recorded in a root-only local index and the journal
+    **before** the archive is published.
+  - `restore` requires `--expected-sha256` and checks it against a private
+    local copy before decryption. When a local index exists, the hash must be
+    in it (`--allow-unindexed` is the documented exception).
+- **Contents.**
+  - The archive holds a manifest (timestamp, host, database name, release,
+    and size and SHA-256 per file), a `pg_dump` custom-format dump and every
+    regular file under `MEDIA_ROOT`.
+  - No environment file, tokens, `SECRET_KEY`, credentials or browser
+    profiles are included.
+  - `pg_dump` uses peer authentication as `postgres`, so no password is
+    involved.
+- **Consistency.**
+  - The service is stopped while the dump and media are captured, within a
+    capture deadline and with `pg_dump --lock-wait-timeout`.
+  - It is always started again if it was running, including on failure,
+    timeout and SIGTERM; exit code 3 means it could not be.
+  - A durable marker plus the unit's `ExecStopPost=… recover-service`
+    restarts it even after SIGKILL.
+  - Encryption happens after the restart.
+  - Unreadable media fails the backup.
+- **Concurrency and plaintext.**
+  - One shared lock, `/run/lock/applyforge-backup.lock`, covers timer and
+    manual runs.
+  - Stale work and staging directories from crashed runs are removed under the
+    lock, and a tmpfiles.d rule backs this up.
+- **Destination.**
+  - It must be a mount point containing a regular marker file, with an
+    optional allow-list of filesystem types, otherwise the backup is refused.
+  - The tool creates the `.partial` file itself
+    (`O_CREAT|O_EXCL|O_NOFOLLOW`, `0600`). age writes into that descriptor,
+    which is fsynced.
+  - The destination is re-checked before publishing.
+  - Publishing never overwrites an existing archive.
+  - On failure, only the run's own partial file is removed.
+- **Retention.**
+  - Archives older than 30 days (configurable) are deleted, and only after a
+    successful backup.
+  - The 7 newest are always kept (`BACKUP_MIN_KEEP`).
+  - Only exact archive names are eligible.
+  - A retention failure is reported separately (exit code 4).
+- **Restore.**
+  - The expected hash is checked, then the archive is decrypted and fully
+    validated: member types, sizes against the manifest, member count, free
+    disk space and checksums.
+  - Data goes into a new database and a new or empty media directory, and both
+    names must be repeated as confirmation.
+  - `createdb` runs as `postgres`. `pg_restore` runs as a dedicated, isolated
+    restore role and OS account (`applyforge_restore`), never as `postgres`
+    and never as the production owner.
+  - Before the restore, the effective identity of that connection is
+    verified: `current_user`/`session_user`, no superuser or role-creation
+    rights, no bypass-RLS, no memberships, no server-program or server-file
+    roles, and no ownership of or privileges on production objects.
+  - Ownership transfer is a separately authorized switch step.
+  - Existing data is never dropped, overwritten or switched to.
+  - A failed restore leaves the newly created empty database in place and
+    reports it.
+- **Configuration.**
+  - `backup.conf` and the recipients file must be root-owned and not group- or
+    world-writable.
+  - Unknown and duplicate keys are refused.
+  - The destination, work, state and media directories must not overlap.
+  - `MEDIA_ROOT` must not be under `/etc`, `/root`, `/home` or
+    `/srv/applyforge`.
+- **Media capture.** Media is walked only through directory descriptors with
+  `O_NOFOLLOW` and checked by device and inode during the scan and again when
+  archiving. Filesystem crossings and swaps are refused.
+- **Service recovery.** Automatic recovery happens only for the marker of the
+  same invocation, same boot, and an untouched service. Old or ambiguous
+  markers never start ApplyForge.
+- **Signals and environment.** SIGTERM, SIGHUP and SIGINT are handled, and
+  logging can't block recovery. Subprocesses get a minimal explicit
+  environment.
+- **Tests.** 140 tests with fictional data and stand-in tools, including a
+  real-`age` round trip.
+- **Real `age` 1.2.1, validated in WSL on 2026-11-19:** streaming
+  encryption, a trusted hash matching age's output, byte-for-byte decryption,
+  and clean refusal of a wrong key, truncation, corruption and age failures.
+- **Real PostgreSQL 18.6 restore rehearsal, passed on 2026-11-20:**
+  - disposable source and target databases, roles and OS account;
+  - real `create`, `verify` and `restore`;
+  - schema, every row and sequences identical, and all media byte for byte;
+  - the restore ran as the isolated restore role;
+  - the protected rehearsal database was untouched.
+- **Limits of that rehearsal:** the destination was **tmpfs**, not NFS/SMB,
+  and the service stop/start window and `ExecStopPost` were not exercised.
+- **Fixed afterwards:** the rehearsal found restored media subdirectories at
+  `0700` instead of `0750`; this is fixed and covered by regression tests.
+- **Production hardening:** revoke the default PUBLIC `CONNECT`/`TEMP` on the
+  production database (`deploy/README.md` section 12.6).
+- **Remaining real-host checks:** listed in `deploy/README.md` section 12.10.
 
 ---
 

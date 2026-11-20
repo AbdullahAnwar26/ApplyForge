@@ -1,0 +1,78 @@
+# ApplyForge encrypted backup (Milestone 8.4d). Started by applyforge-backup.timer.
+#
+# Install: sudo install -m 0644 deploy/systemd/applyforge-backup.service /etc/systemd/system/
+#          (and deploy/systemd/applyforge-backup.tmpfiles as /etc/tmpfiles.d/applyforge-backup.conf)
+# Run once by hand: sudo systemctl start applyforge-backup.service; journalctl -u applyforge-backup
+# See deploy/README.md section 12.
+#
+# Runs as root: it must stop/start applyforge.service, run pg_dump as the postgres user
+# and write to the off-host destination. It briefly stops ApplyForge (maintenance
+# window) and always starts it again if it was running. Exit status 3 means ApplyForge
+# could NOT be started again; 4 means the backup succeeded but retention failed. Alert
+# on failures of this unit.
+#
+# Keep these paths identical to /etc/applyforge/backup.conf:
+#   BACKUP_DESTINATION=/mnt/applyforge-backups      (RequiresMountsFor, ReadWritePaths)
+#   BACKUP_STATE_DIR=/var/lib/applyforge-backup     (ReadWritePaths: index + service marker)
+#   BACKUP_WORK_DIR=/var/lib/applyforge-backup-work (ReadWritePaths: temporary plaintext)
+#   BACKUP_LOCK_FILE=/run/lock/applyforge-backup.lock (created by tmpfiles.d; opened read-only)
+
+[Unit]
+Description=ApplyForge encrypted backup
+Documentation=file:///srv/applyforge/current/deploy/README.md
+After=postgresql.service network-online.target
+Wants=network-online.target
+# Mount the destination first (fstab/mount unit). The tool itself still refuses unless
+# the destination is a mount point carrying the marker file.
+RequiresMountsFor=/mnt/applyforge-backups
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/applyforge-backup create --config /etc/applyforge/backup.conf
+# Runs after ExecStart in every case - success, failure, timeout or SIGKILL. It starts
+# ApplyForge again ONLY if the durable marker was written by THIS invocation
+# ($INVOCATION_ID), on this boot, and the service has neither been started nor stopped
+# since the backup stopped it. Otherwise it leaves the service as it is (ambiguous
+# cases are reported, exit status 2). Without a marker it does nothing, so a service
+# that was inactive before the backup stays inactive. During system shutdown its
+# "systemctl start" is rejected; ApplyForge then comes back only through its own
+# enablement at boot, and the marker is reported as ambiguous (deploy/README.md 12.4).
+ExecStopPost=/usr/local/sbin/applyforge-backup recover-service --config /etc/applyforge/backup.conf
+UMask=0077
+# The capture phase is bounded by BACKUP_CAPTURE_TIMEOUT_SECONDS (default 30 min); this
+# outer limit also covers encryption and the copy to off-host storage.
+TimeoutStartSec=6h
+# SIGTERM is handled: ApplyForge is started again and temporary files are removed.
+KillMode=mixed
+TimeoutStopSec=180
+# No Nice=/IOSchedulingClass=: ApplyForge is down while the database and media are
+# captured, so the capture should run at normal priority to keep that window short.
+
+# --- Filesystem: read-only everywhere except exactly these paths ---
+ProtectSystem=strict
+ReadWritePaths=/mnt/applyforge-backups /var/lib/applyforge-backup /var/lib/applyforge-backup-work
+PrivateTmp=yes
+ProtectHome=yes
+PrivateDevices=yes
+
+# --- Other hardening (does not interfere with systemctl over D-Bus or runuser) ---
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Local sockets (PostgreSQL, D-Bus/systemd), netlink (PAM audit) and IP (only if a
+# client tool needs it). The NFS/SMB/FUSE client runs outside this unit.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+# NOT yet applied - validate on the real host first (deploy/README.md 12.10):
+#   CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_KILL CAP_AUDIT_WRITE
+#   (runuser/PAM may additionally need CAP_SYS_RESOURCE for pam_limits; CAP_KILL is needed to
+#   stop a timed-out pg_dump running as postgres), SystemCallFilter=@system-service.

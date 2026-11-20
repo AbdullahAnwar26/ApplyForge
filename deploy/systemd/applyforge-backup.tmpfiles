@@ -1,0 +1,15 @@
+# ApplyForge backup directories and lock (Milestone 8.4d).
+# Install as /etc/tmpfiles.d/applyforge-backup.conf, then:
+#   sudo systemd-tmpfiles --create /etc/tmpfiles.d/applyforge-backup.conf
+#
+# - State: the root-only backup index and the "service stopped by backup" marker. Never cleaned.
+# - Work: temporary plaintext (dump, tar) while a run is active. The tool removes its own
+#   leftovers; as a second line of defence, systemd-tmpfiles-clean removes entries older
+#   than 2 days (a run is bounded to hours, so nothing active is that old).
+# - Lock: shared by timer and manual runs; created here so the backup unit can open it
+#   on its read-only /run (ProtectSystem=strict).
+#
+# Type Path                               Mode User Group Age
+d      /var/lib/applyforge-backup         0700 root root  -
+d      /var/lib/applyforge-backup-work    0700 root root  2d
+f      /run/lock/applyforge-backup.lock   0600 root root  -

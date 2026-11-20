@@ -1,0 +1,68 @@
+# ApplyForge backup configuration (Milestone 8.4d) - NO SECRETS IN THIS FILE.
+#
+# Install on the server as /etc/applyforge/backup.conf, root-owned and not writable by
+# group or others (the tool refuses otherwise):
+#   sudo install -o root -g root -m 0644 "$REL/deploy/backup/backup.conf.example" /etc/applyforge/backup.conf
+#
+# Format: KEY=VALUE, one per line. Unknown and duplicate keys are refused. Paths must be
+# absolute and normalised. BACKUP_DESTINATION, BACKUP_WORK_DIR, MEDIA_ROOT and
+# BACKUP_STATE_DIR must be separate (none inside another). See deploy/README.md section 12.
+
+# Off-host storage, mounted here (NFS/SMB/sshfs/...). Must be a mount point AND contain
+# the regular marker file .applyforge-backup-destination, otherwise backups are refused.
+BACKUP_DESTINATION=/mnt/applyforge-backups
+
+# Optional: comma-separated filesystem types the destination must have, e.g. nfs4,cifs,
+# fuse.sshfs. Empty = not checked (the mount point and marker checks always apply).
+BACKUP_ALLOWED_FS_TYPES=
+
+# age PUBLIC X25519 recipients (age1...), one per line; root-owned, not group/world
+# writable. Never put a private key on the server.
+BACKUP_RECIPIENTS_FILE=/etc/applyforge/backup-recipients.txt
+
+# Complete archives older than this many days are deleted after each SUCCESSFUL backup
+# (1-3650) - but the BACKUP_MIN_KEEP newest archives are always kept (1-1000).
+BACKUP_RETENTION_DAYS=30
+BACKUP_MIN_KEEP=7
+
+# Local, root-only (0700) directories, created by the tmpfiles.d rule:
+#   STATE: the trusted archive index (name, SHA-256, recipients fingerprint) and the
+#          marker that records a service stopped by a backup.
+#   WORK:  temporary plaintext while a run is active (needs room for about three times
+#          one backup during a restore).
+BACKUP_STATE_DIR=/var/lib/applyforge-backup
+BACKUP_WORK_DIR=/var/lib/applyforge-backup-work
+
+# Shared by timer and manual create/verify/restore runs (outside any PrivateTmp).
+BACKUP_LOCK_FILE=/run/lock/applyforge-backup.lock
+
+# Upper bound for the maintenance window (dump + media capture), and for how long
+# pg_dump waits for a table lock before giving up. ApplyForge is restarted either way.
+BACKUP_CAPTURE_TIMEOUT_SECONDS=1800
+BACKUP_PG_LOCK_WAIT_SECONDS=120
+
+# Must match DATABASE_URL and MEDIA_ROOT in /etc/applyforge/applyforge.env. DB_OWNER is
+# the NON-superuser application role; DB_OWNER_OS_USER the OS account with the same
+# name (pg_restore runs as it via peer authentication). Empty = same as DB_OWNER.
+DB_NAME=applyforge
+DB_OWNER=applyforge
+DB_OWNER_OS_USER=
+MEDIA_ROOT=/var/lib/applyforge/media
+
+# Restores load the dump as this DEDICATED role and OS account (same name, peer
+# authentication) - never as postgres and never as DB_OWNER. It must be a plain
+# non-superuser role: no CREATEROLE/CREATEDB/BYPASSRLS/REPLICATION, no role memberships,
+# and nothing owned in or granted on the production database (all verified before
+# every restore). Empty RESTORE_OS_USER = same as RESTORE_ROLE.
+RESTORE_ROLE=applyforge_restore
+RESTORE_OS_USER=
+
+# pg_dump, createdb and psql run as this OS user via peer authentication, so no
+# database password is needed or stored for backups. pg_restore never runs as it.
+PG_RUN_AS=postgres
+
+# Stopped for the maintenance window if running, and always started again afterwards.
+SERVICE_NAME=applyforge.service
+
+# Read only to record the deployed release (commit) in the manifest.
+RELEASE_LINK=/srv/applyforge/current
