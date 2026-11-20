@@ -193,6 +193,9 @@ def pg_dump():
         print("pg_dump (PostgreSQL) 18.6 (fictional stand-in)")
         return
     record()
+    if os.environ.get("FAKE_PG_DUMP_PIDFILE"):
+        with open(os.environ["FAKE_PG_DUMP_PIDFILE"], "w") as fh:
+            fh.write(str(os.getpid()))
     if os.environ.get("FAKE_PG_DUMP_SLEEP"):
         time.sleep(float(os.environ["FAKE_PG_DUMP_SLEEP"]))
     if os.environ.get("FAKE_PG_DUMP_FAIL"):
@@ -285,6 +288,14 @@ def runuser():
     if len(ARGS) < 4 or ARGS[0] != "-u" or ARGS[2] != "--":
         fail("runuser: unsupported invocation")
     env = dict(os.environ, FAKE_RUN_AS=ARGS[1])
+    if os.environ.get("FAKE_RUNUSER_FORKS"):
+        # Like the real runuser (PAM session): fork, run the command as a child, wait for it.
+        # Killing only this process would leave the child running.
+        child = os.fork()
+        if child == 0:
+            os.execvpe(ARGS[3], [ARGS[3]] + ARGS[4:], env)
+        _, status = os.waitpid(child, 0)
+        sys.exit(os.waitstatus_to_exitcode(status) & 0xFF)
     os.execvpe(ARGS[3], [ARGS[3]] + ARGS[4:], env)
 
 
@@ -1319,6 +1330,32 @@ class ServiceMarkerTests(BackupTestCase):
         self.assertFalse(os.path.lexists(self.marker_path()))
         self.assert_no_leftovers()
 
+    def test_capture_deadline_kills_pg_dump_behind_runuser(self):
+        # Regression (8.4e): the real runuser forks; a timeout must kill pg_dump too, not
+        # just runuser, or the dump keeps running (and holding locks) after the backup failed.
+        self.config = self.write_config(BACKUP_CAPTURE_TIMEOUT_SECONDS="1")
+        pidfile = os.path.join(self.tmp, "pg_dump.pid")
+        os.environ.update(FAKE_PG_DUMP_SLEEP="30", FAKE_RUNUSER_FORKS="1", FAKE_PG_DUMP_PIDFILE=pidfile)
+        started = time.monotonic()
+        self.assertEqual(self.create(), 1)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn("capture deadline", self.stderr)
+        with open(pidfile) as fh:
+            pid = int(fh.read())
+        alive = True
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        if alive:
+            os.kill(pid, signal.SIGKILL)
+        self.assertFalse(alive, "pg_dump survived the capture deadline")
+        self.assertEqual(self.service(), "active")
+        self.assert_no_leftovers()
+
     def test_pg_dump_gets_lock_wait_timeout(self):
         self.config = self.write_config(BACKUP_PG_LOCK_WAIT_SECONDS="45")
         self.assertEqual(self.create(), 0, self.stderr)
@@ -2189,6 +2226,137 @@ class PrivilegeAndErrorTests(BackupTestCase):
 # --- Real age (skipped unless installed) ------------------------------------------------------------------------
 
 @unittest.skipUnless(REAL_AGE and REAL_AGE_KEYGEN, "age/age-keygen not installed")
+class ProbeDestinationTests(BackupTestCase):
+    """probe-destination (8.4e): writes only its own probe directory and reports what the
+    destination supports."""
+
+    def probe(self):
+        return self.run_tool("probe-destination", "--config", self.config)
+
+    def lines(self, tag):
+        return [line for line in self.stdout.splitlines() if line.startswith(tag)]
+
+    def test_local_filesystem_passes_and_leaves_nothing_behind(self):
+        archive = self.make_backup()
+        before = sorted(os.listdir(self.dest))
+        with open(archive, "rb") as fh:
+            content = fh.read()
+        self.assertEqual(self.probe(), 0, self.stdout + self.stderr)
+        self.assertEqual(self.lines("FAIL"), [])
+        for expected in ("O_CREAT|O_EXCL refuses", "read-back matches", "identity is stable",
+                         "hard link refuses to replace", "O_NOFOLLOW refuses", "probe files and directory removed"):
+            self.assertIn(expected, self.stdout)
+        self.assertIn("RESULT  OK", self.stdout)
+        self.assertEqual(sorted(os.listdir(self.dest)), before)
+        with open(archive, "rb") as fh:
+            self.assertEqual(fh.read(), content)
+        self.assertEqual(self.calls(), [], "the probe must not run any external tool")
+
+    def test_falls_back_to_rename_noreplace_without_hard_links(self):
+        if not hasattr(afbackup.ctypes.CDLL(None), "renameat2"):
+            self.skipTest("renameat2 not available in this libc")
+        with mock.patch.object(afbackup.os, "link", side_effect=OSError(errno.EPERM, "Operation not permitted")):
+            code = self.probe()
+        if "renameat2(RENAME_NOREPLACE) is not supported" in self.stdout:
+            self.skipTest("this filesystem does not support RENAME_NOREPLACE")
+        self.assertEqual(code, 0, self.stdout)
+        self.assertIn("renameat2(RENAME_NOREPLACE) refuses to replace", self.stdout)
+        self.assertIn("create will publish archives by renameat2", self.stdout)
+        self.assertEqual(os.listdir(self.dest), [afbackup.MARKER])
+
+    def test_no_safe_publication_method_fails(self):
+        with mock.patch.object(afbackup.os, "link", side_effect=OSError(errno.EPERM, "Operation not permitted")), \
+                mock.patch.object(afbackup, "rename_noreplace", side_effect=OSError(errno.EINVAL, "Invalid argument")):
+            self.assertEqual(self.probe(), 1)
+        self.assertIn("create would refuse to publish", self.stdout)
+        self.assertIn("RESULT  FAILED", self.stdout)
+        self.assertEqual(os.listdir(self.dest), [afbackup.MARKER])
+
+    def test_link_that_replaces_an_existing_name_fails(self):
+        real_link = os.link
+
+        def clobbering_link(src, dst, **kwargs):
+            if os.path.lexists(dst):
+                os.unlink(dst)
+            return real_link(src, dst, **kwargs)
+        with mock.patch.object(afbackup.os, "link", side_effect=clobbering_link):
+            self.assertEqual(self.probe(), 1)
+        self.assertIn("REPLACED an existing file", self.stdout)
+        self.assertEqual(os.listdir(self.dest), [afbackup.MARKER])
+
+    def test_corrupting_storage_fails(self):
+        real_open = afbackup.open_regular_nofollow
+
+        class Corrupting:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def fileno(self):
+                return self.handle.fileno()
+
+            def read(self, *args):
+                data = bytearray(self.handle.read(*args))
+                if data:
+                    data[0] ^= 0xFF
+                return bytes(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.handle.close()
+        with mock.patch.object(afbackup, "open_regular_nofollow", side_effect=lambda p: Corrupting(real_open(p))):
+            self.assertEqual(self.probe(), 1, self.stdout)
+        self.assertIn("read-back DIFFERS", self.stdout)
+        self.assertIn("published probe file's content changed", self.stdout)
+        self.assertEqual(os.listdir(self.dest), [afbackup.MARKER])
+
+    def test_refused_without_marker_and_nothing_written(self):
+        os.unlink(os.path.join(self.dest, afbackup.MARKER))
+        self.assertEqual(self.probe(), 2)
+        self.assertIn("marker", self.stderr)
+        self.assertEqual(os.listdir(self.dest), [])
+
+    def test_refused_when_destination_not_mounted(self):
+        with mock.patch.object(afbackup, "is_mount_point", return_value=False):
+            self.assertEqual(self.probe(), 2)
+        self.assertIn("not a mount point", self.stderr)
+        self.assertEqual(os.listdir(self.dest), [afbackup.MARKER])
+
+    def test_refused_while_a_backup_holds_the_lock(self):
+        with afbackup.exclusive_lock(self.lock_file):
+            self.assertEqual(self.probe(), 2)
+        self.assertIn("lock", self.stderr)
+        self.assertEqual(os.listdir(self.dest), [afbackup.MARKER])
+
+    def test_needs_only_the_destination_setting(self):
+        self.config = self.write_config(BACKUP_RECIPIENTS_FILE=None, MEDIA_ROOT=None, DB_NAME=None)
+        self.assertEqual(self.probe(), 0, self.stdout + self.stderr)
+
+    def test_mount_option_warnings(self):
+        notes = afbackup.mount_option_warnings("nfs", "rw,soft,vers=3,sec=sys")
+        self.assertEqual(len(notes), 3)
+        self.assertEqual(afbackup.mount_option_warnings("nfs4", "rw,hard,vers=4.2,sec=krb5p"), [])
+        self.assertEqual(len(afbackup.mount_option_warnings("cifs", "rw,vers=2.1,hard")), 2)
+        self.assertEqual(afbackup.mount_option_warnings("cifs", "rw,vers=3.1.1,seal,hard,serverino"), [])
+        # what the Linux cifs client actually reported in the 8.4e loopback test (soft is its default)
+        observed = "rw,vers=3.1.1,uid=0,forceuid,gid=0,forcegid,file_mode=0600,dir_mode=0700,seal,soft,serverino"
+        notes = afbackup.mount_option_warnings("cifs", observed)
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(any("soft" in n for n in notes) and any("forced" in n for n in notes))
+        self.assertTrue(any("noserverino" in n for n in
+                            afbackup.mount_option_warnings("cifs", "vers=3.1.1,seal,hard,noserverino")))
+        self.assertEqual(len(afbackup.mount_option_warnings("fuse.sshfs", "rw")), 1)
+        self.assertEqual(afbackup.mount_option_warnings("ext4", "rw,relatime"), [])
+
+    def test_mount_details_parses_mountinfo(self):
+        sample = ("36 35 98:0 / /mnt/applyforge\\040backups rw,noatime master:1 - nfs4 nas:/export/af "
+                  "rw,vers=4.2,hard,sec=sys\n")
+        with mock.patch("builtins.open", mock.mock_open(read_data=sample)):
+            details = afbackup.mount_details("/mnt/applyforge backups")
+        self.assertEqual(details, ("nfs4", "nas:/export/af", "rw,noatime", "rw,vers=4.2,hard,sec=sys"))
+
+
 class RealAgeTests(BackupTestCase):
     """Round trip with the real age binary and a THROWAWAY identity created in the
     test's temporary directory (deleted with it); never a real backup key."""

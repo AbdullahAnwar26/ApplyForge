@@ -72,7 +72,11 @@ SystemCallArchitectures=native
 # client tool needs it). The NFS/SMB/FUSE client runs outside this unit.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
-# NOT yet applied - validate on the real host first (deploy/README.md 12.10):
-#   CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_KILL CAP_AUDIT_WRITE
-#   (runuser/PAM may additionally need CAP_SYS_RESOURCE for pam_limits; CAP_KILL is needed to
-#   stop a timed-out pg_dump running as postgres), SystemCallFilter=@system-service.
+# Capabilities root keeps (Milestone 8.4e; validated with transient units on Ubuntu 26.04 /
+# systemd 259): SETUID/SETGID/AUDIT_WRITE for runuser + PAM, DAC_OVERRIDE/DAC_READ_SEARCH to
+# read MEDIA_ROOT owned by the applyforge account, KILL to kill a timed-out pg_dump running
+# as postgres. Without DAC_* or KILL those steps were shown to fail; CAP_SYS_RESOURCE
+# (pam_limits) was not needed. Re-run deploy/README.md 12.10 on the real host.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_KILL CAP_AUDIT_WRITE
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

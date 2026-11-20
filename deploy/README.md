@@ -52,6 +52,9 @@ Files in this directory:
 | `backup/tests/` | not installed | automated tests with fictional data and stand-in tools |
 | `systemd/applyforge-backup.{service,timer}` | `/etc/systemd/system/` | daily backup at 03:30, strict sandbox, `ExecStopPost` service recovery |
 | `systemd/applyforge-backup.tmpfiles` | `/etc/tmpfiles.d/applyforge-backup.conf` | root-only state and work directories, shared lock file |
+| `host_check.py` | used in place from the release | read-only host readiness check (section 13.1) |
+| `tests/` | not installed | `test_host_check.py`; `stack_test.sh`, the nginx + Gunicorn end-to-end test (section 13.1) |
+| `PRODUCTION_READINESS.md` | not installed | readiness assessment, verified/unverified requirements, blockers and go/no-go checklist |
 
 ### Why one Gunicorn worker
 
@@ -76,8 +79,9 @@ Media and static files live outside the release tree, so upgrades and code rollb
 
 These are prepared outside this milestone. This runbook does not install or configure them.
 
-- **Server.** A current Ubuntu LTS (or Debian stable) host with systemd ≥ 247 and nginx ≥ 1.19.4 (needed for `ssl_reject_handshake`).
-- **Python 3.12.** This matches the version the test suite ran on. Install `python3-venv`.
+- **Server.** **Ubuntu 26.04 LTS** is the validated platform (Milestone 8.4e: systemd 259, nginx 1.28.3, PostgreSQL 18.6, age 1.2.1). Another current Ubuntu LTS or Debian stable host needs systemd ≥ 247 and nginx ≥ 1.19.4 (for `ssl_reject_handshake`), and the 8.4e checks repeated (`deploy/PRODUCTION_READINESS.md`).
+- **Python: the distribution's `python3`** (3.14.4 on Ubuntu 26.04; 3.12 or later is required) plus `python3-venv`. Ubuntu 26.04 has no `python3.12` package; don't install another interpreter. The full backend suite passes on 3.14.4 (Linux) and 3.12 (Windows development).
+- **Readiness check.** After provisioning, and before every deployment, run the read-only host check: `sudo python3 -I "$REL/deploy/host_check.py" --release "$REL"` (section 13.1).
 - **PostgreSQL 14 or later** on the same host, listening on `localhost` only. The Milestone 8.4b rehearsal used PostgreSQL 18.6.
 - **A working VPN.** The server needs a fixed VPN address (example: `10.99.0.1`), and clients need a known subnet (example: `10.99.0.0/24`). The host firewall must not expose ports 80 or 443 on any public interface. nginx binds to the VPN address only, but the firewall is the primary control.
 - **Name resolution.** A private host name (example: `applyforge.vpn.example`) must resolve to the VPN address for VPN clients, through internal DNS or a hosts file.
@@ -193,9 +197,12 @@ sudo test -f "$REL/frontend/dist/index.html"
 sudo find "$REL" -name '.env' -print                    # must print nothing
 
 # Per-release virtual environment. Old releases keep their own dependencies for rollback.
-sudo python3.12 -m venv "$REL/.venv"
-sudo "$REL/.venv/bin/pip" install --no-cache-dir --upgrade pip
-sudo "$REL/.venv/bin/pip" install --no-cache-dir -r "$REL/backend/requirements.txt"
+sudo python3 -m venv "$REL/.venv"
+# Wheels only, exact versions for every package (backend/constraints.txt was resolved and
+# tested on Ubuntu 26.04 / Python 3.14.4). pip itself is left at the distribution's version.
+sudo "$REL/.venv/bin/pip" install --no-cache-dir --only-binary=:all: \
+     -r "$REL/backend/requirements.txt" -c "$REL/backend/constraints.txt"
+sudo "$REL/.venv/bin/pip" check
 sudo "$REL/.venv/bin/python" -m compileall -q "$REL/backend" "$REL/deploy"   # the service cannot write bytecode
 
 sudo chown -R root:root "$REL"
@@ -434,7 +441,7 @@ This is out of scope for this configuration and needs a separate, approved chang
 
 > **Restoring data is not a code rollback.** A code rollback (section 10) only switches releases and never touches the database or media. A restore (section 12.6) only ever creates a **new** database, owned by an isolated restore role, and a **new** media directory. Pointing the application at restored data, including transferring ownership, is a separate decision that needs explicit approval (section 12.7). No tool in this repository drops, overwrites or switches production data.
 
-The tool is `deploy/backup/afbackup.py`, installed as `/usr/local/sbin/applyforge-backup`, with four commands: `create`, `verify`, `restore` and `recover-service`.
+The tool is `deploy/backup/afbackup.py`, installed as `/usr/local/sbin/applyforge-backup`, with five commands: `create`, `verify`, `restore`, `recover-service` and `probe-destination` (Milestone 8.4e).
 
 - It uses only the Python standard library.
 - It calls `age`, the PostgreSQL client tools, `systemctl` and `runuser`, found only on a fixed search path (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin`).
@@ -568,12 +575,26 @@ The destination must be **storage on another machine**, mounted at `BACKUP_DESTI
 | Requirement | NFS | SMB/CIFS | sshfs |
 |---|---|---|---|
 | Exclusive create (`O_EXCL`) | **NFSv3 or later** (NFSv2 is unsafe) | yes | yes |
-| No-clobber publication: hard link, or `RENAME_NOREPLACE` | hard links: yes | hard links only with Unix extensions or an NTFS backend; **`RENAME_NOREPLACE` is usually unsupported**, so without hard links the backup fails closed | hard links need the server's `hardlink@openssh.com` extension (OpenSSH has it) |
-| Stable inode identity (`O_NOFOLLOW` plus inode checks) | yes | mount with **`serverino`** (with `noserverino`, inode numbers are synthesized and checks may fail) | yes |
+| No-clobber publication: hard link, or `RENAME_NOREPLACE` | hard links: yes | Samba with a POSIX backend: hard links work (validated, see below); other servers (Windows, NAS appliances) **must be probed**. Without hard links and `RENAME_NOREPLACE` the backup fails closed | hard links need the server's `hardlink@openssh.com` extension (OpenSSH has it) |
+| Stable inode identity (`O_NOFOLLOW` plus inode checks) | yes | mount with **`serverino`** (the default; with `noserverino`, inode numbers are synthesized and checks fail) | yes |
 | Durability of `fsync`/`close` | depends on the export: use **`sync`** | depends on the server (strict sync) | depends on the SFTP server |
-| Root writes | with `root_squash`, files are written as the squashed user, so make the export directory writable by it | as the mount's credentials | as the remote user |
+| Root writes | with `root_squash`, files are written as the squashed user, so make the export directory writable by it | as the mount's credentials; owner and modes shown on the client are **forced by mount options** | as the remote user |
+| Mount behaviour on server outage | `hard` (default): I/O blocks until the server returns; the unit's `TimeoutStartSec` bounds the run | the cifs default is **`soft`**: mount with **`hard`** | blocks or fails per sshfs options |
 
-**Recommended:** NFSv4 with a `sync` export.
+**Validated on 2026-11-20 (Milestone 8.4e) with `applyforge-backup probe-destination`**, all disposable and on loopback (Ubuntu 26.04, kernel 6.18):
+
+| Destination | Result | Publication | Notes |
+|---|---|---|---|
+| NFSv4.2, export `sync,no_root_squash`, mount `hard` | pass | hard link | |
+| NFSv4.2, export `sync,root_squash` | pass | hard link | files owned by `nobody` (warning: anyone with that uid on the NFS server can delete archives) |
+| NFSv4.2 mounted `soft` | pass, with warning | hard link | the probe flags `soft` |
+| SMB 3.1.1, Samba 4.23, `seal`, cifs client | pass | hard link | cifs mounted `soft` by default; ownership/modes forced by `uid=`/`file_mode=` |
+| ext4, tmpfs | pass | hard link | local only - not off-host |
+| vfat | pass | `renameat2(RENAME_NOREPLACE)` | proves the fallback path; no POSIX modes |
+
+The probe proves the **client-visible semantics on that test setup**, not the durability promises of a particular NAS. Run it on the real share (below).
+
+**Recommended: NFSv4.1+ with a `sync` export, restricted to this server's address, mounted `hard`, with snapshots on the storage side.** Use `sec=krb5p` if the network path between server and storage is not private. Choose SMB 3.1.1 only with `seal`, `hard`, `serverino` and a passing probe. sshfs is not recommended (FUSE, depends on the SFTP server's extensions).
 
 What the tool **cannot** guarantee on any share:
 - that the server persisted the data after a successful `fsync`;
@@ -601,7 +622,13 @@ sudo install -m 0644 "$REL/deploy/systemd/applyforge-backup.service" "$REL/deplo
 sudoedit /etc/systemd/system/applyforge-backup.service   # RequiresMountsFor=/ReadWritePaths= must match backup.conf
 sudo systemctl daemon-reload
 sudo systemd-analyze verify /etc/systemd/system/applyforge-backup.service
+
+# Qualify the mounted share BEFORE the first backup and after any storage change. Writes only
+# a private .applyforge-probe-<random> directory on the share and removes it; holds the lock.
+sudo applyforge-backup probe-destination        # every line PASS (WARN lines: read and decide); exit 0
 ```
+
+`probe-destination` checks: the mount point and marker, the filesystem type against `BACKUP_ALLOWED_FS_TYPES`, mount options (NFS `soft`/version/`sec=sys`; SMB dialect, `seal`, `soft`, `noserverino`, forced ownership), exclusive creation, write + `fsync`, read-back hash, ownership (root squashing) and mode, `(device, inode)` stability, no-clobber publication by hard link or `RENAME_NOREPLACE`, `O_NOFOLLOW` and deletion. A `FAIL` means `create` would refuse or could not be trusted on that storage.
 
 **Path rules.**
 
@@ -617,7 +644,7 @@ The tool refuses:
 - the lock file inside the destination or media;
 - `MEDIA_ROOT`, or a restore target, under `/etc`, `/root`, `/home` or `/srv/applyforge`.
 
-**Sandbox.** The unit uses `ProtectSystem=strict`, with write access only to the destination, state and work directories, plus `RestrictAddressFamilies`. The capability limit is listed in the unit but **not applied** until host testing (section 12.10).
+**Sandbox.** The unit uses `ProtectSystem=strict`, with write access only to the destination, state and work directories, `RestrictAddressFamilies`, `SystemCallFilter=@system-service` and `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_KILL CAP_AUDIT_WRITE` (exposure 2.7). These were validated with the real tool under transient units on Ubuntu 26.04 (section 12.10); a negative control without the DAC and KILL capabilities failed as expected. If `runuser` fails on the production host with a PAM error, check `journalctl -u applyforge-backup` before widening anything.
 
 ### 12.4 Backup procedure, maintenance window and service recovery
 
@@ -630,7 +657,7 @@ sudo cat /var/lib/applyforge-backup/index.tsv        # created, name, sha256, si
 
 1. **Keep an independent copy of the hashes.** The index is the primary trusted record but is lost with the server. Regularly copy `index.tsv`, or the `sha256=` journal lines, to the offline machine or another trusted place that **isn't** the backup share. Only `recorded` lines whose name has no later `failed` line are valid.
 2. **Run manual backups through the unit.** Use `systemctl start applyforge-backup.service` rather than `sudo applyforge-backup create` in a terminal. The unit runs detached from your SSH session and has `ExecStopPost` recovery. A terminal run still handles SIGHUP, SIGINT and SIGTERM, and a closed terminal, by restarting ApplyForge before exiting. But a **SIGKILL** of a terminal run can only be recovered manually.
-3. **First backup.** Run it, copy the archive and its hash to the offline machine, and **verify it there with `--expected-sha256`** (section 12.6). Only then enable the timer: `sudo systemctl enable --now applyforge-backup.timer`.
+3. **First backup.** Run `sudo applyforge-backup probe-destination` first (section 12.3). Then run the backup, copy the archive and its hash to the offline machine, and **verify it there with `--expected-sha256`** (section 12.6). Only then enable the timer: `sudo systemctl enable --now applyforge-backup.timer`.
 4. **Service recovery rules.** A marker means "this tool stopped ApplyForge":
    - **Automatic recovery** happens only in the unit's `ExecStopPost`, only for the marker of **the same invocation**, on the **same boot**, and only if ApplyForge has been **neither started nor stopped since** the backup stopped it (its `Active/InactiveEnterTimestampMonotonic` are unchanged).
    - **A later backup never starts ApplyForge because an old marker exists.** If the service is active, the marker is obsolete and is removed. If the service was started or stopped since (a deliberate action), the marker is removed and the service is left as it is. If the marker is ambiguous (a reboot, an unreadable marker, a transitional state), the backup refuses with exit code 2 until you investigate.
@@ -831,16 +858,18 @@ These cannot be validated with stand-in tools and must be checked on the actual 
   - A wrong identity, truncation, corruption (payload, last byte, header) and a missing age header are all refused.
   - age's non-zero exits (an invalid recipient, a SIGKILL mid-encryption) publish nothing, record nothing and leave no partial file, plaintext or open file descriptors.
   - The automated real-age test now runs instead of being skipped. Repeat it on the production server's own `age` build.
-- **systemd sandbox.**
-  - `ProtectSystem=strict` with `ReadWritePaths`, `PrivateDevices` and `RestrictAddressFamilies` together with `runuser`/PAM (`pam_systemd`, `pam_limits`), `systemctl` over D-Bus and the mounted share.
-  - Whether `RequiresMountsFor`/automount behaves as expected.
-  - Which capabilities are really needed, before applying the commented `CapabilityBoundingSet`.
-- **`ExecStopPost` recovery.**
-  - `$INVOCATION_ID` matching.
-  - The timestamps of a real `applyforge.service`, including `Type=notify` and a failed start.
-  - Behaviour during shutdown.
-- **The share.** Not yet validated. The rehearsal below used a local **tmpfs**, which proves nothing about NFS/SMB/sshfs.
-  - `O_EXCL`, hard links or `RENAME_NOREPLACE`, inode stability and `fsync` semantics on the chosen mount (section 12.3).
+- **systemd sandbox — validated on 2026-11-20** (Ubuntu 26.04 under WSL, systemd 259, transient units carrying the unit file's own directives):
+  - With `ProtectSystem=strict`, `PrivateDevices`, `RestrictAddressFamilies`, `SystemCallFilter=@system-service` and the capability set now applied: `runuser`/PAM, `psql`/`pg_dump` with peer authentication, `systemctl` over D-Bus, `flock` on the read-only lock, `age`, and reading a `0700` media directory owned by another account all work. Writes outside `ReadWritePaths`, user namespaces and outbound IP are denied.
+  - **Negative control:** without `CAP_DAC_*` and `CAP_KILL`, reading the other account's media and killing a `postgres`-owned process fail. `CAP_SYS_RESOURCE` was not needed.
+  - **Still on the production host:** the real share under the sandbox, and `RequiresMountsFor`/automount behaviour.
+- **`ExecStopPost` recovery — validated on 2026-11-20** with the real tool, a disposable dummy service (a runtime unit), a tmpfs destination, a throwaway age key and a read-only `pg_dump` of the `postgres` maintenance database (26/26 checks):
+  - **Normal run:** the dummy service was stopped for the capture and started again (new `ActiveEnterTimestamp`); one archive was recorded and verified with `--expected-sha256`; no plaintext, marker or `pg_dump` was left.
+  - **SIGKILL during the capture:** systemd killed `runuser` and `pg_dump`; `ExecStopPost` (`recover-service`, same `$INVOCATION_ID`) started the dummy service and cleared the marker; nothing was published. The run directory left behind (its per-run lock free) was removed by a later run once older than 15 minutes.
+  - **SIGTERM during the capture:** handled in-process: the service was started again, temporary files removed, exit 1, `ExecStopPost` found no marker.
+  - **Service inactive before the backup:** it stayed inactive.
+  - **Still on the production host:** a real `Type=notify` `applyforge.service`, a failed start, and behaviour during shutdown.
+- **Timed-out `pg_dump` — fixed on 2026-11-20.** `pg_dump` runs as `runuser -u postgres -- pg_dump`, and `runuser` forks. A capture timeout used to kill only `runuser` and leave `pg_dump` running (reproduced on Ubuntu 26.04). It now runs in its own session and the whole process group is killed; a regression test fails against the old code.
+- **The share — client semantics validated on 2026-11-20** with `probe-destination` against loopback NFSv4.2 (`sync`, with and without `root_squash`), SMB 3.1.1 (Samba 4.23), ext4, tmpfs and vfat (section 12.3). **Still on the production host:** the probe against the real storage, a full backup and restore through it, the storage's own snapshot/retention, and the behaviour when the storage is unreachable (a `hard` mount blocks until `TimeoutStartSec`).
 - **PostgreSQL end-to-end — rehearsed on 2026-11-20.**
   - **Setup:** PostgreSQL 18.6 and age 1.2.1, Ubuntu 26.04 under WSL. Disposable databases, roles, OS account and fictional data.
   - **Backup:** the real `create` dumped a source database and its media.
@@ -856,3 +885,79 @@ These cannot be validated with stand-in tools and must be checked on the actual 
   - **Fixed afterwards:** the rehearsal found restored media subdirectories at `0700` instead of `0750` (the process umask). Directories are now set to `0750` explicitly, with regression tests.
   - **Still to do on the production host:** peer and `pg_ident` behaviour, the identity and `pg_shdepend` queries on its PostgreSQL version, and the PUBLIC-privilege hardening in section 12.6.
 - **tmpfiles.d.** Creation as root, and the cleanup age of the work directory.
+
+---
+
+## 13. Readiness checks and operational procedures (Milestone 8.4e)
+
+`deploy/PRODUCTION_READINESS.md` records what has been validated, what has not, and the go/no-go checklist. The procedures below are the routine ones.
+
+### 13.1 Readiness checks
+
+| Check | When | Command | Changes anything? |
+|---|---|---|---|
+| Host check | after provisioning; before every deployment; after OS or PostgreSQL upgrades | `sudo python3 -I "$REL/deploy/host_check.py" --release "$REL"` (add `--strict` to fail on warnings) | no: secrets are only stat()ed, SQL is read-only, commands are read-only |
+| Configuration preflight | automatically before every start and management command | `sudo applyforge-manage "$REL" check --deploy` | no |
+| Destination probe | before the first backup; after any storage change | `sudo applyforge-backup probe-destination` | writes and removes its own probe directory on the share |
+| Stack test | on a workstation or test VM when `deploy/nginx`, `deploy/gunicorn.conf.py` or settings change | `deploy/tests/stack_test.sh --venv <venv>` (normal user, loopback high ports) | no (temporary directory, removed) |
+| Backup tests | when `deploy/backup` changes | `python3 -m unittest discover -s deploy/backup/tests` (Linux) | no |
+
+The host check prints `PASS`, `WARN`, `FAIL`, `INFO` and `SKIP` lines and exits 1 on any `FAIL`. It never opens `/etc/applyforge/applyforge.env` or private keys, runs PostgreSQL queries as `postgres` in `default_transaction_read_only` sessions, and never starts, stops, enables or mounts anything. It covers:
+
+- OS, systemd and clock synchronisation; CPU, memory and free space;
+- tool versions; the virtualenv against `backend/constraints.txt`, and `pip check`;
+- the service and restore accounts; the layout and modes of section 1; the release tree (root-owned, not writable, no `.env`); installed copies against the release;
+- `systemd-analyze verify` and the app unit's exposure score;
+- nginx: `nginx -t`, the default site, listen addresses, leftover placeholders, certificate expiry and host name;
+- listening sockets and the firewall policy;
+- PostgreSQL: version, `listen_addresses`, `password_encryption`, `pg_hba` rules, peer authentication, role attributes and memberships, database owner and PUBLIC rights;
+- backup configuration, mount, recipients (no private key) and the age of the last recorded backup.
+
+### 13.2 Logs and what to watch
+
+| Source | Command | Watch for |
+|---|---|---|
+| ApplyForge (Gunicorn, Django) | `journalctl -u applyforge -f` | `preflight: FAILED`, tracebacks, worker timeouts, repeated restarts (`systemctl show -p NRestarts applyforge`) |
+| nginx | `/var/log/nginx/applyforge.{access,error}.log` | 5xx bursts, 403s from VPN addresses (allowlist), TLS handshake errors |
+| Backups | `journalctl -u applyforge-backup` | exit 1 (failed), **2** (marker needs investigation), **3** (ApplyForge down), **4** (retention failed); no run in 36 hours |
+| PostgreSQL | `journalctl -u postgresql@18-main` and `/var/log/postgresql/` | authentication failures, connection-limit errors, disk full |
+| System | `journalctl -p warning -b`, `df -h`, `systemctl --failed` | full disks (database, work directory, share), failed units, OOM kills |
+
+Set journald's `SystemMaxUse=` so logs cannot fill `/var`. Alert at least on: `applyforge` not active, `applyforge-backup` failed or not run for 36 hours, the health check failing, disk usage above 80 %, and certificate expiry within 30 days.
+
+### 13.3 Routine maintenance
+
+- **Monthly.** Run the host check. Apply OS security updates (`sudo apt update && sudo apt upgrade`), then `sudo systemctl restart applyforge` and the health checks (section 8.1). A PostgreSQL **minor** update restarts PostgreSQL; ApplyForge reconnects on the next request.
+- **PostgreSQL major upgrade.** A separate, planned change: back up, verify the archive offline, upgrade with `pg_upgradecluster`, run the host check, take a new backup.
+- **Python.** Release virtualenvs use the system interpreter. After a Python patch update, run `sudo "$REL/.venv/bin/pip" check` and the health checks. A new Python minor version needs a new release (section 5).
+- **Dependencies.** Change `backend/requirements.txt`, regenerate `backend/constraints.txt` in a fresh venv (`pip freeze`), run the backend tests and `pip-audit`, and ship a new release.
+- **Certificate renewal.** Install the new certificate and key with the same paths and modes, run `sudo nginx -t && sudo systemctl reload nginx`, then check the expiry from a VPN client.
+- **Quarterly restore drill.** Restore the latest archive into a new database and directory (section 12.6), validate it (section 12.7), then drop the copy (`sudo -u postgres dropdb <copy>`) and remove the directory.
+- **Releases.** Keep two or three; delete older ones (section 9).
+
+### 13.4 Security incidents
+
+Contain first, then investigate. Keep notes with times.
+
+| Incident | Immediate actions |
+|---|---|
+| **API token disclosed** | Generate a new `API_TOKEN` (section 3.2), restart ApplyForge, give users the new token over a trusted channel. Review the nginx access log for unexpected VPN addresses. |
+| **`SECRET_KEY` disclosed** | Replace it and restart. Signed values become invalid; API clients use the token and are not affected. |
+| **Database password disclosed** | `sudo -u postgres psql -c "\password applyforge"`, update `DATABASE_URL`, restart. Confirm `listen_addresses` and `pg_hba` still limit access to localhost. |
+| **A VPN client's credentials lost** | Revoke that peer in the VPN and rotate the API token. |
+| **age private key exposed** | Create a new key pair offline, replace the recipients file, take and verify a new backup. Treat every older archive as readable by whoever holds the key; delete them once the new backups are verified if that data must not be exposed. |
+| **age private key lost** | Create a new key pair; older archives cannot be decrypted (section 12.2). Take and verify a new backup now. |
+| **Server suspected compromised** | Disconnect it from the VPN (keep it powered for forensics if needed). Don't trust its local index; use offline hash records. Rebuild on a new server (section 12.8) from an archive verified offline. Rotate **all** secrets: token, `SECRET_KEY`, database password, TLS key, VPN keys, and the age key if it was ever on that server. |
+| **Backup storage compromised** | Archives stay confidential and tampering is detected by the trusted hashes. Take a new backup to clean storage, verify it, and verify any older archive against offline records before using it. |
+
+### 13.5 Failures and disaster recovery
+
+| Failure | Procedure | Data loss |
+|---|---|---|
+| ApplyForge does not start | `journalctl -u applyforge -n 100`; fix the reported preflight variable or roll back the release (section 10); then `sudo systemctl reset-failed applyforge` | none |
+| PostgreSQL down or damaged | Restart it. If the data directory is damaged, restore the latest verified archive into a new database (section 12.6) and switch through the gate (section 12.7) | since the last backup |
+| Disk full | Find the cause (`sudo du -xh /var \| sort -h \| tail`); journald and `BACKUP_WORK_DIR` are the usual suspects. Never delete files under `/var/lib/postgresql` by hand | none if handled before PostgreSQL stops |
+| Server lost | Section 12.8 on a new server, with an archive verified offline against the offline hash record | since the last backup |
+| Backup storage lost | Provision new storage, mount it, add the marker, run `probe-destination`, take and verify a new backup | none (history only) |
+
+Recovery objectives with the shipped configuration: **RPO 24 hours** (daily backup at 03:30) and an **RTO of a few hours** for a rebuild (provisioning, restore, validation). Back up more often only after measuring the maintenance window, because each backup stops ApplyForge briefly.

@@ -135,10 +135,12 @@ Existing data-integrity constraints:
   Ollama only.
 - `PROJECT_CONTEXT.md`. It is gitignored and was lost.
 - A deployed server. Milestone 8.4c added the deployment configuration and
-  runbook (`deploy/`), but nothing has been provisioned or deployed.
-- A real backup or restore. Milestone 8.4d added the backup tool and its tests
-  (fictional data and stand-in tools only); `age` is not installed on the
-  development machine, and no PostgreSQL restore rehearsal has been run.
+  runbook (`deploy/`), and Milestone 8.4e validated it locally, but nothing has
+  been provisioned or deployed (`deploy/PRODUCTION_READINESS.md`).
+- A production backup or restore. Milestone 8.4d added the backup tool; the
+  real `age` integration and a PostgreSQL restore rehearsal ran in WSL with
+  disposable resources, and 8.4e exercised the systemd recovery path and
+  loopback NFS/SMB. No real backup storage has been used.
 
 The React + Vite frontend (`frontend/`) was added in Milestone 7.
 
@@ -674,7 +676,7 @@ most 5 posts. They wrote only to the scratch database
 | 5 | Generation via local Ollama/Qwen (rules 6–8, 10): grounded prompts, clear failure that changes only `last_error`, throttled endpoint, editable drafts, `SENT` → job `APPLIED` | **Done (uncommitted; verified with a simulated Ollama only)**. Batch generation through Celery is deferred. |
 | 6 | Integrated LinkedIn collector (rule 12): 6a parsing, service, command and offline tests; 6b Playwright browser source; 6c `CollectorRun` and API | **6a, 6b and 6c done:** browser source validated live into the scratch database and hardened; 6c run history and API verified offline. |
 | 7 | React + Vite frontend dashboard | **Done** (frontend `17420d2`, integration hardening `16c2ba0`). |
-| 8 | Production readiness: settings hardening, dependency upgrades, health check, PostgreSQL, private deployment, backups | **8.1–8.3 done** (`ba57c62`). **8.4b** PostgreSQL rehearsal passed (PostgreSQL 18.6; all migrations, checks and 557 backend tests). **8.4c** private/VPN deployment configuration and runbook written; not yet used on a server. **8.4d** encrypted backup and restore tool, documentation and 140 tests written, including two security corrective passes; real `age` 1.2.1 integration validated (2026-11-19); real PostgreSQL 18.6 backup/restore rehearsal passed (2026-11-20, disposable objects, **tmpfs** destination - NFS/SMB and the systemd recovery path not yet validated). |
+| 8 | Production readiness: settings hardening, dependency upgrades, health check, PostgreSQL, private deployment, backups | **8.1–8.3 done** (`ba57c62`). **8.4b** PostgreSQL rehearsal passed (PostgreSQL 18.6; all migrations, checks and 557 backend tests). **8.4c** private/VPN deployment configuration and runbook written; not yet used on a server. **8.4d** encrypted backup and restore tool, documentation and 140 tests written, including two security corrective passes; real `age` 1.2.1 integration validated (2026-11-19); real PostgreSQL 18.6 backup/restore rehearsal passed (2026-11-20, disposable objects, **tmpfs** destination). **8.4e** production readiness (2026-11-20): Ubuntu 26.04 / Python 3.14 selected and validated (psycopg2-binary 2.9.13, `backend/constraints.txt`); real nginx + Gunicorn end-to-end test 61/61; systemd sandboxes and backup `ExecStopPost` recovery validated (26/26); orphaned `pg_dump` on timeout fixed; backup capability set applied; `probe-destination` and `deploy/host_check.py` added; NFS/SMB client semantics probed; readiness assessment, operations and incident runbooks written. **Not production-ready** until the real-host blockers in `deploy/PRODUCTION_READINESS.md` are closed. |
 
 Order may be adjusted, but each milestone should leave `manage.py check`,
 `makemigrations --check` and the test suite passing.
@@ -724,7 +726,7 @@ authoritative.
   - A code rollback switches the symlink back. It never restores or migrates
     the database; that is a separate, explicit decision (Milestone 8.4d).
 
-### Backup and restore (Milestone 8.4d) [Tested with fictional data only; no real rehearsal yet]
+### Backup and restore (Milestone 8.4d, 8.4e) [Rehearsed locally with disposable resources; no production storage yet]
 
 `deploy/backup/afbackup.py` (installed as `applyforge-backup`) is described in
 section 12 of `deploy/README.md`, which is authoritative.
@@ -811,7 +813,7 @@ section 12 of `deploy/README.md`, which is authoritative.
 - **Signals and environment.** SIGTERM, SIGHUP and SIGINT are handled, and
   logging can't block recovery. Subprocesses get a minimal explicit
   environment.
-- **Tests.** 140 tests with fictional data and stand-in tools, including a
+- **Tests.** 140 tests in 8.4d (152 after 8.4e) with fictional data and stand-in tools, including a
   real-`age` round trip.
 - **Real `age` 1.2.1, validated in WSL on 2026-11-19:** streaming
   encryption, a trusted hash matching age's output, byte-for-byte decryption,
@@ -828,6 +830,33 @@ section 12 of `deploy/README.md`, which is authoritative.
   `0700` instead of `0750`; this is fixed and covered by regression tests.
 - **Production hardening:** revoke the default PUBLIC `CONNECT`/`TEMP` on the
   production database (`deploy/README.md` section 12.6).
+- **Milestone 8.4e additions:**
+  - `pg_dump` runs in its own session; a capture timeout kills the whole
+    process group. Previously only `runuser` was killed and `pg_dump` kept
+    running (reproduced on Ubuntu 26.04).
+  - `probe-destination` checks a mounted destination with its own probe files
+    (exclusive create, fsync, read-back, inode stability, no-clobber
+    publication, O_NOFOLLOW, deletion, mount options).
+  - The backup unit applies `CapabilityBoundingSet` and
+    `SystemCallFilter=@system-service`, validated under systemd 259.
+  - Real `create` under systemd: normal run, SIGKILL recovered by
+    `ExecStopPost`, SIGTERM, and an inactive service left inactive.
+  - 152 tests; 36 of 36 mutants killed.
+
+### Production readiness (Milestone 8.4e) [Validated locally; no production host yet]
+
+`deploy/PRODUCTION_READINESS.md` is authoritative: the selected architecture,
+the evidence, verified and unverified requirements, PostgreSQL and backup
+storage recommendations, blockers, the authorizations still needed and the
+go/no-go checklist. Runbook section 13 covers readiness checks, logs,
+maintenance, security incidents and disaster recovery.
+
+- **Platform:** Ubuntu 26.04 LTS with the distribution's Python 3.14; release
+  virtualenvs are installed wheel-only from `backend/requirements.txt` with
+  `backend/constraints.txt`.
+- **Checks:** `deploy/host_check.py` (read-only host check; never opens
+  secrets; read-only SQL), `deploy/tests/stack_test.sh` (real nginx + Gunicorn,
+  61 checks), `applyforge-backup probe-destination`.
 - **Remaining real-host checks:** listed in `deploy/README.md` section 12.10.
 
 ---

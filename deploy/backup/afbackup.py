@@ -16,6 +16,7 @@ POSIX systems with age.
                                       --confirm-database NAME --confirm-media-dir DIR
                                       [--config FILE] [--media-owner USER] [--allow-unindexed]
     applyforge-backup recover-service [--config FILE] [--discard-marker]
+    applyforge-backup probe-destination [--config FILE]
 
 Trust model. age encrypts and integrity-protects an archive, but anyone holding the
 PUBLIC recipient can create a valid archive, and the off-host share controls what it
@@ -193,6 +194,34 @@ def run(args, new_session=False, **kwargs):
         return subprocess.run(args, check=False, env=clean_env(), start_new_session=new_session, **kwargs)
     except OSError as exc:
         raise Failed(f"could not run {args[0]} ({exc.strerror})") from None
+
+
+def run_with_deadline(args, timeout, **kwargs):
+    """Like run(), with a timeout that kills the whole process group, not just the direct
+    child. pg_dump runs as `runuser -u postgres -- pg_dump`; subprocess.run's timeout would
+    SIGKILL only runuser and leave the postgres-owned pg_dump running (verified on Ubuntu
+    26.04, Milestone 8.4e). The command gets its own session so the group holds exactly it."""
+    try:
+        proc = subprocess.Popen(args, env=clean_env(), start_new_session=True, **kwargs)
+    except OSError as exc:
+        raise Failed(f"could not run {args[0]} ({exc.strerror})") from None
+    try:
+        _, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode, None, stderr)
 
 
 def last_line(data):
@@ -1013,10 +1042,10 @@ def dump_database(cfg, path, deadline):
     remaining = max(1.0, deadline - time.monotonic())
     try:
         with open(path, "xb") as out:
-            result = run(pg_command(cfg, ["pg_dump", "--format=custom", "--no-password",
-                                          f"--lock-wait-timeout={cfg.pg_lock_wait * 1000}",
-                                          f"--dbname={cfg.db_name}"]),
-                         stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.PIPE, timeout=remaining)
+            result = run_with_deadline(pg_command(cfg, ["pg_dump", "--format=custom", "--no-password",
+                                                        f"--lock-wait-timeout={cfg.pg_lock_wait * 1000}",
+                                                        f"--dbname={cfg.db_name}"]),
+                                       remaining, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.PIPE)
     except subprocess.TimeoutExpired:
         raise Failed("pg_dump did not finish before the capture deadline (BACKUP_CAPTURE_TIMEOUT_SECONDS)") from None
     if result.returncode != 0:
@@ -1973,6 +2002,276 @@ def cmd_recover_service(args):
     return EXIT_OK
 
 
+# --- Probe the backup destination (Milestone 8.4e) ------------------------------------------------
+
+PROBE_PREFIX = ".applyforge-probe-"
+PROBE_BYTES = 4 * 1024 * 1024
+LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK, errno.ENOSYS)
+
+
+def mount_details(path):
+    """(filesystem type, source, per-mount options, superblock options) of the mount at path."""
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    found = None
+    for line in lines:
+        left, _, right = line.partition(" - ")
+        fields, rest = left.split(), right.split()
+        if len(fields) < 6 or len(rest) < 3:
+            continue
+        mount_point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
+        if mount_point == path:
+            found = (rest[0], rest[1], fields[5], rest[2])
+    return found
+
+
+class ProbeReport:
+    def __init__(self):
+        self.failures = self.warnings = 0
+
+    @staticmethod
+    def _emit(tag, message):
+        try:
+            print(f"{tag}  {message}", flush=True)
+        except (OSError, ValueError):
+            pass
+
+    def ok(self, message):
+        self._emit("PASS", message)
+
+    def info(self, message):
+        self._emit("INFO", message)
+
+    def warn(self, message):
+        self.warnings += 1
+        self._emit("WARN", message)
+
+    def fail(self, message):
+        self.failures += 1
+        self._emit("FAIL", message)
+
+
+def mount_option_warnings(fs_type, options):
+    opts = {o.strip() for o in options.split(",") if o.strip()}
+    notes = []
+    if fs_type.startswith("nfs"):
+        if opts & {"soft", "softerr"}:
+            notes.append("NFS is mounted 'soft': a server hiccup can surface as an I/O error or a short "
+                         "write; mount it 'hard' (the default)")
+        vers = next((o.split("=", 1)[1] for o in opts if o.startswith(("vers=", "nfsvers="))), "")
+        if vers and not vers.startswith("4"):
+            notes.append(f"NFS version {vers}: use NFSv4.1 or later")
+        if "sec=sys" in opts:
+            notes.append("NFS sec=sys trusts client UIDs: restrict the export to this server's address only "
+                         "(sec=krb5p if the network path is not private)")
+    if fs_type in ("cifs", "smb3"):
+        if not any(o.startswith("vers=3") for o in opts):
+            notes.append("SMB dialect below 3 or not shown: require vers=3.1.1")
+        if "seal" not in opts:
+            notes.append("SMB 'seal' (transport encryption) is off: archives are encrypted, but file names "
+                         "and metadata cross the network in the clear")
+        if "hard" not in opts:
+            notes.append("SMB is mounted 'soft' (the cifs default): a server hiccup can surface as an I/O "
+                         "error mid-write; mount it with 'hard'")
+        if "noserverino" in opts:
+            notes.append("SMB 'noserverino': inode numbers are generated by the client and can change, which "
+                         "breaks create's identity check; remove noserverino")
+        if opts & {"forceuid", "forcegid"} or any(o.startswith(("file_mode=", "dir_mode=")) for o in opts):
+            notes.append("SMB ownership/modes shown here are forced by the client mount options (uid=, "
+                         "file_mode=), not stored on the server: check the share's ACL on the server so only "
+                         "this server's account can write or delete")
+    if fs_type.startswith("fuse"):
+        notes.append("FUSE filesystem: hard-link, O_EXCL and fsync semantics depend on the driver; rely only "
+                     "on the results below and re-run this probe after driver upgrades")
+    return notes
+
+
+def cmd_probe_destination(args):
+    """Check, with a few small files of its own, that the mounted destination provides what
+    `create` relies on (exclusive creation, durable writes, faithful reads, stable inode
+    identity, no-clobber publication, O_NOFOLLOW, deletion). Writes only inside a new
+    directory .applyforge-probe-<random> and removes it; never touches archives. Holds the
+    shared lock, so it cannot run during a backup."""
+    require_posix()
+    require_root()
+    cfg = load_config(args.config, ("BACKUP_DESTINATION",))
+    report = ProbeReport()
+    check_destination(cfg)
+    dest = cfg.destination
+    report.ok(f"{dest} is a mount point carrying {MARKER} and is writable")
+    details = mount_details(dest)
+    if details:
+        fs_type, source, options, super_options = details
+        report.info(f"filesystem {fs_type} from {source}; mount options {options}; superblock {super_options}")
+        for note in mount_option_warnings(fs_type, options + "," + super_options):
+            report.warn(note)
+        if cfg.allowed_fs_types:
+            report.ok(f"filesystem type {fs_type} is in BACKUP_ALLOWED_FS_TYPES")
+        else:
+            report.warn(f"BACKUP_ALLOWED_FS_TYPES is empty: set it to {fs_type} so a wrong mount is refused")
+    usage = shutil.disk_usage(dest)
+    report.info(f"free space {usage.free} of {usage.total} bytes; compare with archive size x (retention "
+                "days + BACKUP_MIN_KEEP) plus a margin")
+
+    with exclusive_lock(cfg.lock_file):
+        probe_dir = os.path.join(dest, PROBE_PREFIX + os.urandom(8).hex())
+        try:
+            os.mkdir(probe_dir, 0o700)
+        except OSError as exc:
+            raise Failed(f"cannot create a directory in {dest} ({exc.strerror})") from None
+        try:
+            _probe_files(probe_dir, report)
+        except OSError as exc:
+            report.fail(f"unexpected error during the probe ({exc.strerror or exc})")
+        finally:
+            for name in PROBE_FILES:
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(probe_dir, name))
+            try:
+                os.rmdir(probe_dir)
+                fsync_directory(dest)
+                report.ok("probe files and directory removed (deletion works, as retention requires)")
+            except OSError as exc:
+                report.fail(f"could not remove {probe_dir} ({exc.strerror}); inspect and remove it by hand")
+
+    report._emit("RESULT", f"{'FAILED' if report.failures else 'OK'}: {report.failures} failure(s), "
+                           f"{report.warnings} warning(s)")
+    return EXIT_FAILED if report.failures else EXIT_OK
+
+
+PROBE_FILES = ("partial", "final", "other", "symlink")
+
+
+def _probe_files(probe_dir, report):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    first = os.path.join(probe_dir, "partial")
+    payload = os.urandom(PROBE_BYTES)
+    expected = hashlib.sha256(payload).hexdigest()
+
+    fd = os.open(first, flags, 0o600)
+    try:
+        st = os.fstat(fd)
+        identity = (st.st_dev, st.st_ino)
+        started = time.monotonic()
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, 0o600)
+        try:
+            os.fsync(fd)
+            rate = PROBE_BYTES / max(time.monotonic() - started, 1e-6) / 1e6
+            report.ok(f"wrote and fsync'd {PROBE_BYTES} bytes ({rate:.1f} MB/s)")
+        except OSError as exc:
+            report.fail(f"fsync failed ({exc.strerror}): durability cannot be confirmed")
+        written = os.fstat(fd)
+    finally:
+        os.close(fd)
+    fsync_directory(probe_dir)
+
+    if written.st_uid == os.geteuid():
+        report.ok("new files are owned by the writing user, root (no root squashing)")
+    else:
+        report.warn(f"new files are owned by uid {written.st_uid}, not root (root_squash/all_squash or a forced "
+                    "owner): backups still work, but anyone with that uid on the storage can delete or replace "
+                    "archives - restrict the export/share to this server")
+    if stat.S_IMODE(written.st_mode) == 0o600:
+        report.ok("file mode 0600 is honoured")
+    else:
+        report.warn(f"file mode is {stat.S_IMODE(written.st_mode):04o}, not 0600 (the storage forces modes): "
+                    "archives stay encrypted, but other users of the storage may be able to read them")
+
+    try:
+        fd = os.open(first, flags, 0o600)
+    except FileExistsError:
+        report.ok("O_CREAT|O_EXCL refuses an existing name")
+    except OSError as exc:
+        report.fail(f"O_EXCL on an existing name failed with {exc.strerror} instead of EEXIST")
+    else:
+        os.close(fd)
+        report.fail("O_CREAT|O_EXCL opened an EXISTING file: exclusive creation is not honoured")
+
+    try:
+        with open_regular_nofollow(first) as handle:
+            back = os.fstat(handle.fileno())
+            digest = hashlib.sha256(handle.read()).hexdigest()
+    except (OSError, Failed) as exc:
+        report.fail(f"could not read the probe file back ({exc})")
+    else:
+        if digest == expected:
+            report.ok("read-back matches what was written (SHA-256)")
+        else:
+            report.fail("read-back DIFFERS from what was written: the storage alters or loses data")
+        if (back.st_dev, back.st_ino) == identity:
+            report.ok("(device, inode) identity is stable across close and reopen")
+        else:
+            report.fail("the file's (device, inode) changed after reopening: create's identity check would "
+                        "refuse every publication")
+
+    final = os.path.join(probe_dir, "final")
+    method = None
+    try:
+        os.link(first, final, follow_symlinks=False)
+        method = "hard link"
+    except OSError as exc:
+        if exc.errno not in LINK_UNSUPPORTED:
+            report.fail(f"hard link failed unexpectedly ({exc.strerror})")
+        else:
+            report.info(f"hard links are not supported ({exc.strerror}); trying renameat2(RENAME_NOREPLACE)")
+            try:
+                rename_noreplace(first, final)
+                method = "renameat2(RENAME_NOREPLACE)"
+            except OSError as exc2:
+                report.fail(f"renameat2(RENAME_NOREPLACE) is not supported either ({exc2.strerror}): create "
+                            "would refuse to publish archives here")
+    if method:
+        st = os.lstat(final)
+        if (st.st_dev, st.st_ino) == identity:
+            report.ok(f"publication by {method} keeps the file's identity")
+        else:
+            report.fail(f"after publication by {method} the file has a different identity")
+        other = os.path.join(probe_dir, "other")
+        fd = os.open(other, flags, 0o600)
+        try:
+            os.write(fd, b"must not replace the published file")
+        finally:
+            os.close(fd)
+        try:
+            if method == "hard link":
+                os.link(other, final, follow_symlinks=False)
+            else:
+                rename_noreplace(other, final)
+        except FileExistsError:
+            report.ok(f"{method} refuses to replace an existing name (no-clobber publication)")
+        except OSError as exc:
+            report.fail(f"{method} onto an existing name failed with {exc.strerror} instead of EEXIST")
+        else:
+            report.fail(f"{method} REPLACED an existing file: archives could be overwritten")
+        with open_regular_nofollow(final) as handle:
+            if hashlib.sha256(handle.read()).hexdigest() != expected:
+                report.fail("the published probe file's content changed")
+        report.info(f"create will publish archives by {method}")
+
+    link = os.path.join(probe_dir, "symlink")
+    try:
+        os.symlink("final", link)
+    except OSError as exc:
+        report.info(f"symbolic links cannot be created here ({exc.strerror})")
+    else:
+        try:
+            fd = os.open(link, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                report.ok("O_NOFOLLOW refuses symbolic links")
+            else:
+                report.warn(f"O_NOFOLLOW on a symbolic link failed with {exc.strerror} (expected ELOOP)")
+        else:
+            os.close(fd)
+            report.fail("O_NOFOLLOW followed a symbolic link")
+
+
 # --- Command line --------------------------------------------------------------------------------------------
 
 def build_parser():
@@ -2012,6 +2311,11 @@ def build_parser():
     recover.add_argument("--discard-marker", action="store_true",
                          help="after investigating: remove the marker without starting or stopping anything")
     recover.set_defaults(func=cmd_recover_service)
+
+    probe = commands.add_parser("probe-destination",
+                                help="check that the mounted destination supports what create relies on")
+    probe.add_argument("--config", default=DEFAULT_CONFIG)
+    probe.set_defaults(func=cmd_probe_destination)
     return parser
 
 
