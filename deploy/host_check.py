@@ -516,6 +516,19 @@ def check_nginx_vpn_ordering(host, r, listens):
     if not vpn_units:
         r.info("no enabled wg-quick unit found; check that nginx starts after whatever brings up the VPN address")
         return
+    # Only the tunnels that carry an address nginx listens on matter (the two-server design also has wg1, the
+    # backup link, which nginx does not use - found in the installer VM test). If the addresses cannot be
+    # mapped to interfaces (VPN down while checking), stay conservative and require all enabled tunnels.
+    rc, out, _ = host.run(["ip", "-o", "addr", "show"])
+    carrying = set()
+    if rc == 0:
+        wanted = {listen_address(x).strip("[]") for x in specific}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].split("/")[0] in wanted:
+                carrying.add(f"wg-quick@{parts[1]}.service")
+    if carrying & set(vpn_units):
+        vpn_units = sorted(carrying & set(vpn_units))
     rc, out, _ = host.run(["systemctl", "show", "-p", "After", "--value", "nginx.service"])
     after = set(out.split()) if rc == 0 else set()
     missing = [u for u in vpn_units if u not in after]

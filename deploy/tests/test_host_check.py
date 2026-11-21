@@ -119,6 +119,7 @@ def answer(args):
          (0, "wg-quick@wg0.service loaded active exited WireGuard via wg-quick(8) for wg0\n", "")),
         ("systemctl show -p After --value nginx.service",
          (0, "network-online.target wg-quick@wg0.service systemd-journald.socket sysinit.target\n", "")),
+        ("ip -o addr show", (0, "1: lo    inet 127.0.0.1/8 scope host lo\n5: wg0    inet 10.99.1.1/24 scope global wg0\n", "")),
         ("systemd-escape", (0, "mnt-applyforge\\x2dbackups.mount\n", "")),
         ("openssl x509 -checkend", (0, "Certificate will not expire\n", "")),
         ("openssl x509 -noout -checkhost", (0, "Hostname applyforge.vpn.internal does match certificate\n", "")),
@@ -332,6 +333,34 @@ class HostCheckTests(unittest.TestCase):
     def test_nginx_ordered_after_vpn_passes(self):
         self.assertEqual(self.check(), 0, self.out)
         self.assertIn("nginx starts after wg-quick@wg0.service", self.out)
+
+    def two_tunnels(self, after):
+        # Two-server design: wg0 carries nginx's address, wg1 is the backup link.
+        self.host.overrides["systemctl list-units --all --type=service --no-legend --plain wg-quick@*"] = (0,
+            "wg-quick@wg0.service loaded active exited x\nwg-quick@wg1.service loaded active exited x\n", "")
+        self.host.overrides["systemctl is-enabled wg-quick@wg1.service"] = (0, "enabled\n", "")
+        self.host.overrides["ip -o addr show"] = (0, "1: lo    inet 127.0.0.1/8 scope host lo\n"
+                                                     "5: wg0    inet 10.99.1.1/24 scope global wg0\n"
+                                                     "6: wg1    inet 10.98.0.1/30 scope global wg1\n", "")
+        self.host.overrides["systemctl show -p After --value nginx.service"] = (0, after, "")
+
+    def test_backup_link_tunnel_is_not_required_for_nginx(self):
+        # Regression (installer VM test 2026-11-21): FAIL "nginx is not ordered after wg-quick@wg1.service".
+        self.two_tunnels("network-online.target wg-quick@wg0.service\n")
+        self.assertEqual(self.check(), 0, self.out)
+        self.assertIn("nginx starts after wg-quick@wg0.service", self.out)
+
+    def test_tunnel_carrying_the_listen_address_is_still_required(self):
+        self.two_tunnels("network-online.target wg-quick@wg1.service\n")
+        self.assertEqual(self.check(), 1)
+        fails = [l for l in self.lines("FAIL") if "not ordered after" in l]
+        self.assertTrue(fails and "wg-quick@wg0.service" in fails[0] and "wg1" not in fails[0], self.out)
+
+    def test_unmappable_address_requires_every_tunnel(self):
+        self.two_tunnels("network-online.target wg-quick@wg0.service\n")
+        self.host.overrides["ip -o addr show"] = (0, "1: lo    inet 127.0.0.1/8 scope host lo\n", "")
+        self.assertEqual(self.check(), 1)
+        self.assertTrue(any("wg-quick@wg1.service" in l for l in self.lines("FAIL")), self.out)
 
     def test_no_enabled_vpn_unit_is_info_only(self):
         self.host.overrides["systemctl list-units --all --type=service --no-legend --plain wg-quick@*"] = (0, "", "")

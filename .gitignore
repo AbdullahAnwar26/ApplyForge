@@ -47,3 +47,7 @@ COMMIT_PLAN.md
 backend/debug_page*.html
 backend/linkedin_search_debug*.html
 backend/post_identity_debug.txt
+
+# Staging/production operator files (no secrets in the repository)
+deploy/hetzner/hetzner.env
+release-out/

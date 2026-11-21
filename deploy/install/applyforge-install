@@ -1,0 +1,847 @@
+#!/usr/bin/env bash
+# ApplyForge server installer: automates deploy/README.md sections 3-8, 9-10, 12.3, 14 and 15 for the
+# two-server architecture (application server + backup server). Idempotent: every step checks the current
+# state first, so a re-run repairs drift and changes nothing that is already correct.
+#
+# Run as root from an extracted release (…/deploy/install/applyforge-install) or, after `host`, as
+# /usr/local/sbin/applyforge-install. Site settings: /etc/applyforge/site.env (deploy/install/site.env.example).
+#
+#   keys      --role app|backup     generate this server's WireGuard keys (once) and print the PUBLIC keys
+#   host      --role app|backup     packages, admin account + SSH hardening, WireGuard, services, tooling
+#   release   --from DIR [--allow-no-backup]
+#                                   app: install/upgrade the release in DIR (3 files from build-release.sh),
+#                                   migrate, switch, restart, health-check; automatic code rollback on failure
+#   rollback                        app: switch back to the previous release (refused if newer migrations ran)
+#   link                            app: mount the backup share over wg1, marker, probe-destination, enable backups
+#   acme                            app: issue the certificate if needed (DNS-01) and enable renewals
+#   peer add NAME PUBKEY ADDR | peer remove NAME | peer list
+#                                   VPN devices on this server's wg0 (no tunnel interruption: wg syncconf)
+#   client-config NAME              print the WireGuard config for a device (its private key stays on the device)
+#   firewall apply [--timeout S] | firewall confirm | firewall status
+#                                   default-deny ruleset with automatic rollback until confirmed (14.3)
+#   validate                        read-only end-to-end checks for this server's role; exit 1 on any FAIL
+#
+# Never prints secrets. Private keys are generated on the server and never leave it.
+set -euo pipefail
+umask 022
+export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+DEPLOY=$(cd -- "$(dirname -- "$SELF")/.." && pwd)
+ETC=/etc/applyforge
+SITE=${APPLYFORGE_SITE:-$ETC/site.env}
+ROLE_FILE=$ETC/role
+TOOL_DIR=/usr/local/lib/applyforge/deploy
+LINK_DEST=/mnt/applyforge-backups
+FSTAB_LINE="10.98.0.2:/srv/applyforge-backups $LINK_DEST nfs4 vers=4.2,hard,proto=tcp,_netdev,x-systemd.requires=wg-quick@wg1.service 0 0"
+FW_CANDIDATE=$ETC/nftables.candidate.nft
+FW_UNIT=applyforge-fw-rollback
+APP_VPN=10.99.0.1
+BACKUP_VPN=10.97.0.1
+CHANGES=0
+
+# ---------------------------------------------------------------- helpers
+log()  { printf '%s\n' "== $*"; }
+note() { printf '   %s\n' "$*"; }
+warn() { printf 'WARN %s\n' "$*" >&2; }
+die()  { printf 'applyforge-install: %s\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "run as root"; }
+
+load_site() {
+  [ -f "$SITE" ] || die "$SITE missing (copy deploy/install/site.env.example and fill it in)"
+  local st; st=$(stat -c '%U %a' "$SITE")
+  case "$st" in "root "[0-7][0-5][0-5]|"root "[0-7][0-5][0-4]) ;; *) die "$SITE must be owned by root and not group/world-writable ($st)";; esac
+  # Parse KEY=VALUE lines only (no shell evaluation).
+  local line k v
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k=${line%%=*}; v=${line#*=}
+    [[ "$k" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "$SITE: bad line: $k"
+    v=${v%\"}; v=${v#\"}
+    printf -v "S_$k" '%s' "$v"
+  done < "$SITE"
+  : "${S_APP_HOST:?}" "${S_APP_PUBLIC_IPV4:?}" "${S_BACKUP_PUBLIC_IPV4:?}" "${S_ADMIN_USER:?}"
+  S_APP_WG1_PUBKEY=${S_APP_WG1_PUBKEY:-}; S_BACKUP_WG1_PUBKEY=${S_BACKUP_WG1_PUBKEY:-}
+  S_ADMIN_SSH_KEYS_FROM=${S_ADMIN_SSH_KEYS_FROM:-/root/.ssh/authorized_keys}
+  S_TIME_ZONE=${S_TIME_ZONE:-UTC}; S_INPUTS_DIR=${S_INPUTS_DIR:-/root/applyforge-inputs}; S_KEEP_RELEASES=${S_KEEP_RELEASES:-3}
+  [[ "$S_APP_HOST" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$ ]] || die "APP_HOST is not a valid lower-case host name"
+  case "$S_APP_HOST" in *example.org|*.example) die "APP_HOST is still the example value";; esac
+  local ip; for ip in "$S_APP_PUBLIC_IPV4" "$S_BACKUP_PUBLIC_IPV4"; do
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "not an IPv4 address: $ip"; done
+  [[ "$S_ADMIN_USER" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || die "ADMIN_USER invalid"
+  [[ "$S_KEEP_RELEASES" =~ ^[2-9]$ ]] || die "KEEP_RELEASES must be 2-9"
+  local key; for key in "$S_APP_WG1_PUBKEY" "$S_BACKUP_WG1_PUBKEY"; do
+    [ -z "$key" ] || [[ "$key" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] || die "invalid WireGuard public key in $SITE"; done
+}
+
+role() {
+  [ -f "$ROLE_FILE" ] || die "role unknown: run 'host --role app|backup' first"
+  cat "$ROLE_FILE"
+}
+set_role() {
+  case "$1" in app|backup) ;; *) die "--role must be app or backup";; esac
+  if [ -f "$ROLE_FILE" ] && [ "$(cat "$ROLE_FILE")" != "$1" ]; then die "this server is already '$(cat "$ROLE_FILE")'"; fi
+  install -d -o root -g root -m 0755 "$ETC"
+  printf '%s\n' "$1" > "$ROLE_FILE"
+}
+
+# install SRC DST MODE only when content/mode differ; prints the path when changed. Returns 0 if changed.
+put() {
+  local src=$1 dst=$2 mode=$3 owner=${4:-root} group=${5:-root}
+  if [ -f "$dst" ] && cmp -s "$src" "$dst" && [ "$(stat -c '%a %U %G' "$dst")" = "$mode $owner $group" ]; then return 1; fi
+  install -o "$owner" -g "$group" -m "$mode" "$src" "$dst"; note "installed $dst"; CHANGES=$((CHANGES+1)); return 0
+}
+# put_text DST MODE <<< content
+put_text() {
+  local dst=$1 mode=$2 tmp; tmp=$(mktemp); cat > "$tmp"
+  if put "$tmp" "$dst" "$mode" "${3:-root}" "${4:-root}"; then rm -f "$tmp"; return 0; fi
+  rm -f "$tmp"; return 1
+}
+
+consume_input() {   # consume_input NAME DST MODE [OWNER GROUP]: install INPUTS_DIR/NAME then delete it
+  local src=$S_INPUTS_DIR/$1
+  [ -f "$src" ] || return 1
+  [ "$(stat -c '%U' "$src")" = root ] || die "$src must be owned by root"
+  install -d -m 0700 "$(dirname "$2")" 2>/dev/null || true
+  install -o "${4:-root}" -g "${5:-root}" -m "$3" "$src" "$2"
+  rm -f -- "$src"; note "installed $2 from $1 (input removed)"
+}
+
+apt_install() {
+  local missing=() p
+  for p in "$@"; do dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null | grep -qx installed || missing+=("$p"); done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  log "installing packages: ${missing[*]}"
+  apt-get update -q >/dev/null
+  apt-get install -y -q --no-install-recommends "${missing[@]}" >/dev/null
+}
+
+wg_pub() { wg pubkey < "/etc/wireguard/$1.key"; }
+
+# ---------------------------------------------------------------- keys
+cmd_keys() {
+  local r=""; while [ $# -gt 0 ]; do case "$1" in --role) r=$2; shift 2;; *) die "keys: unknown $1";; esac; done
+  need_root; set_role "$r"
+  apt_install wireguard-tools
+  install -d -o root -g root -m 0700 /etc/wireguard
+  local i; for i in wg0 wg1; do
+    if [ ! -s "/etc/wireguard/$i.key" ]; then (umask 077; wg genkey > "/etc/wireguard/$i.key"); note "generated /etc/wireguard/$i.key"; fi
+    chmod 0600 "/etc/wireguard/$i.key"
+  done
+  echo "role=$r"
+  echo "wg0 public key (devices enrol against this): $(wg_pub wg0)"
+  echo "wg1 public key (backup link; put into site.env as $( [ "$r" = app ] && echo APP_WG1_PUBKEY || echo BACKUP_WG1_PUBKEY )): $(wg_pub wg1)"
+}
+
+# ---------------------------------------------------------------- WireGuard
+peer_dir() { echo "$ETC/wg-peers"; }
+
+render_wg0() {
+  local r=$1 addr port=51820 f name pub ip
+  [ "$r" = app ] && addr="$APP_VPN/24" || addr="$BACKUP_VPN/24"
+  {
+    printf '# Managed by applyforge-install (peers: %s). Do not edit by hand.\n' "$(peer_dir)"
+    printf '[Interface]\nAddress = %s\nListenPort = %s\nPrivateKey = %s\n' "$addr" "$port" "$(cat /etc/wireguard/wg0.key)"
+    for f in "$(peer_dir)"/*.peer; do
+      [ -f "$f" ] || continue
+      name=$(basename "$f" .peer); pub=$(sed -n 's/^PUBKEY=//p' "$f"); ip=$(sed -n 's/^ADDR=//p' "$f")
+      printf '\n[Peer]\n# %s\nPublicKey = %s\nAllowedIPs = %s/32\n' "$name" "$pub" "$ip"
+    done
+  }
+}
+
+render_wg1() {
+  local r=$1
+  if [ "$r" = app ]; then
+    printf '# Managed by applyforge-install. Backup link (client side).\n[Interface]\nAddress = 10.98.0.1/30\nPrivateKey = %s\n\n[Peer]\n# backup server\nPublicKey = %s\nEndpoint = %s:51821\nAllowedIPs = 10.98.0.2/32\nPersistentKeepalive = 25\n' \
+      "$(cat /etc/wireguard/wg1.key)" "$S_BACKUP_WG1_PUBKEY" "$S_BACKUP_PUBLIC_IPV4"
+  else
+    printf '# Managed by applyforge-install. Backup link (server side).\n[Interface]\nAddress = 10.98.0.2/30\nListenPort = 51821\nPrivateKey = %s\n\n[Peer]\n# application server\nPublicKey = %s\nAllowedIPs = 10.98.0.1/32\n' \
+      "$(cat /etc/wireguard/wg1.key)" "$S_APP_WG1_PUBKEY"
+  fi
+}
+
+apply_wg() {   # apply_wg IFACE: write config, then sync live (no interruption) or start
+  local i=$1 r=$2 changed=0
+  if [ "$i" = wg0 ]; then render_wg0 "$r" | put_text "/etc/wireguard/$i.conf" 600 && changed=1 || true
+  else render_wg1 "$r" | put_text "/etc/wireguard/$i.conf" 600 && changed=1 || true; fi
+  if systemctl is-active -q "wg-quick@$i"; then
+    [ $changed = 1 ] && { wg syncconf "$i" <(wg-quick strip "$i"); note "$i: peers synced live"; }
+  else
+    systemctl enable -q --now "wg-quick@$i"; note "$i: started"
+  fi
+  systemctl is-enabled -q "wg-quick@$i" || systemctl enable -q "wg-quick@$i"
+}
+
+setup_wireguard() {
+  local r=$1
+  [ -s /etc/wireguard/wg0.key ] && [ -s /etc/wireguard/wg1.key ] || die "WireGuard keys missing: run 'keys --role $r' first"
+  install -d -o root -g root -m 0700 "$(peer_dir)"
+  log "WireGuard wg0 (devices)"; apply_wg wg0 "$r"
+  local peerkey; [ "$r" = app ] && peerkey=$S_BACKUP_WG1_PUBKEY || peerkey=$S_APP_WG1_PUBKEY
+  if [ -z "$peerkey" ]; then warn "wg1 (backup link) skipped: the other server's wg1 public key is not in $SITE yet"
+  else log "WireGuard wg1 (backup link)"; apply_wg wg1 "$r"; fi
+}
+
+cmd_peer() {
+  need_root; load_site; local r; r=$(role); local sub=${1:-list}; shift || true
+  install -d -o root -g root -m 0700 "$(peer_dir)"
+  case "$sub" in
+    add)
+      [ $# -eq 3 ] || die "usage: peer add NAME PUBKEY ADDR"
+      local name=$1 pub=$2 ip=$3 net f
+      [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "NAME: lower-case letters, digits, '-'"
+      [[ "$pub" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] || die "PUBKEY is not a WireGuard public key"
+      [ "$r" = app ] && net=10.99.0 || net=10.97.0
+      [[ "$ip" =~ ^${net//./\\.}\.([0-9]{1,3})$ ]] && [ "${BASH_REMATCH[1]}" -ge 2 ] && [ "${BASH_REMATCH[1]}" -le 254 ] \
+        || die "ADDR must be $net.2 - $net.254 on this server"
+      for f in "$(peer_dir)"/*.peer; do
+        [ -f "$f" ] || continue; [ "$(basename "$f" .peer)" = "$name" ] && continue
+        grep -qx "ADDR=$ip" "$f" && die "$ip is already used by $(basename "$f" .peer)"
+        grep -qx "PUBKEY=$pub" "$f" && die "this key is already enrolled as $(basename "$f" .peer)"
+      done
+      printf 'PUBKEY=%s\nADDR=%s\n' "$pub" "$ip" | put_text "$(peer_dir)/$name.peer" 600 || note "$name unchanged"
+      apply_wg wg0 "$r" ;;
+    remove)
+      [ $# -eq 1 ] || die "usage: peer remove NAME"
+      [ -f "$(peer_dir)/$1.peer" ] || die "no peer $1"
+      rm -f -- "$(peer_dir)/$1.peer"; note "removed $1"; apply_wg wg0 "$r" ;;
+    list)
+      local f; for f in "$(peer_dir)"/*.peer; do [ -f "$f" ] || continue
+        printf '%-20s %-12s %s\n' "$(basename "$f" .peer)" "$(sed -n 's/^ADDR=//p' "$f")" "$(sed -n 's/^PUBKEY=//p' "$f")"; done ;;
+    *) die "peer add|remove|list" ;;
+  esac
+}
+
+cmd_client_config() {
+  need_root; load_site; local r; r=$(role); local name=${1:?usage: client-config NAME} f ip ep net
+  f="$(peer_dir)/$name.peer"; [ -f "$f" ] || die "no peer $name (peer add first)"
+  ip=$(sed -n 's/^ADDR=//p' "$f")
+  if [ "$r" = app ]; then ep=$S_APP_PUBLIC_IPV4; net=10.99.0.0/24; else ep=$S_BACKUP_PUBLIC_IPV4; net=10.97.0.0/24; fi
+  cat <<EOF
+# WireGuard config for device '$name' -> $r server. Paste the device's OWN private key below.
+[Interface]
+Address = $ip/24
+PrivateKey = <this device's private key - never sent to the server>
+EOF
+  if [ "$r" = app ]; then cat <<EOF
+# Phones / WireGuard apps: use the VPN resolver for everything
+DNS = $APP_VPN
+# Linux laptops with systemd-resolved: instead of DNS =, send only the app name to the VPN resolver
+# (no PreDown: Ubuntu's AppArmor profile for wg-quick denies the revert; the link vanishes anyway)
+# PostUp = resolvectl dns %i $APP_VPN; resolvectl domain %i ~$S_APP_HOST
+EOF
+  fi
+  cat <<EOF
+
+[Peer]
+PublicKey = $(wg_pub wg0)
+Endpoint = $ep:51820
+AllowedIPs = $net
+PersistentKeepalive = 25
+EOF
+}
+
+# ---------------------------------------------------------------- admin account and SSH
+setup_admin_ssh() {
+  local u=$S_ADMIN_USER
+  log "admin account '$u' (SSH keys only) and SSH hardening"
+  if ! id "$u" >/dev/null 2>&1; then
+    useradd --create-home --shell /bin/bash --groups sudo "$u"; note "created $u (set its CONSOLE password: passwd $u)"
+  fi
+  id -nG "$u" | tr ' ' '\n' | grep -qx sudo || usermod -aG sudo "$u"
+  local home; home=$(getent passwd "$u" | cut -d: -f6)
+  install -d -o "$u" -g "$u" -m 0700 "$home/.ssh"
+  if [ ! -s "$home/.ssh/authorized_keys" ]; then
+    [ -s "$S_ADMIN_SSH_KEYS_FROM" ] || die "no SSH keys for $u: $S_ADMIN_SSH_KEYS_FROM is empty"
+    # Copy key lines only (drop any forced-command/"Please login as" prefixes the provider may add for root).
+    sed -nE 's/^.*((ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com) [A-Za-z0-9+\/=]+.*)$/\1/p' \
+      "$S_ADMIN_SSH_KEYS_FROM" > "$home/.ssh/authorized_keys.new"
+    chown "$u:$u" "$home/.ssh/authorized_keys.new"; chmod 0600 "$home/.ssh/authorized_keys.new"
+    mv "$home/.ssh/authorized_keys.new" "$home/.ssh/authorized_keys"
+    note "copied SSH keys to $home/.ssh/authorized_keys"
+  fi
+  grep -qE '^(ssh-|ecdsa-|sk-)' "$home/.ssh/authorized_keys" || die "$home/.ssh/authorized_keys has no usable key; refusing to lock SSH down"
+  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$u" | put_text /etc/sudoers.d/90-applyforge-admin 440 || true
+  visudo -cqf /etc/sudoers.d/90-applyforge-admin || { rm -f /etc/sudoers.d/90-applyforge-admin; die "sudoers drop-in invalid"; }
+  printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nAllowUsers %s\n' "$u" \
+    | put_text /etc/ssh/sshd_config.d/10-applyforge.conf 644 || true
+  sshd -t || die "sshd configuration invalid"
+  systemctl try-reload-or-restart ssh.service 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- firewall
+fw_table() { [ "$1" = app ] && echo applyforge || echo applyforge_backup; }   # table names in deploy/nftables/
+render_firewall() {
+  local r=$1
+  if [ "$r" = app ]; then cp "$DEPLOY/nftables/applyforge.nft" "$FW_CANDIDATE.tmp"
+  else sed -E "s/^define APP_PUBLIC_V4 = .*/define APP_PUBLIC_V4 = { $S_APP_PUBLIC_IPV4 }/" \
+         "$DEPLOY/nftables/applyforge-backup-server.nft" > "$FW_CANDIDATE.tmp"
+       grep -q "define APP_PUBLIC_V4 = { $S_APP_PUBLIC_IPV4 }" "$FW_CANDIDATE.tmp" || die "could not set APP_PUBLIC_V4"
+  fi
+  nft -c -f "$FW_CANDIDATE.tmp" || die "candidate ruleset failed nft -c"
+  put "$FW_CANDIDATE.tmp" "$FW_CANDIDATE" 644 || true; rm -f "$FW_CANDIDATE.tmp"
+}
+
+cmd_firewall() {
+  need_root; load_site; local r; r=$(role); local sub=${1:-status}; shift || true
+  case "$sub" in
+    apply)
+      local t=120; [ "${1:-}" = --timeout ] && { t=$2; [[ "$t" =~ ^[0-9]+$ ]] && [ "$t" -ge 30 ] || die "--timeout >= 30"; }
+      render_firewall "$r"
+      if systemctl is-active -q "$FW_UNIT.timer"; then die "a rollback is already armed; confirm or wait for it"; fi
+      # Rollback target: the saved ruleset at boot (what nftables.service loads), or an empty ruleset.
+      local back=/etc/nftables.conf; [ -f "$back" ] || back=/dev/null
+      cp "$back" "$ETC/nftables.rollback.nft"
+      systemctl reset-failed "$FW_UNIT.service" "$FW_UNIT.timer" 2>/dev/null || true
+      systemd-run -q --unit="$FW_UNIT" --on-active="$t" /bin/sh -c "nft flush ruleset; nft -f $ETC/nftables.rollback.nft"
+      nft -f "$FW_CANDIDATE"
+      echo "Candidate ruleset is LIVE. Rollback in $t s unless confirmed."
+      echo "From a NEW session through the VPN (ssh $S_ADMIN_USER@$([ "$r" = app ] && echo $APP_VPN || echo $BACKUP_VPN)) run:"
+      echo "  sudo applyforge-install firewall confirm" ;;
+    confirm)
+      [ -f "$FW_CANDIDATE" ] || die "no candidate ruleset"
+      systemctl is-active -q "$FW_UNIT.timer" || die "no armed rollback: run 'firewall apply' first (it may have expired and rolled back)"
+      nft list table inet "$(fw_table "$r")" >/dev/null 2>&1 || die "candidate is not live"
+      systemctl stop "$FW_UNIT.timer"
+      install -o root -g root -m 0644 "$FW_CANDIDATE" /etc/nftables.conf
+      # Start the unit too (it reloads the same, already-live ruleset; established sessions are kept), so
+      # nftables.service is active now and not only after the next boot.
+      systemctl enable -q nftables
+      systemctl restart nftables
+      echo "Confirmed: /etc/nftables.conf updated, nftables active and enabled at boot." ;;
+    status)
+      if systemctl is-active -q "$FW_UNIT.timer"; then echo "rollback ARMED (unconfirmed change live)"; fi
+      if [ -f /etc/nftables.conf ] && [ -f "$FW_CANDIDATE" ] && cmp -s /etc/nftables.conf "$FW_CANDIDATE"; then echo "saved ruleset = candidate"; else echo "saved ruleset differs from candidate (apply + confirm pending)"; fi
+      nft list chain inet "$(fw_table "$r")" input 2>/dev/null | grep -q 'policy drop' && echo "live: default-deny input" || echo "live: NO default-deny input chain" ;;
+    *) die "firewall apply|confirm|status" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- tooling copy
+install_tooling() {
+  log "tooling copy in $TOOL_DIR"
+  if [ "$DEPLOY" != "$TOOL_DIR" ]; then
+    install -d -o root -g root -m 0755 "$(dirname "$TOOL_DIR")"
+    rm -rf "$TOOL_DIR.new"; cp -a "$DEPLOY" "$TOOL_DIR.new"
+    chown -R root:root "$TOOL_DIR.new"; chmod -R go-w "$TOOL_DIR.new"
+    rm -rf "$TOOL_DIR.old"; [ -e "$TOOL_DIR" ] && mv "$TOOL_DIR" "$TOOL_DIR.old"
+    mv "$TOOL_DIR.new" "$TOOL_DIR"; rm -rf "$TOOL_DIR.old"
+  fi
+  ln -sfn "$TOOL_DIR/install/applyforge-install" /usr/local/sbin/applyforge-install
+  put "$DEPLOY/backup/afbackup.py" /usr/local/sbin/applyforge-backup 755 || true
+  put "$DEPLOY/monitoring/applyforge-ping" /usr/local/sbin/applyforge-ping 755 || true
+  put "$DEPLOY/monitoring/applyforge-check" /usr/local/sbin/applyforge-check 755 || true
+}
+
+setup_monitoring() {
+  local r=$1 timers u
+  log "monitoring (Healthchecks dead-man's switch)"
+  for u in applyforge-check@.service applyforge-ping-fail@.service; do put "$DEPLOY/monitoring/$u" "/etc/systemd/system/$u" 644 || true; done
+  if [ "$r" = app ]; then
+    timers="health dns disk cert"
+    printf 'APP_HOST=%s\nVPN_ADDR=%s\nDISK_PATHS="/ /var/lib/postgresql"\nDISK_MAX_PCT=80\nCERT_FILE=/etc/ssl/applyforge/applyforge.crt\nCERT_MIN_DAYS=21\nCHECK_NAME_PREFIX=\n' \
+      "$S_APP_HOST" "$APP_VPN" | put_text "$ETC/monitoring.env" 644 || true
+  else
+    timers="heartbeat disk"
+    printf 'DISK_PATHS="/ /srv/applyforge-backups /srv/applyforge-vault"\nDISK_MAX_PCT=80\nCHECK_NAME_PREFIX=backup-\n' \
+      | put_text "$ETC/monitoring.env" 644 || true
+  fi
+  for u in $timers; do put "$DEPLOY/monitoring/applyforge-check-$u.timer" "/etc/systemd/system/applyforge-check-$u.timer" 644 || true; done
+  consume_input healthchecks.env "$ETC/healthchecks.env" 600 || true
+  systemctl daemon-reload
+  if [ -s "$ETC/healthchecks.env" ]; then
+    for u in $timers; do systemctl enable -q --now "applyforge-check-$u.timer"; done
+    note "monitoring timers enabled: $timers"
+  else
+    warn "no $ETC/healthchecks.env: monitoring timers NOT enabled (supply $S_INPUTS_DIR/healthchecks.env and re-run host)"
+  fi
+}
+
+# ---------------------------------------------------------------- host: backup server
+host_backup() {
+  apt_install nfs-kernel-server wireguard-tools nftables age python3 curl ca-certificates
+  setup_admin_ssh
+  setup_wireguard backup
+  log "storage: export (drop box) and vault (root-only, never exported)"
+  install -d -m 0700 -o nobody -g nogroup /srv/applyforge-backups
+  install -d -m 0700 -o root -g root /srv/applyforge-vault
+  install -d -m 0755 /etc/exports.d /etc/nfs.conf.d /etc/systemd/system/nfs-server.service.d
+  local nfs_changed=0
+  echo "/srv/applyforge-backups 10.98.0.1(rw,sync,root_squash,no_subtree_check,sec=sys)" | put_text /etc/exports.d/applyforge.exports 644 && nfs_changed=1 || true
+  printf '[nfsd]\nvers3=n\n' | put_text /etc/nfs.conf.d/applyforge.conf 644 && nfs_changed=1 || true
+  put "$DEPLOY/systemd/nfs-server-applyforge-vpn.conf" /etc/systemd/system/nfs-server.service.d/applyforge-vpn.conf 644 && nfs_changed=1 || true
+  systemctl daemon-reload
+  systemctl enable -q nfs-server
+  if [ $nfs_changed = 1 ] || ! systemctl is-active -q nfs-server; then
+    if systemctl is-active -q wg-quick@wg1; then systemctl restart nfs-server; else warn "nfs-server not (re)started: wg1 is not up yet"; fi
+  fi
+  exportfs -ra 2>/dev/null || true
+  install_tooling
+  log "seal timer"
+  put "$DEPLOY/systemd/applyforge-seal.service" /etc/systemd/system/applyforge-seal.service 644 || true
+  put "$DEPLOY/systemd/applyforge-seal.timer" /etc/systemd/system/applyforge-seal.timer 644 || true
+  systemctl daemon-reload; systemctl enable -q --now applyforge-seal.timer
+  setup_monitoring backup
+  render_firewall backup
+  log "backup server done"
+  [ -f /etc/nftables.conf ] && cmp -s /etc/nftables.conf "$FW_CANDIDATE" || note "next: enrol an admin device (peer add), then 'firewall apply' + 'firewall confirm'"
+}
+
+# ---------------------------------------------------------------- host: app server
+pg_q() { runuser -u postgres -- psql -X -qtA -v ON_ERROR_STOP=1 "$@"; }
+
+host_app() {
+  apt_install nginx postgresql age python3-venv wireguard-tools nftables unbound unbound-anchor lego nfs-common \
+    bind9-dnsutils curl ca-certificates openssl
+  setup_admin_ssh
+  if [ ! -L /srv/applyforge/current ]; then
+    # The package starts nginx with its default site on every address; keep it off until 'release'.
+    rm -f /etc/nginx/sites-enabled/default; systemctl stop nginx 2>/dev/null || true
+  fi
+  setup_wireguard app
+
+  log "service account and directories (runbook 3)"
+  id applyforge >/dev/null 2>&1 || useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin applyforge
+  install -d -o root -g root -m 0755 /srv/applyforge /srv/applyforge/releases /var/lib/applyforge
+  install -d -o applyforge -g applyforge -m 0750 /var/lib/applyforge/media
+  install -d -o applyforge -g applyforge -m 0755 /var/lib/applyforge/static
+  install -d -o root -g applyforge -m 0750 "$ETC"
+
+  log "PostgreSQL (localhost only)"
+  systemctl enable -q --now postgresql
+  local la; la=$(pg_q -c 'SHOW listen_addresses')
+  [ "$la" = localhost ] || die "PostgreSQL listen_addresses is '$la', expected 'localhost'"
+  [ "$(pg_q -c 'SHOW port')" = 5432 ] || die "PostgreSQL is not on port 5432"
+  [ "$(pg_q -c "SELECT count(*) FROM pg_roles WHERE rolname='applyforge'")" = 1 ] || \
+    pg_q -c 'CREATE ROLE applyforge LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE' && true
+  [ "$(pg_q -c "SELECT count(*) FROM pg_database WHERE datname='applyforge'")" = 1 ] || \
+    { runuser -u postgres -- createdb --owner applyforge applyforge; pg_q -c 'REVOKE CONNECT, TEMPORARY ON DATABASE applyforge FROM PUBLIC'; note "created database applyforge"; }
+  id applyforge_restore >/dev/null 2>&1 || useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin applyforge_restore
+  [ "$(pg_q -c "SELECT count(*) FROM pg_roles WHERE rolname='applyforge_restore'")" = 1 ] || \
+    runuser -u postgres -- createuser --no-superuser --no-createdb --no-createrole --no-replication applyforge_restore
+
+  log "TLS certificate (bootstrap self-signed until ACME issues one)"
+  install -d -m 0755 /etc/ssl/applyforge
+  if [ ! -s /etc/ssl/applyforge/applyforge.crt ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 14 -subj "/CN=$S_APP_HOST" -addext "subjectAltName=DNS:$S_APP_HOST" \
+      -keyout /etc/ssl/applyforge/applyforge.key -out /etc/ssl/applyforge/applyforge.crt 2>/dev/null
+    chmod 0600 /etc/ssl/applyforge/applyforge.key; chmod 0644 /etc/ssl/applyforge/applyforge.crt
+    note "self-signed bootstrap certificate (14 days); run 'acme' to replace it"
+  fi
+
+  log "private DNS (unbound on $APP_VPN, VPN only)"
+  local ub=0
+  sed "s/<applyforge\.example\.org>/$S_APP_HOST/g" "$DEPLOY/unbound/applyforge.conf" | put_text /etc/unbound/unbound.conf.d/applyforge.conf 644 && ub=1 || true
+  # The config uses ip-freebind. An "After=wg-quick@wg0" drop-in (earlier releases) creates a boot ordering
+  # cycle through nss-lookup.target that systemd breaks by dropping the wg0 start job: remove it.
+  if [ -e /etc/systemd/system/unbound.service.d/applyforge-vpn.conf ]; then
+    rm -f /etc/systemd/system/unbound.service.d/applyforge-vpn.conf; rmdir /etc/systemd/system/unbound.service.d 2>/dev/null || true
+    note "removed the unbound start-order drop-in (ordering cycle)"; ub=1
+  fi
+  [ -s /var/lib/unbound/root.key ] || { [ -x /usr/libexec/unbound-helper ] && /usr/libexec/unbound-helper root_trust_anchor_update || true; }
+  [ -s /var/lib/unbound/root.key ] || unbound-anchor -a /var/lib/unbound/root.key || true
+  [ -s /var/lib/unbound/root.key ] || die "/var/lib/unbound/root.key missing (unbound-anchor failed)"
+  chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+  unbound-checkconf >/dev/null || die "unbound-checkconf failed"
+  systemctl daemon-reload; systemctl enable -q unbound
+  if [ $ub = 1 ] || ! systemctl is-active -q unbound; then systemctl restart unbound; fi
+
+  log "backup tooling (destination: NFS over wg1)"
+  install_tooling
+  if [ ! -f "$ETC/backup.conf" ]; then
+    sed 's/^BACKUP_ALLOWED_FS_TYPES=.*/BACKUP_ALLOWED_FS_TYPES=nfs4/' "$DEPLOY/backup/backup.conf.example" | put_text "$ETC/backup.conf" 644 || true
+  fi
+  consume_input backup-recipients.txt "$ETC/backup-recipients.txt" 644 || true
+  if [ -f "$ETC/backup-recipients.txt" ]; then
+    [ "$(grep -c '^age1[0-9a-z]\{58\}$' "$ETC/backup-recipients.txt")" -ge 2 ] || die "$ETC/backup-recipients.txt needs 2 age recipients (primary + escrow)"
+    grep -q 'AGE-SECRET-KEY' "$ETC/backup-recipients.txt" && die "$ETC/backup-recipients.txt contains a SECRET key: remove it now"
+  fi
+  put "$DEPLOY/systemd/applyforge-backup.tmpfiles" /etc/tmpfiles.d/applyforge-backup.conf 644 || true
+  systemd-tmpfiles --create /etc/tmpfiles.d/applyforge-backup.conf
+  put "$DEPLOY/systemd/applyforge-backup.service" /etc/systemd/system/applyforge-backup.service 644 || true
+  put "$DEPLOY/systemd/applyforge-backup.timer" /etc/systemd/system/applyforge-backup.timer 644 || true
+  install -d /etc/systemd/system/applyforge-backup.service.d
+  put "$DEPLOY/monitoring/applyforge-backup-monitoring.conf" /etc/systemd/system/applyforge-backup.service.d/monitoring.conf 644 || true
+  install -d -m 0700 "$LINK_DEST"
+  grep -qF "$FSTAB_LINE" /etc/fstab || { echo "$FSTAB_LINE" >> /etc/fstab; note "fstab: backup share"; }
+  systemctl daemon-reload
+
+  log "ACME tooling (DNS-01)"
+  put "$DEPLOY/acme/applyforge-acme" /usr/local/sbin/applyforge-acme 755 || true
+  put "$DEPLOY/acme/applyforge-cert-deploy" /usr/local/sbin/applyforge-cert-deploy 755 || true
+  put "$DEPLOY/acme/applyforge-acme-renew.service" /etc/systemd/system/applyforge-acme-renew.service 644 || true
+  put "$DEPLOY/acme/applyforge-acme-renew.timer" /etc/systemd/system/applyforge-acme-renew.timer 644 || true
+  install -d -m 0700 "$ETC/acme"
+  consume_input acme.env "$ETC/acme/acme.env" 600 || true
+
+  setup_monitoring app
+  render_firewall app
+  log "app server host setup done"
+  [ -L /srv/applyforge/current ] || note "next: 'release --from DIR' to install the first release"
+}
+
+cmd_host() {
+  local r=""; while [ $# -gt 0 ]; do case "$1" in --role) r=$2; shift 2;; *) die "host: unknown $1";; esac; done
+  need_root; set_role "$r"; load_site
+  . /etc/os-release; [ "$ID" = ubuntu ] || warn "validated on Ubuntu 26.04; this is $PRETTY_NAME"
+  install -d -o root -g root -m 0700 "$S_INPUTS_DIR"
+  if [ "$r" = app ]; then host_app; else host_backup; fi
+}
+
+# ---------------------------------------------------------------- release (app)
+health_local() {  # Gunicorn directly, as nginx would call it
+  curl -fsS --max-time 5 -H "Host: $S_APP_HOST" -H 'X-Forwarded-Proto: https' http://127.0.0.1:8000/api/v1/health/ 2>/dev/null | grep -q '"status": *"ok"'
+}
+health_nginx() {
+  curl -fsS --max-time 5 -k --resolve "$S_APP_HOST:443:$APP_VPN" "https://$S_APP_HOST/api/v1/health/" 2>/dev/null | grep -q '"status": *"ok"'
+}
+wait_healthy() { local i; for i in $(seq 1 "${1:-60}"); do health_local && return 0; sleep 1; done; return 1; }
+
+env_file_first_time() {
+  local rel=$1 envf=$ETC/applyforge.env
+  [ -f "$envf" ] && return 0
+  log "production environment file (secrets generated here, never printed)"
+  local tmp; tmp=$(mktemp); chmod 600 "$tmp"
+  python3 -I - "$rel/deploy/env.production.example" "$tmp" "$S_APP_HOST" "$S_TIME_ZONE" <<'PY'
+import os, secrets, sys, urllib.parse
+os.umask(0o077)
+src, dst, host, tz = sys.argv[1:5]
+pw = secrets.token_urlsafe(32)
+repl = {"SECRET_KEY": secrets.token_urlsafe(64), "API_TOKEN": secrets.token_urlsafe(64),
+        "DATABASE_URL": f"postgres://applyforge:{urllib.parse.quote(pw, safe='')}@127.0.0.1:5432/applyforge",
+        "ALLOWED_HOSTS": host, "CSRF_TRUSTED_ORIGINS": f"https://{host}", "DJANGO_TIME_ZONE": tz}
+seen, out = set(), []
+for line in open(src).read().splitlines():
+    k = line.split("=", 1)[0]
+    if "=" in line and not line.startswith("#") and k in repl:
+        out.append(f"{k}={repl[k]}"); seen.add(k)
+    else:
+        out.append(line)
+missing = set(repl) - seen
+if missing:
+    sys.exit(f"example lacks {sorted(missing)}")
+if any("<" in l and not l.startswith("#") for l in out):
+    sys.exit("unreplaced <placeholder> left")
+open(dst, "w").write("\n".join(out) + "\n")
+open(dst + ".pw", "w").write(pw)
+PY
+  # Set the role password to the generated one (psql variable: never on a command line or in logs).
+  # token_urlsafe output is [A-Za-z0-9_-]: safe in a quoted \set. Sent on stdin, never in argv.
+  { printf "\\\\set pw '%s'\n" "$(cat "$tmp.pw")"; printf "ALTER ROLE applyforge PASSWORD :'pw';\n"; } \
+    | runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1
+  rm -f "$tmp.pw"
+  install -o root -g applyforge -m 0640 "$tmp" "$envf"; rm -f "$tmp"
+  note "created $envf (API token: sudo grep ^API_TOKEN= $envf - share only through a trusted channel)"
+}
+
+install_site_config() {
+  local rel=$1 changed=0
+  log "service and nginx configuration from the release (runbook 6)"
+  put "$rel/deploy/bin/applyforge-manage" /usr/local/sbin/applyforge-manage 755 || true
+  put "$rel/deploy/systemd/applyforge.service" /etc/systemd/system/applyforge.service 644 && changed=1 || true
+  install -d /etc/nginx/snippets /etc/systemd/system/nginx.service.d
+  put "$rel/deploy/nginx/snippets/applyforge-security-headers.conf" /etc/nginx/snippets/applyforge-security-headers.conf 644 || true
+  put "$rel/deploy/nginx/snippets/applyforge-proxy.conf" /etc/nginx/snippets/applyforge-proxy.conf 644 || true
+  # Redirect (not a pipe): put_text must run in this shell so CHANGES counts it.
+  put_text /etc/nginx/sites-available/applyforge.conf 644 < <(sed "s#applyforge\.vpn\.example#$S_APP_HOST#g" "$rel/deploy/nginx/applyforge.conf") || true
+  ln -sfn /etc/nginx/sites-available/applyforge.conf /etc/nginx/sites-enabled/applyforge.conf
+  rm -f /etc/nginx/sites-enabled/default
+  put "$rel/deploy/systemd/nginx-applyforge-vpn.conf" /etc/systemd/system/nginx.service.d/applyforge-vpn.conf 644 || true
+  systemctl daemon-reload
+  nginx -t 2>/dev/null || { nginx -t; die "nginx -t failed"; }
+}
+
+switch_to() {
+  local rel=$1 cur
+  cur=$(readlink -f /srv/applyforge/current 2>/dev/null || true)
+  if [ -n "$cur" ] && [ "$cur" != "$rel" ]; then ln -sfn "$cur" /srv/applyforge/previous; fi
+  ln -sfn "$rel" /srv/applyforge/current.new && mv -T /srv/applyforge/current.new /srv/applyforge/current
+}
+
+restart_app() {
+  systemctl reset-failed applyforge 2>/dev/null || true
+  if systemctl is-enabled -q applyforge 2>/dev/null; then systemctl restart applyforge; else systemctl enable -q --now applyforge; fi
+  systemctl enable -q nginx
+  if systemctl is-active -q nginx; then systemctl reload nginx; else systemctl restart nginx; fi
+}
+
+prune_releases() {
+  local cur prev keep=$S_KEEP_RELEASES n=0 d
+  cur=$(readlink -f /srv/applyforge/current); prev=$(readlink -f /srv/applyforge/previous 2>/dev/null || true)
+  while IFS= read -r d; do
+    n=$((n+1)); [ $n -le "$keep" ] && continue
+    [ "$d" = "$cur" ] || [ "$d" = "$prev" ] && continue
+    rm -rf -- "$d"; note "pruned old release $(basename "$d")"
+  done < <(ls -1dt /srv/applyforge/releases/*/ 2>/dev/null | sed 's#/$##')
+}
+
+cmd_release() {
+  local from="" allow_nobackup=0
+  while [ $# -gt 0 ]; do case "$1" in --from) from=$2; shift 2;; --allow-no-backup) allow_nobackup=1; shift;; *) die "release: unknown $1";; esac; done
+  need_root; load_site; [ "$(role)" = app ] || die "release runs on the app server"
+  [ -d "$from" ] || die "--from DIR required"
+  local sums; sums=$(ls "$from"/applyforge-*.sha256 2>/dev/null) || die "no applyforge-<sha>.sha256 in $from"
+  [ "$(echo "$sums" | wc -l)" = 1 ] || die "more than one release in $from"
+  local sha; sha=$(basename "$sums" .sha256); sha=${sha#applyforge-}
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "bad release name"
+  local rel=/srv/applyforge/releases/$sha
+  log "release $sha"
+  (cd "$from" && sha256sum --quiet -c "applyforge-$sha.sha256") || die "checksum mismatch"
+
+  if [ -f "$rel/.applyforge-release-complete" ]; then
+    note "already installed"
+  else
+    [ "$(readlink -f /srv/applyforge/current 2>/dev/null)" = "$rel" ] && die "$rel is current but incomplete; investigate"
+    [ -e "$rel" ] && { note "removing incomplete earlier attempt"; rm -rf -- "$rel"; }
+    log "extract, virtual environment, bytecode (runbook 5)"
+    tar -xzf "$from/applyforge-$sha.tar.gz" -C /srv/applyforge/releases
+    [ -d "$rel/backend" ] || die "archive did not create $rel"
+    install -d -o root -g root -m 0755 "$rel/frontend"; rm -rf "$rel/frontend/dist"
+    tar -xzf "$from/applyforge-$sha-dist.tar.gz" -C "$rel/frontend"
+    [ -f "$rel/frontend/dist/index.html" ] || die "frontend dist missing"
+    [ -z "$(find "$rel" -name .env -print -quit)" ] || die "release contains a .env"
+    python3 -m venv "$rel/.venv"
+    "$rel/.venv/bin/pip" install -q --no-cache-dir --only-binary=:all: -r "$rel/backend/requirements.txt" \
+      -c "$rel/backend/constraints.txt" > /var/log/applyforge-pip-$sha.log 2>&1 || die "pip install failed (/var/log/applyforge-pip-$sha.log)"
+    "$rel/.venv/bin/pip" check >/dev/null || die "pip check failed"
+    "$rel/.venv/bin/python" -m compileall -q "$rel/backend" "$rel/deploy" >/dev/null
+    chown -R root:root "$rel"; chmod -R go-w "$rel"; chmod 0755 "$rel/deploy/bin/applyforge-manage"
+    touch "$rel/.applyforge-release-complete"
+  fi
+
+  env_file_first_time "$rel"
+  CHANGES=0
+  install_site_config "$rel"
+  local first=0; [ -L /srv/applyforge/current ] || first=1
+  local cur; cur=$(readlink -f /srv/applyforge/current 2>/dev/null || true)
+  if [ "$cur" = "$rel" ] && [ $CHANGES = 0 ] && health_local && health_nginx; then
+    echo "release $sha is already live and healthy; nothing to do"; return 0
+  fi
+
+  log "preflight, deploy checks, migrations (runbook 7)"
+  local chk; chk=$(applyforge-manage "$rel" check --deploy 2>&1) || { echo "$chk"; die "check --deploy failed"; }
+  # Expected and deliberate: security.W005 (no includeSubDomains) and security.W021 (no preload).
+  local other; other=$(echo "$chk" | grep -oE '\([a-z_]+\.[A-Z][0-9]+\)' | grep -vxE '\(security\.W(005|021)\)' | sort -u || true)
+  [ -z "$other" ] || { echo "$chk"; die "unexpected check --deploy findings: $other"; }
+  local plan; plan=$(applyforge-manage "$rel" migrate --plan 2>&1) || { echo "$plan"; die "migrate --plan failed"; }
+  local migrated=0
+  if ! echo "$plan" | grep -q 'No planned migration operations'; then
+    echo "$plan" | sed 's/^/   /'
+    if [ $first = 0 ]; then
+      if [ -s "$ETC/backup-recipients.txt" ] && mountpoint -q "$LINK_DEST"; then
+        log "pre-migration backup (stops ApplyForge briefly)"; applyforge-backup create || die "pre-migration backup failed"
+      elif [ $allow_nobackup = 1 ]; then warn "migrating WITHOUT a backup (--allow-no-backup)"
+      else die "migrations pending and backups are not operational; fix 'link' or pass --allow-no-backup"; fi
+    fi
+    applyforge-manage "$rel" migrate --noinput > "/var/log/applyforge-migrate-$sha.log" 2>&1 || die "migrate failed (/var/log/applyforge-migrate-$sha.log)"
+    migrated=1
+  fi
+  applyforge-manage "$rel" collectstatic --noinput >/dev/null || die "collectstatic failed"
+
+  log "switch and restart (runbook 8)"
+  switch_to "$rel"
+  systemd-analyze verify /etc/systemd/system/applyforge.service 2>&1 | grep -i applyforge && die "unit verification failed" || true
+  restart_app
+  if wait_healthy 90 && health_nginx; then
+    echo "release $sha is live and healthy"
+    diff -rq "$rel/deploy" "$TOOL_DIR" >/dev/null 2>&1 || note "this release's deploy/ differs from $TOOL_DIR: re-run '$rel/deploy/install/applyforge-install host --role app'"
+    prune_releases
+    return 0
+  fi
+  journalctl -u applyforge -n 30 --no-pager || true
+  if [ -n "$cur" ] && [ "$cur" != "$rel" ] && [ $migrated = 0 ]; then
+    warn "health check failed: rolling the code back to $(basename "$cur") (no migrations were applied)"
+    switch_to "$cur"; applyforge-manage "$cur" collectstatic --noinput >/dev/null || true; restart_app
+    wait_healthy 90 && echo "rolled back; previous release healthy" || warn "previous release is not healthy either"
+  elif [ $migrated = 1 ] && [ -n "$cur" ]; then
+    warn "health check failed AFTER migrations: not rolling back automatically (deploy/README.md 10.1)"
+  fi
+  die "release $sha failed its health check"
+}
+
+cmd_rollback() {
+  need_root; load_site; [ "$(role)" = app ] || die "rollback runs on the app server"
+  local cur prev; cur=$(readlink -f /srv/applyforge/current); prev=$(readlink -f /srv/applyforge/previous 2>/dev/null || true)
+  [ -n "$prev" ] && [ -x "$prev/.venv/bin/gunicorn" ] && [ "$prev" != "$cur" ] || die "no usable previous release"
+  log "rollback $(basename "$cur") -> $(basename "$prev") (code only; the database is not touched)"
+  local newer applied m
+  newer=$(diff <(cd "$prev/backend" && find . -path '*/migrations/0*.py' | sort) <(cd "$cur/backend" && find . -path '*/migrations/0*.py' | sort) | sed -n 's#^> \./\([^/]*\)/migrations/\(.*\)\.py$#\1 \2#p')
+  if [ -n "$newer" ]; then
+    applied=$(applyforge-manage "$cur" showmigrations --list 2>/dev/null | awk '/^[a-z_]+$/{app=$1} /\[X\]/{print app, $2}')
+    while read -r m; do
+      [ -n "$m" ] || continue
+      if echo "$applied" | grep -qxF "$m"; then die "migration '$m' exists only in the newer release and is APPLIED: assess per deploy/README.md 10.1 (fix forward or reverse it first)"; fi
+    done <<< "$newer"
+  fi
+  switch_to "$prev"
+  applyforge-manage "$prev" collectstatic --noinput >/dev/null
+  restart_app
+  wait_healthy 90 && health_nginx && echo "rolled back to $(basename "$prev"): healthy" || die "previous release is not healthy"
+}
+
+# ---------------------------------------------------------------- backup link (app)
+cmd_link() {
+  need_root; load_site; [ "$(role)" = app ] || die "link runs on the app server"
+  systemctl is-active -q wg-quick@wg1 || die "wg1 is not up (set BACKUP_WG1_PUBKEY in $SITE and re-run host)"
+  log "backup share over wg1"
+  if ! mountpoint -q "$LINK_DEST"; then
+    timeout 60 mount "$LINK_DEST" || die "mount failed: is the backup server up, its nfs-server running, wg1 handshaking? (wg show wg1)"
+  fi
+  [ "$(findmnt -n -o FSTYPE "$LINK_DEST")" = nfs4 ] || die "$LINK_DEST is not the NFSv4 share"
+  [ -f "$LINK_DEST/.applyforge-backup-destination" ] || { touch "$LINK_DEST/.applyforge-backup-destination"; note "marker created"; }
+  log "probe-destination"
+  applyforge-backup probe-destination || die "probe-destination failed"
+  if [ -s "$ETC/backup-recipients.txt" ]; then
+    systemctl enable -q --now applyforge-backup.timer; note "daily backup timer enabled"
+  else
+    warn "no $ETC/backup-recipients.txt: backup timer NOT enabled (supply $S_INPUTS_DIR/backup-recipients.txt and re-run host)"
+  fi
+}
+
+# ---------------------------------------------------------------- ACME (app)
+cmd_acme() {
+  need_root; load_site; [ "$(role)" = app ] || die "acme runs on the app server"
+  [ -s "$ETC/acme/acme.env" ] || die "no $ETC/acme/acme.env (supply $S_INPUTS_DIR/acme.env and re-run host)"
+  local issuer; issuer=$(openssl x509 -noout -issuer -in /etc/ssl/applyforge/applyforge.crt 2>/dev/null || true)
+  local subj;   subj=$(openssl x509 -noout -subject -in /etc/ssl/applyforge/applyforge.crt 2>/dev/null || true)
+  if [ "${issuer#issuer=}" = "${subj#subject=}" ] || [ "${1:-}" = --force ]; then
+    log "issuing certificate for $S_APP_HOST (DNS-01)"; applyforge-acme issue
+  else
+    note "CA-issued certificate present (${issuer#issuer=}); renewals handle it"
+  fi
+  systemctl enable -q --now applyforge-acme-renew.timer
+  openssl x509 -noout -subject -issuer -enddate -in /etc/ssl/applyforge/applyforge.crt | sed 's/^/   /'
+}
+
+# ---------------------------------------------------------------- validate
+V_PASS=0; V_FAIL=0; V_WARN=0
+vp() { V_PASS=$((V_PASS+1)); echo "PASS  $*"; }
+vf() { V_FAIL=$((V_FAIL+1)); echo "FAIL  $*"; }
+vw() { V_WARN=$((V_WARN+1)); echo "WARN  $*"; }
+vc() { local d=$1; shift; if "$@" >/dev/null 2>&1; then vp "$d"; else vf "$d"; fi; }
+
+validate_common() {
+  local r=$1 vpn=$2 u
+  for u in wg-quick@wg0 wg-quick@wg1 nftables ssh; do
+    if systemctl is-active -q "$u"; then vp "$u active"; else vf "$u not active"; fi
+  done
+  vc "firewall: saved ruleset is the rendered candidate" cmp -s /etc/nftables.conf "$FW_CANDIDATE"
+  vc "firewall: live default-deny input chain" sh -c "nft list chain inet $(fw_table "$r") input | grep -q 'policy drop'"
+  systemctl is-active -q "$FW_UNIT.timer" && vf "firewall: unconfirmed change with rollback armed" || vp "firewall: no unconfirmed change"
+  vc "sshd: keys only, no root, AllowUsers $S_ADMIN_USER" sh -c "sshd -T 2>/dev/null | grep -qx 'passwordauthentication no' && sshd -T | grep -qx 'permitrootlogin no' && sshd -T | grep -qx 'allowusers $S_ADMIN_USER'"
+  local lst; lst=$(ss -Hltn | awk '{print $4}')
+  if echo "$lst" | grep -E ':22$' | grep -vqE "^($vpn|127\.0\.0\.1|\[::1\]):22$|^(0\.0\.0\.0|\*|\[::\]):22$"; then vw "sshd listens on unexpected addresses"; fi
+  local pw; pw=$(passwd -S "$S_ADMIN_USER" 2>/dev/null | awk '{print $2}')
+  [ "$pw" = P ] && vp "admin console password set" || vw "admin '$S_ADMIN_USER' has no console password (passwd $S_ADMIN_USER) - needed for console recovery (14.4)"
+  [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && vp "clock NTP-synchronised" || vf "clock not NTP-synchronised (ACME DNS updates and TLS need it)"
+  systemctl is-enabled -q unattended-upgrades 2>/dev/null && vp "unattended-upgrades enabled" || vw "unattended-upgrades not enabled"
+  if [ -s "$ETC/healthchecks.env" ]; then
+    local t; for t in $3; do systemctl is-active -q "applyforge-check-$t.timer" && vp "monitoring timer $t active" || vf "monitoring timer $t not active"; done
+  else vf "no healthchecks.env: monitoring disabled"; fi
+  [ "$(peer_count)" -ge 1 ] && vp "$(peer_count) VPN device(s) enrolled" || vf "no VPN device enrolled"
+  local cyc; cyc=$(journalctl -b --no-pager -q 2>/dev/null | grep -c 'deleted to break ordering cycle')
+  [ "$cyc" = 0 ] && vp "no boot ordering cycle this boot" || vf "systemd broke $cyc ordering cycle(s) this boot (journalctl -b | grep 'ordering cycle'): a start job was dropped"
+  local df; df=$(df --output=pcent / | tail -n1 | tr -dc 0-9); [ "$df" -lt 80 ] && vp "root filesystem ${df}% used" || vf "root filesystem ${df}% used"
+}
+peer_count() { ls "$(peer_dir)"/*.peer 2>/dev/null | wc -l; }
+
+validate_app() {
+  validate_common app "$APP_VPN" "health dns disk cert"
+  local u; for u in postgresql unbound applyforge nginx; do systemctl is-active -q "$u" && vp "$u active" || vf "$u not active"; done
+  vc "Gunicorn health (127.0.0.1:8000)" health_local
+  vc "nginx + TLS health on $APP_VPN" health_nginx
+  vc "private DNS: $S_APP_HOST -> $APP_VPN" sh -c "[ \"\$(dig +short +time=2 +tries=1 @$APP_VPN $S_APP_HOST A)\" = $APP_VPN ]"
+  # Distinguish "no address record" (good) from "no answer at all" (cannot tell): a timeout is not a pass.
+  local pubans pubst; pubans=$(dig +time=3 +tries=2 @1.1.1.1 "$S_APP_HOST" A 2>/dev/null)
+  pubst=$(echo "$pubans" | sed -n 's/.*status: \([A-Z]*\),.*/\1/p' | head -n1)
+  local pubip; pubip=$(echo "$pubans" | awk -v h="$S_APP_HOST." '$1==h && $4=="A"{print $5; exit}')
+  if [ -n "$pubip" ]; then vf "public DNS publishes $S_APP_HOST -> $pubip (must not)"
+  elif [ "$pubst" = NXDOMAIN ] || [ "$pubst" = NOERROR ]; then vp "public DNS has no A record for $S_APP_HOST ($pubst)"
+  else vw "public DNS could not be queried (${pubst:-no answer}); check: dig @1.1.1.1 $S_APP_HOST A"; fi
+  local ss8000 ss5432; ss8000=$(ss -Hltn 'sport = :8000' | awk '{print $4}' | sort -u | paste -sd' '); ss5432=$(ss -Hltn 'sport = :5432' | awk '{print $4}' | sort -u | paste -sd' ')
+  [ "$ss8000" = 127.0.0.1:8000 ] && vp "Gunicorn on 127.0.0.1 only" || vf "Gunicorn listens on: $ss8000"
+  echo "$ss5432" | grep -qvE '^(127\.0\.0\.1:5432|\[::1\]:5432)( (127\.0\.0\.1:5432|\[::1\]:5432))*$' && vf "PostgreSQL listens on: $ss5432" || vp "PostgreSQL on loopback only"
+  ss -Hltn | awk '{print $4}' | grep -E ':(80|443)$' | grep -vqE "^$APP_VPN:(80|443)$" && vf "nginx listens beyond $APP_VPN" || vp "nginx on $APP_VPN only"
+  local h; h=$(curl -sk --max-time 5 -D - -o /dev/null --resolve "$S_APP_HOST:443:$APP_VPN" "https://$S_APP_HOST/" || true)
+  echo "$h" | grep -qi '^strict-transport-security: max-age=31536000' && vp "HSTS header" || vf "HSTS header missing"
+  echo "$h" | grep -qi '^content-security-policy:' && vp "CSP header" || vf "CSP header missing"
+  local code; code=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' --resolve "$S_APP_HOST:443:$APP_VPN" "https://$S_APP_HOST/api/v1/profiles/")
+  [ "$code" = 401 ] && vp "API requires the token (401)" || vf "API without token returned $code"
+  code=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' --resolve "$S_APP_HOST:443:$APP_VPN" "https://$S_APP_HOST/admin/")
+  [ "$code" = 404 ] && vp "/admin/ not exposed (404)" || vf "/admin/ returned $code"
+  code=$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' -X POST --resolve "$S_APP_HOST:443:$APP_VPN" "https://$S_APP_HOST/api/v1/collector/runs/")
+  [ "$code" = 403 ] || [ "$code" = 401 ] && vp "collector disabled/protected ($code)" || vf "collector endpoint returned $code"
+  # certificate
+  local issuer subj
+  issuer=$(openssl x509 -noout -issuer -in /etc/ssl/applyforge/applyforge.crt | sed 's/^issuer=//'); subj=$(openssl x509 -noout -subject -in /etc/ssl/applyforge/applyforge.crt | sed 's/^subject=//')
+  [ "$issuer" != "$subj" ] && vp "certificate CA-issued ($issuer)" || vf "certificate is the self-signed bootstrap (run acme)"
+  openssl x509 -checkend $((21*86400)) -noout -in /etc/ssl/applyforge/applyforge.crt >/dev/null && vp "certificate valid > 21 days" || vf "certificate expires within 21 days"
+  if curl -fsS --max-time 5 --resolve "$S_APP_HOST:443:$APP_VPN" "https://$S_APP_HOST/api/v1/health/" >/dev/null 2>&1; then vp "TLS chain trusted by the system store"
+  else vw "TLS chain not trusted by the system store (expected for the bootstrap or a Let's Encrypt STAGING certificate)"; fi
+  [ -s "$ETC/acme/acme.env" ] && { systemctl is-active -q applyforge-acme-renew.timer && vp "ACME renew timer active" || vf "ACME renew timer not active"; } || vf "no acme.env (ACME not configured)"
+  # backups
+  vc "backup share mounted (nfs4)" sh -c "[ \"\$(findmnt -n -o FSTYPE $LINK_DEST)\" = nfs4 ]"
+  vc "backup destination marker" test -f "$LINK_DEST/.applyforge-backup-destination"
+  vc "two age recipients configured" sh -c "[ \$(grep -c '^age1' $ETC/backup-recipients.txt) -ge 2 ]"
+  systemctl is-active -q applyforge-backup.timer && vp "backup timer active" || vf "backup timer not active"
+  local last; last=$(awk -F'\t' '$7=="recorded"{t=$1} END{print t}' /var/lib/applyforge-backup/index.tsv 2>/dev/null || true)
+  if [ -n "$last" ] && [ $(( $(date +%s) - $(date -d "$last" +%s 2>/dev/null || echo 0) )) -lt $((27*3600)) ]; then vp "last recorded backup: $last"
+  else vf "no recorded backup within 27 h"; fi
+  [ "$(systemctl show -p Result --value applyforge-backup.service)" = success ] && vp "last backup run succeeded" || vf "last backup run result: $(systemctl show -p Result --value applyforge-backup.service)"
+  # readiness check
+  if [ -L /srv/applyforge/current ]; then
+    local hc rc=0; hc=$(python3 -I "$DEPLOY/host_check.py" --release /srv/applyforge/current 2>&1) || rc=$?
+    echo "$hc" | grep -E '^(FAIL|WARN)' | sed 's/^/      host_check: /'
+    [ $rc = 0 ] && vp "host_check passed" || vf "host_check reported failures"
+  else vf "no release installed"; fi
+  systemctl --failed --no-legend --plain | grep -q . && vf "failed units: $(systemctl --failed --no-legend --plain | awk '{print $1}' | paste -sd' ')" || vp "no failed units"
+}
+
+validate_backup() {
+  validate_common backup "$BACKUP_VPN" "heartbeat disk"
+  systemctl is-active -q nfs-server && vp "nfs-server active" || vf "nfs-server not active"
+  vc "export restricted to 10.98.0.1" sh -c "exportfs -s | grep -q '^/srv/applyforge-backups  *10.98.0.1('"
+  vc "NFSv3 disabled" sh -c "! tr ' ' '\n' < /proc/fs/nfsd/versions | grep -qx '+3'"
+  vc "vault root-only 0700" sh -c "[ \"\$(stat -c '%a %U' /srv/applyforge-vault)\" = '700 root' ]"
+  exportfs -s | grep -q applyforge-vault && vf "vault is exported!" || vp "vault not exported"
+  systemctl is-active -q applyforge-seal.timer && vp "seal timer active" || vf "seal timer not active"
+  local res; res=$(systemctl show -p Result --value applyforge-seal.service)
+  [ "$res" = success ] && vp "last seal run succeeded" || vf "last seal run result: $res"
+  local n; n=$(find /srv/applyforge-vault -maxdepth 1 -name 'applyforge-backup-*' -mmin -$((28*60)) | wc -l)
+  [ "$n" -ge 1 ] && vp "sealed archive from the last 28 h present" || vf "no sealed archive from the last 28 h"
+  local hs; hs=$(wg show wg1 latest-handshakes 2>/dev/null | awk '{print $2}')
+  [ -n "$hs" ] && [ "$hs" -gt 0 ] && [ $(( $(date +%s) - hs )) -lt 300 ] && vp "backup link handshake recent" || vf "no recent backup link handshake"
+  systemctl --failed --no-legend --plain | grep -q . && vf "failed units: $(systemctl --failed --no-legend --plain | awk '{print $1}' | paste -sd' ')" || vp "no failed units"
+}
+
+cmd_validate() {
+  need_root; load_site; local r; r=$(role)
+  set +e +o pipefail   # probes are expected to fail; every result is counted instead
+  echo "ApplyForge validation: role=$r host=$(hostname) $(date -u +%FT%TZ)"
+  if [ "$r" = app ]; then validate_app; else validate_backup; fi
+  echo "RESULT: $V_PASS passed, $V_WARN warnings, $V_FAIL failed"
+  [ $V_FAIL = 0 ]
+}
+
+# ---------------------------------------------------------------- main
+main() {
+  local cmd=${1:-}; shift || true
+  case "$cmd" in
+    keys) cmd_keys "$@" ;;
+    host) cmd_host "$@" ;;
+    release) cmd_release "$@" ;;
+    rollback) cmd_rollback "$@" ;;
+    link) cmd_link "$@" ;;
+    acme) cmd_acme "$@" ;;
+    peer) cmd_peer "$@" ;;
+    client-config) cmd_client_config "$@" ;;
+    firewall) cmd_firewall "$@" ;;
+    validate) cmd_validate "$@" ;;
+    ''|-h|--help|help) sed -n '2,27p' "$SELF" ;;
+    *) die "unknown command '$cmd' (see --help)" ;;
+  esac
+}
+# Sourced by deploy/tests/test_install_tooling.py to test individual functions; executed otherwise.
+[ "${BASH_SOURCE[0]}" != "$0" ] || main "$@"

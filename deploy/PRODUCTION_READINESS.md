@@ -267,6 +267,27 @@ Real-data timings remain U11.
 | Clock (NTP) | DNS-01 and TLS failures | host check warns; runbook 15.8 | add an NTP check to monitoring (backlog) |
 | Admin devices | lockout | two enrolled devices; console (15.7) | — |
 
+## 3d. Installer end-to-end test on fresh servers (2026-11-21)
+
+`deploy/install/applyforge-install` (runbook 16) run as an operator would on three fresh Ubuntu 26.04 VMs that look like new Hetzner servers (root SSH key only, nothing installed): app server, backup server, admin device. Internet access only through a userspace NAT; nothing reachable from outside. Releases built with `deploy/release/build-release.sh` (lint, typecheck, 277 frontend tests). Fictional data and keys.
+
+**Worked first time:** `keys` (private keys generated on the server, only public keys printed) → `host` on both servers (21 s backup, 42 s app) → device enrolment (`peer add`, `client-config` without the private key; duplicate key and wrong subnet refused) → SSH as the admin through the VPN, root refused → `release` (first deployment, 47 s; generated secrets never in any log) → `link` (`probe-destination` OK) → first backup → seal into the vault → upgrade to a second release → `rollback` → forward again (no re-extract) → same release again is a no-op → tampered release refused by checksum → firewall `apply` + `confirm` from a new VPN session, public SSH/HTTPS/NFS closed → device resolves the private name and uses the app with the generated token → every monitoring check pinged the receiver → `host` re-run installs nothing and restarts nothing.
+
+**Defects found and fixed (with regression tests):**
+
+| Defect | Effect | Fix |
+|---|---|---|
+| `confirm`/`validate` looked for nft table `applyforge` on the backup server (`applyforge_backup`) | backup firewall could not be confirmed; the 120 s rollback correctly undid it | role-aware table name; test ties it to both ruleset files |
+| **unbound `After=wg-quick@wg0` drop-in formed a boot ordering cycle** (unbound `Before=nss-lookup.target`, wg-quick `After=` it) | at every boot systemd **deleted the wg0 start job**; unbound failed once; the VPN came up only because unbound's restart pulled wg0 in again. The 3c rehearsal missed it | unbound `ip-freebind: yes`, drop-in removed (installer deletes it on existing hosts); `validate` FAILs on any broken ordering cycle. 3 reboots: `running`, no cycle, unbound never failed |
+| `host_check` required nginx after **every** wg-quick unit | false FAIL with the backup link `wg1` | only the tunnel carrying nginx's listen address (all tunnels if unmappable) |
+| `confirm` enabled but did not start `nftables.service` | unit inactive until the next boot | `confirm` restarts it (same ruleset, sessions kept) |
+| Public-DNS probe treated a timeout as "record published" | false FAIL | NXDOMAIN/NOERROR without A = pass, no answer = WARN |
+| `build-release.sh` left a partial tarball when the frontend build failed | a later build refused, or could ship a partial release | tool preflight; cleanup trap |
+
+**Result:** `validate` after reboot: backup server 24 passed, 0 failed; app server 41 passed, 0 failed except the three caused by the bootstrap certificate (no ACME endpoint in this test; `acme` replaces it).
+
+**Consequence for staging:** the `health` and `cert` checks verify TLS against the system trust store, so a Let's Encrypt **staging** certificate shows them as down. Staging does one dry run against the LE staging CA, then uses the production CA.
+
 ## 4. Verified requirements
 
 | # | Requirement | Evidence |

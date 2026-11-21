@@ -1130,7 +1130,7 @@ Repository files used here:
 | `deploy/nftables/applyforge.nft` | app server ruleset (now including DNS on `wg0`) |
 | `deploy/nftables/applyforge-backup-server.nft` | backup server ruleset |
 | `deploy/unbound/applyforge.conf` | private resolver configuration |
-| `deploy/systemd/unbound-applyforge-vpn.conf`, `nfs-server-applyforge-vpn.conf` | start-order drop-ins |
+| `deploy/systemd/nfs-server-applyforge-vpn.conf` | start-order drop-in (nfs-server after `wg1`) |
 | `deploy/acme/` | ACME wrapper, deploy hook, renewal units |
 | `deploy/monitoring/` | ping and check scripts, units |
 | `deploy/systemd/applyforge-seal.{service,timer}` | backup server seal |
@@ -1145,8 +1145,8 @@ sudo apt install unbound unbound-anchor
 sudo unbound-anchor -a /var/lib/unbound/root.key; sudo chown unbound: /var/lib/unbound/root.key
 sudo install -m 0644 "$REL/deploy/unbound/applyforge.conf" /etc/unbound/unbound.conf.d/applyforge.conf
 sudoedit /etc/unbound/unbound.conf.d/applyforge.conf          # replace <applyforge.example.org>
-sudo install -d /etc/systemd/system/unbound.service.d
-sudo install -m 0644 "$REL/deploy/systemd/unbound-applyforge-vpn.conf" /etc/systemd/system/unbound.service.d/applyforge-vpn.conf
+# No start-order drop-in: the config sets ip-freebind. Ordering unbound after wg-quick@wg0 creates a boot
+# ordering cycle via nss-lookup.target, and systemd breaks it by dropping the wg0 start job.
 sudo unbound-checkconf && sudo systemctl daemon-reload && sudo systemctl enable --now unbound
 dig +short @10.99.0.1 applyforge.<domain>                     # from a VPN client: 10.99.0.1
 ```
@@ -1370,3 +1370,78 @@ The rehearsal killed the app server, **deleted its disk** and rebuilt it. Timing
    - Re-pin the SSH host key (`ssh-keygen -R 10.99.0.1`) unless it was restored.
    - Give users the new API token.
 8. **Take a backup** and check that it is sealed. Re-enable the timers.
+
+---
+
+## 16. Staging and production deployment with the installer
+
+`deploy/install/applyforge-install` automates sections 3–8, 9–10, 12.3, 14 and 15 for the two-server architecture. Every step is idempotent: a re-run repairs drift and changes nothing that is already correct. Private keys and application secrets are generated **on the servers** and never printed. Tested end to end on fresh Ubuntu 26.04 VMs (`PRODUCTION_READINESS.md` 3d).
+
+| Tool | Runs on | Purpose |
+|---|---|---|
+| `deploy/release/build-release.sh` | admin workstation | Release tarballs + checksums from a clean commit (section 4) |
+| `deploy/hetzner/provision.sh` | admin workstation | Servers, cloud firewalls, SSH key on Hetzner Cloud; `plan` (default) changes nothing |
+| `deploy/install/applyforge-install` | both servers, as root | `keys`, `host`, `release`, `rollback`, `link`, `acme`, `peer`, `client-config`, `firewall`, `validate` |
+
+**Inputs.** `/etc/applyforge/site.env` (same file on both servers; public values only, see `deploy/install/site.env.example`). Secrets are files placed in `/root/applyforge-inputs/` (root 0700); `host` installs them and deletes the copies:
+
+| File | Server | Content |
+|---|---|---|
+| `backup-recipients.txt` | app | the two age **public** recipients (15.5) |
+| `healthchecks.env` | both | `HC_<CHECK>=` ping URLs (15.6) |
+| `acme.env` | app | lego/DNS-01 settings with the scoped DNS credential (15.2) |
+
+### 16.1 Sequence
+
+```bash
+# Workstation
+deploy/release/build-release.sh --out ~/applyforge-releases          # -> applyforge-<sha>{.tar.gz,-dist.tar.gz,.sha256}
+export HCLOUD_TOKEN=...                                               # project token, shell only
+deploy/hetzner/provision.sh plan  --config deploy/hetzner/hetzner.env # review
+deploy/hetzner/provision.sh apply --config deploy/hetzner/hetzner.env # prints both public IPv4 addresses
+scp ~/applyforge-releases/applyforge-<sha>* root@<app-ip>:/root/upload/     # backup server: only the .tar.gz
+```
+
+On **each** server (bootstrap SSH as root, from `ADMIN_CIDR` only):
+
+```bash
+mkdir -p /root/stage && tar -xzf /root/upload/applyforge-<sha>.tar.gz -C /root/stage
+AI=/root/stage/<sha>/deploy/install/applyforge-install
+install -d -m 0755 /etc/applyforge && install -m 0644 site.env /etc/applyforge/site.env
+$AI keys --role app            # backup server: --role backup. Prints the PUBLIC keys
+```
+
+Put both printed `wg1` public keys into `site.env` (`APP_WG1_PUBKEY`, `BACKUP_WG1_PUBKEY`) on both servers, place the input files, then:
+
+```bash
+$AI host --role backup         # backup server first (the app's wg1 and NFS mount need it)
+$AI host --role app            # app server
+```
+
+From the **admin device** (each device generates its own key; only the public key goes to the servers):
+
+```bash
+wg genkey | tee laptop.key | wg pubkey            # on the device
+sudo applyforge-install peer add laptop <device public key> 10.99.0.2    # app server
+sudo applyforge-install peer add laptop <device public key 2> 10.97.0.2  # backup server (its own key/tunnel)
+sudo applyforge-install client-config laptop      # prints the device config; paste the device's private key in
+```
+
+Then on the app server:
+
+```bash
+applyforge-install release --from /root/upload    # first deployment: env file, DB password, migrate, start
+applyforge-install link                           # NFS share over wg1, marker, probe-destination, backup timer
+applyforge-install acme                           # Let's Encrypt via DNS-01 (staging CA first, see acme.env)
+```
+
+**Firewall, on each server:** `applyforge-install firewall apply` (from the bootstrap session; the live ruleset rolls back after 120 s unless confirmed), then from a **new SSH session through the VPN**: `ssh afadmin@10.99.0.1 sudo applyforge-install firewall confirm` (backup server: `10.97.0.1`). When both are confirmed: `deploy/hetzner/provision.sh close-ssh`. Set the admin console password (`passwd afadmin`) and test the provider console (15.7).
+
+**Validate:** `sudo applyforge-install validate` on each server: every check prints PASS/WARN/FAIL; exit 1 on any FAIL. After the first backup has run (02:30) and been sealed (hourly, ≥ 10 min old), both servers should show no FAIL.
+
+### 16.2 Upgrades, rollback, devices
+
+- **Upgrade:** copy the new release to `/root/upload-<sha>/` and run `applyforge-install release --from /root/upload-<sha>`. If migrations are pending, it takes a backup first (refuses if backups are not operational, unless `--allow-no-backup`). If the new release fails its health check and no migration ran, it switches back automatically. If the release changes `deploy/` tooling, re-run `host` from the new release.
+- **Code rollback:** `applyforge-install rollback`. It refuses when a migration that exists only in the newer release has been applied (section 10.1).
+- **Devices:** `peer add|remove|list`; changes are applied with `wg syncconf` (no tunnel interruption).
+- **Rebuild (15.8):** before `host`, restore `/etc/wireguard/wg0.key` and `wg1.key` from the password manager (0600); `keys` keeps existing keys, so devices and the backup link work unchanged.
