@@ -1,0 +1,49 @@
+#!/usr/sbin/nft -f
+# ApplyForge server firewall: default-deny inbound. Validated in the network rehearsal (QEMU/KVM VMs,
+# Ubuntu 26.04, WireGuard, 2026-11-21): deploy/README.md section 14.
+# Install as /etc/nftables.conf (Ubuntu's nftables.service loads it at boot):
+#   sudo nft -c -f applyforge.nft && sudo install -m 0644 applyforge.nft /etc/nftables.conf
+#   sudo systemctl enable --now nftables
+# Change it only with the rollback procedure in deploy/README.md (an automatic revert timer).
+#
+# Reachable from outside the VPN: nothing except the WireGuard UDP port.
+# Reachable through the VPN (interface wg0 only): SSH 22, HTTP 80 (redirect), HTTPS 443.
+# The server makes outbound connections freely (updates, NTP, DNS, the backup NFS share).
+# If the backup share is on the LAN, NFS needs no inbound rule (the server is the client).
+
+define WG_PORT = 51820
+
+flush ruleset
+
+table inet applyforge {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state invalid drop
+        ct state { established, related } accept
+        iifname "lo" accept
+
+        # IPv6 neighbour discovery and path MTU must work on every interface.
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, packet-too-big } accept
+        icmp type { destination-unreachable, time-exceeded } accept
+
+        # The only service reachable from outside the VPN.
+        udp dport $WG_PORT accept
+
+        # Administration and the application: VPN only.
+        iifname "wg0" tcp dport { 22, 80, 443 } accept
+        iifname "wg0" icmp type echo-request limit rate 5/second accept
+        iifname "wg0" icmpv6 type echo-request limit rate 5/second accept
+
+        # Everything else is dropped silently (no reject: nothing to fingerprint). Count it.
+        counter comment "dropped inbound"
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

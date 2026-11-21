@@ -110,9 +110,15 @@ def answer(args):
         (f"{venv} -m pip freeze", (0, "Django==5.2.19\ngunicorn==27.0.1\npsycopg2-binary==2.9.13\npip==25.3\n", "")),
         ("systemd-analyze verify", (0, "", "")),
         ("systemd-analyze security", (0, "→ Overall exposure level for applyforge.service: 1.2 OK 🙂\n", "")),
+        ("systemctl is-enabled wg-quick@wg0.service", (0, "enabled\n", "")),   # before the generic entry
         ("systemctl is-enabled", (1, "disabled\n", "")),
         ("systemctl is-active", (3, "inactive\n", "")),
         ("systemctl cat", (1, "", "No files found")),
+        # As on real systemd: enabled template instances appear in list-units, not in list-unit-files.
+        ("systemctl list-units --all --type=service --no-legend --plain wg-quick@*",
+         (0, "wg-quick@wg0.service loaded active exited WireGuard via wg-quick(8) for wg0\n", "")),
+        ("systemctl show -p After --value nginx.service",
+         (0, "network-online.target wg-quick@wg0.service systemd-journald.socket sysinit.target\n", "")),
         ("systemd-escape", (0, "mnt-applyforge\\x2dbackups.mount\n", "")),
         ("openssl x509 -checkend", (0, "Certificate will not expire\n", "")),
         ("openssl x509 -noout -checkhost", (0, "Hostname applyforge.vpn.internal does match certificate\n", "")),
@@ -315,6 +321,40 @@ class HostCheckTests(unittest.TestCase):
         self.host.overrides["systemctl is-active applyforge-backup.service"] = (3, "failed\n", "")
         self.assertEqual(self.check(), 0)
         self.assertTrue(any("applyforge-backup.service is in the failed state" in l for l in self.lines("WARN")))
+
+    def test_nginx_not_ordered_after_vpn_fails(self):
+        # Regression (network rehearsal 2026-11-21): nginx started before wg-quick@wg0 at boot, failed to
+        # bind the VPN address and stayed down.
+        self.host.overrides["systemctl show -p After --value nginx.service"] = (0, "network-online.target sysinit.target\n", "")
+        self.assertEqual(self.check(), 1)
+        self.assertTrue(any("nginx is not ordered after wg-quick@wg0.service" in l for l in self.lines("FAIL")), self.out)
+
+    def test_nginx_ordered_after_vpn_passes(self):
+        self.assertEqual(self.check(), 0, self.out)
+        self.assertIn("nginx starts after wg-quick@wg0.service", self.out)
+
+    def test_no_enabled_vpn_unit_is_info_only(self):
+        self.host.overrides["systemctl list-units --all --type=service --no-legend --plain wg-quick@*"] = (0, "", "")
+        self.assertEqual(self.check(), 0, self.out)
+        self.assertTrue(any("no enabled wg-quick unit" in l for l in self.lines("INFO")))
+
+    def test_disabled_vpn_instance_is_not_required(self):
+        self.host.overrides["systemctl is-enabled wg-quick@wg0.service"] = (1, "disabled\n", "")
+        self.host.overrides["systemctl show -p After --value nginx.service"] = (0, "network-online.target\n", "")
+        self.assertEqual(self.check(), 0, self.out)
+
+    def test_verify_ignores_notes_about_unrelated_distribution_units(self):
+        # Regression (network rehearsal 2026-11-21): Ubuntu 26.04 prints deprecation notes for its own units.
+        self.host.overrides["systemd-analyze verify"] = (0, "", "/usr/lib/systemd/system/system-xfs_scrub.slice:15: "
+                                                          "Support for option CPUAccounting= has been removed and it is ignored\n")
+        self.assertEqual(self.check("--strict"), 0, self.out)
+        self.assertIn("systemd-analyze verify applyforge.service: clean", self.out)
+
+    def test_verify_warning_about_the_unit_itself_is_reported(self):
+        self.host.overrides["systemd-analyze verify"] = (0, "", "/etc/systemd/system/applyforge.service:12: Unknown key "
+                                                          "name 'Foo' in section 'Service', ignoring.\n")
+        self.check()
+        self.assertTrue(any("applyforge.service:12: Unknown key" in l for l in self.lines("WARN")), self.out)
 
     def test_writable_release_file_fails(self):
         os.chmod(self.path(f"{self.rel}/deploy/preflight.py"), 0o666)

@@ -2223,9 +2223,8 @@ class PrivilegeAndErrorTests(BackupTestCase):
         self.assertFalse(os.path.exists(canary))
 
 
-# --- Real age (skipped unless installed) ------------------------------------------------------------------------
+# --- probe-destination ------------------------------------------------------------------------------------------
 
-@unittest.skipUnless(REAL_AGE and REAL_AGE_KEYGEN, "age/age-keygen not installed")
 class ProbeDestinationTests(BackupTestCase):
     """probe-destination (8.4e): writes only its own probe directory and reports what the
     destination supports."""
@@ -2357,6 +2356,12 @@ class ProbeDestinationTests(BackupTestCase):
         self.assertEqual(details, ("nfs4", "nas:/export/af", "rw,noatime", "rw,vers=4.2,hard,sec=sys"))
 
 
+# --- Real age (skipped unless installed) ------------------------------------------------------------------------
+# The decorator must stay directly on RealAgeTests. In the 8.4e commit a class was inserted between
+# them, which skipped the probe-destination tests without age and crashed RealAgeTests (network
+# rehearsal, 2026-11-21); test_real_age_skip_is_attached_to_the_right_class guards it.
+
+@unittest.skipUnless(REAL_AGE and REAL_AGE_KEYGEN, "age/age-keygen not installed")
 class RealAgeTests(BackupTestCase):
     """Round trip with the real age binary and a THROWAWAY identity created in the
     test's temporary directory (deleted with it); never a real backup key."""
@@ -2384,6 +2389,17 @@ class RealAgeTests(BackupTestCase):
         damaged = self.touch(os.path.join(self.tmp, "damaged.tar.age"), bytes(data))
         self.assertEqual(self.verify(damaged), 1)
         self.assert_no_leftovers()
+
+
+class SuiteStructureTests(unittest.TestCase):
+    """Regression (network rehearsal 2026-11-21): the 'age installed' skip belongs to RealAgeTests only."""
+
+    def test_real_age_skip_is_attached_to_the_right_class(self):
+        self.assertNotIn("age", getattr(ProbeDestinationTests, "__unittest_skip_why__", "") or "",
+                         "probe-destination tests must not depend on age being installed")
+        if not (REAL_AGE and REAL_AGE_KEYGEN):
+            self.assertTrue(getattr(RealAgeTests, "__unittest_skip__", False))
+            self.assertIn("age", RealAgeTests.__unittest_skip_why__)
 
 
 if __name__ == "__main__":

@@ -53,7 +53,9 @@ Files in this directory:
 | `systemd/applyforge-backup.{service,timer}` | `/etc/systemd/system/` | daily backup at 03:30, strict sandbox, `ExecStopPost` service recovery |
 | `systemd/applyforge-backup.tmpfiles` | `/etc/tmpfiles.d/applyforge-backup.conf` | root-only state and work directories, shared lock file |
 | `host_check.py` | used in place from the release | read-only host readiness check (section 13.1) |
-| `tests/` | not installed | `test_host_check.py`; `stack_test.sh`, the nginx + Gunicorn end-to-end test (section 13.1) |
+| `systemd/nginx-applyforge-vpn.conf` | `/etc/systemd/system/nginx.service.d/applyforge-vpn.conf` | starts nginx after the VPN interface it listens on (section 14) |
+| `nftables/applyforge.nft` | `/etc/nftables.conf` | default-deny inbound firewall: WireGuard from outside, SSH/HTTP/HTTPS only through the VPN (section 14) |
+| `tests/` | not installed | `test_host_check.py`; `test_firewall_ruleset.py`; `stack_test.sh`, the nginx + Gunicorn end-to-end test (section 13.1) |
 | `PRODUCTION_READINESS.md` | not installed | readiness assessment, verified/unverified requirements, blockers and go/no-go checklist |
 
 ### Why one Gunicorn worker
@@ -83,7 +85,7 @@ These are prepared outside this milestone. This runbook does not install or conf
 - **Python: the distribution's `python3`** (3.14.4 on Ubuntu 26.04; 3.12 or later is required) plus `python3-venv`. Ubuntu 26.04 has no `python3.12` package; don't install another interpreter. The full backend suite passes on 3.14.4 (Linux) and 3.12 (Windows development).
 - **Readiness check.** After provisioning, and before every deployment, run the read-only host check: `sudo python3 -I "$REL/deploy/host_check.py" --release "$REL"` (section 13.1).
 - **PostgreSQL 14 or later** on the same host, listening on `localhost` only, on the **default port 5432**. The Milestone 8.4b rehearsal used PostgreSQL 18.6. The backup tool runs `pg_dump`, `createdb`, `psql` and `pg_restore` with a scrubbed environment (no `PG*` variables) through the default Unix socket, so it reaches only a cluster on port 5432.
-- **A working VPN.** The server needs a fixed VPN address (example: `10.99.0.1`), and clients need a known subnet (example: `10.99.0.0/24`). The host firewall must not expose ports 80 or 443 on any public interface. nginx binds to the VPN address only, but the firewall is the primary control.
+- **A working VPN.** The server needs a fixed VPN address (example: `10.99.0.1`), and clients need a known subnet (example: `10.99.0.0/24`). The host firewall must not expose ports 80 or 443 on any public interface. nginx binds to the VPN address only, but the firewall is the primary control. Section 14 has the rehearsed WireGuard setup, the default-deny ruleset (`deploy/nftables/applyforge.nft`) and the safe procedure for changing it.
 - **Name resolution.** A private host name (example: `applyforge.vpn.example`) must resolve to the VPN address for VPN clients, through internal DNS or a hosts file.
 - **TLS certificate.** You need a certificate and key for that host name, typically from a private CA that the client devices trust. Install them as `/etc/ssl/applyforge/applyforge.crt` (`0644`) and `/etc/ssl/applyforge/applyforge.key` (`0600`, `root`).
   - **The private CA must issue RFC 5280-conformant certificates.** The CA certificate needs `basicConstraints = critical, CA:TRUE` and `keyUsage = critical, keyCertSign, cRLSign`. The server certificate needs `subjectAltName = DNS:<host name>`, `extendedKeyUsage = serverAuth`, and subject/authority key identifiers. Strict clients reject a CA without `keyUsage`, even though curl and browsers may accept it: in the 8.4e rehearsal, Python 3.13+ failed with "CA cert does not include key usage extension". Check with `openssl verify -x509_strict -CAfile ca.crt applyforge.crt`.
@@ -230,6 +232,9 @@ sudo install -m 0644 "$REL/deploy/nginx/applyforge.conf" /etc/nginx/sites-availa
 sudoedit /etc/nginx/sites-available/applyforge.conf     # replace 10.99.0.1, 10.99.0.0/24, applyforge.vpn.example
 sudo ln -sfn /etc/nginx/sites-available/applyforge.conf /etc/nginx/sites-enabled/applyforge.conf
 sudo rm -f /etc/nginx/sites-enabled/default             # the distribution's default site listens on all addresses
+# nginx listens on the VPN address: start it only after the VPN interface exists (section 14).
+sudo install -d /etc/systemd/system/nginx.service.d
+sudo install -m 0644 "$REL/deploy/systemd/nginx-applyforge-vpn.conf" /etc/systemd/system/nginx.service.d/applyforge-vpn.conf
 
 sudo systemctl daemon-reload
 sudo nginx -t
@@ -1015,3 +1020,81 @@ Contain first, then investigate. Keep notes with times.
 | Backup storage lost | Provision new storage, mount it, add the marker, run `probe-destination`, take and verify a new backup | none (history only) |
 
 Recovery objectives with the shipped configuration: **RPO 24 hours** (daily backup at 03:30) and an **RTO of a few hours** for a rebuild (provisioning, restore, validation). Back up more often only after measuring the maintenance window, because each backup stops ApplyForge briefly.
+
+---
+
+## 14. VPN, firewall and administrative access (rehearsed 2026-11-21)
+
+This is the configuration exercised in the network rehearsal: three QEMU/KVM VMs (server, VPN client, outsider) on an isolated virtual LAN, running Ubuntu 26.04. Results are in `deploy/PRODUCTION_READINESS.md` section 3b. The VPN here is WireGuard. If you use another VPN, keep the same properties.
+
+**Properties.**
+
+- The server's VPN address is `10.99.0.1`.
+- From outside the VPN, nothing but the WireGuard UDP port answers. All other traffic is dropped silently, not refused.
+- SSH (keys only, no root), HTTP and HTTPS are accepted **only on the `wg0` interface**.
+- nginx and the firewall come back on their own after every reboot.
+
+### 14.1 WireGuard on the server
+
+```bash
+sudo apt install wireguard-tools
+umask 077; wg genkey | sudo tee /etc/wireguard/server.key | wg pubkey | sudo tee /etc/wireguard/server.pub
+sudoedit /etc/wireguard/wg0.conf                 # 0600 root
+#   [Interface]
+#   Address = 10.99.0.1/24
+#   ListenPort = 51820
+#   PrivateKey = <contents of /etc/wireguard/server.key>
+#   [Peer]                                       # one block per admin/user device
+#   PublicKey = <the device's public key>
+#   AllowedIPs = 10.99.0.2/32
+sudo systemctl enable --now wg-quick@wg0
+```
+
+Each client device has its own key pair and `Address = 10.99.0.N/24`. Its peer block for the server has `Endpoint = <server public or LAN address>:51820`, `AllowedIPs = 10.99.0.0/24` and `PersistentKeepalive = 25`. Enable `wg-quick@wg0` on clients that should reconnect after a reboot.
+
+- **To add a device:** add a `[Peer]` block, then `sudo systemctl restart wg-quick@wg0`. The restart briefly interrupts every tunnel, so do it from the console or be ready to reconnect. `wg syncconf` avoids the interruption.
+- **To remove a device:** delete its block and restart. A key the server does not list gets no handshake and no access (rehearsal N6).
+
+### 14.2 Firewall
+
+```bash
+sudo apt install nftables
+sudo nft -c -f "$REL/deploy/nftables/applyforge.nft"      # syntax check only; changes nothing
+sudo install -m 0644 "$REL/deploy/nftables/applyforge.nft" /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo nft list ruleset | grep 'policy drop'                # input and forward chains
+```
+
+`flush ruleset` in that file removes every other nftables table, so this assumes a dedicated server. If anything else manages rules (Docker, ufw, a cloud agent), merge the `applyforge` table instead. The host check reports `PASS nftables has an input chain with policy drop`.
+
+### 14.3 Changing the firewall safely (automatic rollback)
+
+A wrong ruleset can lock you out of SSH. The rehearsal's lock-out ruleset also dropped the WireGuard port, so the tunnel went down too. **Always apply changes with a rollback timer**, from an SSH session through the VPN:
+
+```bash
+sudo nft -c -f /tmp/new.nft                                                    # 1. syntax check
+sudo systemd-run --unit=fw-rollback --on-active=120 /usr/sbin/nft -f /etc/nftables.conf   # 2. arm the rollback
+sudo nft -f /tmp/new.nft                                                       # 3. apply (live only)
+# 4. From a SECOND, new SSH session through the VPN, confirm SSH and HTTPS still work. Then:
+sudo systemctl stop fw-rollback.timer                                          # 5. confirm (cancel the rollback)
+sudo install -m 0644 /tmp/new.nft /etc/nftables.conf                           # 6. persist
+```
+
+If you are locked out, do nothing. When the timer fires, the saved `/etc/nftables.conf` is restored. The rehearsal used a 60 s timer, and access returned 64 s and 87 s after applying (the timer plus the WireGuard re-handshake). With the 120 s timer above, expect about 2–2.5 minutes. A change that was never persisted (step 6) is also undone by any reboot.
+
+### 14.4 Console recovery
+
+When SSH is unreachable and no rollback timer was armed:
+
+1. Open the **provider/hypervisor console** (serial or VNC). This is out of band and does not use the network.
+2. Log in as the admin account with its **console password**. SSH accepts keys only, so this password is useful only on the console. Store it in the password manager, not on the server.
+3. Run `sudo nft -f /etc/nftables.conf` (restores the saved ruleset), or `sudo systemctl restart nftables`.
+4. Alternatively, **reboot from the console or hypervisor**. The bad ruleset was live only, and the saved file is loaded at boot.
+
+Both paths were rehearsed (F2 and F4). Before go-live, confirm that the provider console works and that the console password is known.
+
+### 14.5 Boot order
+
+- **nginx after the VPN.** nginx listens on `10.99.0.1`, which exists only once `wg-quick@wg0` has run. Without the drop-in from section 6 (`deploy/systemd/nginx-applyforge-vpn.conf`), nginx can start first, fail with `bind() to 10.99.0.1:443 failed (99: Cannot assign requested address)` and **stay down** until restarted by hand. The rehearsal reproduced this; the host check now fails when the ordering is missing.
+- **DNS configuration.** On Ubuntu 26.04, netplan runs `systemd-networkd-wait-online --dns`. If the server's network configuration has **no DNS server**, boot waits the full 120 s timeout before `network-online.target`, and with it the VPN, nginx and ApplyForge. Make sure netplan (or DHCP) provides a resolver.
+- **Restarting nginx while `wg0` is down** fails for the same reason as at boot. Bring the VPN up first: `sudo systemctl start wg-quick@wg0`.

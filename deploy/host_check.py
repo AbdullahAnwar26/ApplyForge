@@ -473,6 +473,7 @@ def check_nginx(host, r):
         r.fail("nginx site listens on all addresses: " + ", ".join(wildcard))
     else:
         r.ok("nginx site listens only on specific addresses: " + ", ".join(sorted(set(listens))))
+    check_nginx_vpn_ordering(host, r, listens)
     names = sorted(set(re.findall(r"^\s*server_name\s+([^;]+);", conf, re.M)) - {"_"})
     server_names = sorted({n for line in names for n in line.split() if n != "_"})
     if any(n.endswith(".example") for n in server_names) or "10.99.0." in conf:
@@ -499,6 +500,30 @@ def check_nginx(host, r):
             r.ok(f"certificate covers {server_name}")
         else:
             r.fail(f"certificate does not cover {server_name}")
+
+
+def check_nginx_vpn_ordering(host, r, listens):
+    """nginx listens on the VPN address; if a WireGuard (wg-quick) unit is enabled, nginx must be ordered
+    after it, or nginx can fail to bind at boot and stay down (found in the 2026-11-21 network rehearsal)."""
+    specific = [x for x in listens if listen_address(x) not in WILDCARD_ADDRESSES | LOOPBACK_ADDRESSES | {"", "unix"}]
+    if not specific:
+        return
+    # Enabled template INSTANCES (wg-quick@wg0) are not listed by list-unit-files, only the template is;
+    # list the loaded instances and keep the enabled ones.
+    rc, out, _ = host.run(["systemctl", "list-units", "--all", "--type=service", "--no-legend", "--plain", "wg-quick@*"])
+    loaded = sorted({line.split()[0] for line in out.splitlines() if line.strip()}) if rc == 0 else []
+    vpn_units = [u for u in loaded if host.run(["systemctl", "is-enabled", u])[1].strip() == "enabled"]
+    if not vpn_units:
+        r.info("no enabled wg-quick unit found; check that nginx starts after whatever brings up the VPN address")
+        return
+    rc, out, _ = host.run(["systemctl", "show", "-p", "After", "--value", "nginx.service"])
+    after = set(out.split()) if rc == 0 else set()
+    missing = [u for u in vpn_units if u not in after]
+    if missing:
+        r.fail(f"nginx is not ordered after {', '.join(missing)}: at boot it can fail to bind the VPN address and "
+               "stay down - install deploy/systemd/nginx-applyforge-vpn.conf (deploy/README.md section 6)")
+    else:
+        r.ok(f"nginx starts after {', '.join(vpn_units)} (it binds the VPN address)")
 
 
 def listen_address(spec):
@@ -679,7 +704,11 @@ def check_units(host, r):
             (r.fail if unit == "applyforge.service" else r.warn)(f"{unit} is not installed")
             continue
         rc, out, err = host.run(["systemd-analyze", "verify", path], timeout=60)
-        text = (err + out).strip()
+        # verify also prints notes about unrelated distribution units it loads (e.g. Ubuntu 26.04:
+        # "system-xfs_scrub.slice:15: Support for option CPUAccounting= has been removed"); keep only
+        # lines about this unit.
+        text = "\n".join(line for line in (err + out).splitlines()
+                         if unit in line or path in line or unit.split(".")[0] + "." in line).strip()
         (r.ok if rc == 0 and not text else r.warn if rc == 0 else r.fail)(
             f"systemd-analyze verify {unit}: " + (text.splitlines()[-1][:200] if text else "clean"))
         rc, enabled, _ = host.run(["systemctl", "is-enabled", unit])

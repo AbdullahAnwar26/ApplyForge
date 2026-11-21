@@ -105,6 +105,58 @@ Timings are for a few KB of fictional data on local disks. Production timings mu
 - With the NFS server in the same instance, a `hard` mount delays shutdown by 60 s unless it is unmounted first. A real NAS is separate, but note B4.
 - WSL idle-stops instances and was suspended once (about 20 min) by the host.
 
+## 3b. Network rehearsal: VPN, firewall, SSH (2026-11-21)
+
+**Why not Hyper-V.** The workstation runs Windows 11 Home (edition ID `Core`), which has no Hyper-V management stack. With the owner's approval, the rehearsal used real **QEMU/KVM virtual machines** with nested virtualization, inside a new disposable WSL instance (`af84g-net-11210049f1ea`). No Windows firewall, Windows adapter or shared WSL network was changed.
+
+**Topology.** Three Ubuntu 26.04 VMs (kernel 7.0, cloud image verified against Ubuntu's GPG-signed checksums) on a virtual LAN `10.20.0.0/24`:
+
+- the bridge `br-lan` lives in a private network namespace with no uplink, no routes and no link to any other namespace;
+- the VMs have no default route and cannot reach the internet;
+- the VMs were controlled out of band through the QEMU guest agent and serial console, never over the network under test.
+
+| VM | LAN | VPN | Role |
+|---|---|---|---|
+| server (2 vCPU, 1.5 GiB) | 10.20.0.10 | 10.99.0.1 (wg0, UDP 51820) | ApplyForge deployed with the runbook (release `222ccd3`), nginx with the repository site and its real placeholder values, PostgreSQL, sshd (keys only), nftables `deploy/nftables/applyforge.nft` |
+| client (1 vCPU, 1 GiB) | 10.20.0.20 | 10.99.0.2 | the admin/VPN client: WireGuard enabled at boot, the private CA trusted |
+| outsider (1 vCPU, 768 MiB) | 10.20.0.30 | — | the attacker: holds the **valid** admin SSH key and a WireGuard key the server does not know |
+
+**Results (all fictional credentials).**
+
+| Area | Result |
+|---|---|
+| WireGuard | handshake and ping client ↔ 10.99.0.1. The server lists exactly one peer. The outsider's unknown key gets no handshake and no connectivity. |
+| Firewall | inbound `policy drop` loaded from `/etc/nftables.conf`. The nftables drop counter climbed past 196,000 packets during the scans. Forwarding: drop. |
+| SSH | through the VPN: key login and `sudo` work. Password login and root login are refused ("Permission denied (publickey)"). From the LAN (client or outsider, **even with the valid key**): timeout. |
+| HTTP/HTTPS | through the VPN: health 200, SPA 200, HTTP→301, `/admin` 404, API 401 without the token and 200 with it, collector POST 403, HSTS. From the LAN: dropped (curl exit 28: timeout, not refused). With the VPN down: no access. |
+| Routing trick | the outsider routing `10.99.0.0/24` via the server's LAN address: 22 and 443 on `10.99.0.1` dropped. The rule matches `iifname "wg0"`, not just the address. |
+| Port scans (TCP 1–65535, completed) | outsider → server LAN: **0 open** (65,535 filtered). VPN client → server LAN address: **0 open**. VPN client → 10.99.0.1: **exactly 22, 80, 443 open**, 65,532 filtered. UDP: every probed port is `open|filtered`, because a silent drop leaves nmap nothing to distinguish. |
+| Reboot persistence | admin reboot over SSH, client reboot and cold power cycle: everything came back on its own. The firewall loaded before WireGuard and nginx (5.1 s, 7.7 s, 7.9 s). HTTPS through the VPN answered 4 s after an admin reboot and 17 s after a cold start. The client tunnel returned within about 2 s. |
+| Firewall change safety | `nft -c` rejected a typo and left the live rules untouched. A real lock-out (it also dropped the WireGuard port) applied **with** the rollback timer recovered automatically after 64 s and 87 s (two runs). Confirming a good change by cancelling the timer works. A lock-out **without** a timer was recovered through the serial console (afterwards SSH worked within 1 s) and, separately, by a hypervisor reset (the saved rules loaded at boot). |
+
+**Defects found and fixed.**
+
+1. **High – nginx did not survive a reboot.** nginx and `wg-quick@wg0` both start after `network-online.target`. nginx started first, failed with `bind() to 10.99.0.1:443 failed (99: Cannot assign requested address)`, and stayed down: the site was unreachable after reboot until a manual restart. **Fixed** by `deploy/systemd/nginx-applyforge-vpn.conf` (nginx `After=`/`Wants=wg-quick@wg0.service`), installed in runbook section 6. Verified across three reboot types.
+2. **Medium – the host check could not see the ordering problem.** It now fails when an enabled `wg-quick@` instance exists and nginx is not ordered after it. A first version used `list-unit-files`, which never lists enabled template instances; the real VM caught that, and it is fixed and tested. Regression tests fail on the committed code.
+3. **Medium – backup test suite (introduced in 8.4e).** The "age installed" skip decorator sat on the wrong class. Without `age`, the 11 `probe-destination` tests were silently skipped and `RealAgeTests` crashed; this showed up in the fresh VM-host instance. Fixed, with a guard test (`SuiteStructureTests`).
+4. **Low – host check false warning.** `systemd-analyze verify` echoes Ubuntu 26.04's notes about its own units (`system-xfs_scrub.slice: CPUAccounting= removed`). Only lines about the verified unit now count. Tested.
+5. **Documentation.** Runbook section 14 (new):
+   - the WireGuard setup;
+   - the firewall ruleset and its installation;
+   - the change procedure with an automatic rollback timer;
+   - console recovery;
+   - boot order, including the 120 s boot stall when netplan configures no DNS server (`systemd-networkd-wait-online --dns`), which the rehearsal hit first.
+
+   `deploy/nftables/applyforge.nft` is new, guarded by `deploy/tests/test_firewall_ruleset.py`. `nft -c` accepted the repository copy on the server, and its rules are identical to the ones loaded there.
+
+**Rehearsal-harness errors (corrected; not product defects).**
+
+- A first lock-out ruleset had a syntax error, so nothing was locked out. The test now refuses to run unless the lock-out file passes `nft -c`.
+- Two full scans hit a time limit before completing. They now use a minimum rate and must print nmap's completion line.
+- `pipefail` masked a correct SSH refusal message.
+
+**Not covered.** The real provider network, router and NAT, the public interface and the real VPN endpoint. The Hyper-V virtual switch (not available). IPv6 reachability beyond the rules. A real provider console. Clock synchronisation (the VMs had no NTP).
+
 ## 4. Verified requirements
 
 | # | Requirement | Evidence |
@@ -126,14 +178,18 @@ Timings are for a few KB of fictional data on local disks. Production timings mu
 | V15 | First backup through the real unit with the real `Type=notify` app: about 1 s client-visible outage; offline verification by a separate account with primary and escrow identities | dress rehearsal |
 | V16 | Restore → validate → rename-based switch → backups capture the live data; rollback paths for the switch and for code | dress rehearsal |
 | V17 | Services and the NFS backup mount recover after an unplanned restart | dress rehearsal |
+| V18 | WireGuard + nftables default-deny: only UDP 51820 is reachable from outside; SSH/HTTP/HTTPS only through `wg0`; full-range scans confirm it | network rehearsal (3b) |
+| V19 | Key-only SSH administration through the VPN; password and root login refused; the valid key alone is not enough from the LAN | network rehearsal |
+| V20 | Reboot and cold-start persistence of the firewall, VPN, nginx (with the ordering fix) and ApplyForge | network rehearsal |
+| V21 | Safe firewall change: syntax check, automatic rollback timer, confirmation, serial-console and reset recovery | network rehearsal |
 
 ## 5. Unverified requirements (need the real host or real infrastructure)
 
 | # | Requirement | How it will be verified |
 |---|---|---|
 | U1 | Real server sizing, disks, kernel and Ubuntu 26.04 install | `host_check.py` |
-| U2 | VPN: fixed server address, client subnet, peers; nginx `allow` lines match | host check (listeners) + section 8.1 client checks |
-| U3 | Host firewall default-deny; 80/443 only on the VPN interface; SSH only via VPN | host check (nftables/ufw) + an external scan from outside the VPN (authorized) |
+| U2 | The **production** VPN: provider network, NAT/port forwarding to UDP 51820, real client devices and their keys, nginx `allow` lines matching. Configuration and behaviour were rehearsed in VMs (3b) | host check + section 8.1 client checks from a real VPN client |
+| U3 | The firewall on the **production host and its real public interface** (the ruleset and procedures were rehearsed in VMs, 3b); provider-level firewall or security groups; a provider console that works | host check + an authorized external scan from outside the VPN |
 | U4 | Private DNS name, certificate from the private CA, client trust, expiry monitoring | host check (expiry, host name) + client checks |
 | U5 | Production PostgreSQL: roles, `pg_hba`, peer/`pg_ident`, PUBLIC revocation, connection limits, the restore tool's identity and `pg_shdepend` queries | host check + one authorized restore drill on the host |
 | U6 | The real `applyforge.service` inside the backup maintenance window **on the production host**, and shutdown behaviour. Rehearsed locally: the window (about 1 s outage) and failed starts with `reset-failed` recovery | first authorized backup run + journal review |
@@ -189,14 +245,14 @@ Timings are for a few KB of fictional data on local disks. Production timings mu
 ## 8. Remaining blockers (prioritized)
 
 1. **B1 – No production host.** Provision Ubuntu 26.04 per runbook sections 2–3. Then run `host_check.py` until there are no `FAIL` lines.
-2. **B2 – Network access controls unverified.** Set up the VPN, the firewall default-deny and the private DNS. Verify from a VPN client and from outside the VPN (U2, U3).
+2. **B2 – Production network access controls.** Apply the rehearsed configuration (runbook section 14) on the real host: WireGuard, `deploy/nftables/applyforge.nft` with the rollback timer, the nginx drop-in, and private DNS. Verify the provider console and console password **before** the first firewall change. Then run an authorized scan from outside the VPN (U2, U3).
 3. **B3 – TLS.** Issue a certificate from the private CA, distribute the CA to clients, and monitor expiry (U4).
 4. **B4 – Backup storage.** Provision NFSv4.1+ with a `sync` export restricted to the server, and snapshots. Run `probe-destination`. Then do the first backup, offline verify and restore drill (U7, U8, U11). Also test the shutdown/reboot behaviour of the `hard` mount with the real NAS (the rehearsal saw a 60 s shutdown delay when the NFS server went away first).
 5. **B5 – Key custody.** Generate the age key pair offline with a second (escrow) recipient. Store the private keys offline, and keep the offline hash record (U10).
 6. **B6 – Production PostgreSQL hardening and drill.** Create the roles and `pg_hba`, revoke PUBLIC, and run a restore drill on the host (U5).
 7. **B7 – First real maintenance window.** Run the first backup with ApplyForge running and review the journal (U6).
 8. **B8 – Monitoring and alerting** for runbook 13.2 (U9).
-9. **B9 – Source control.** The 8.4e changes are committed (`948f58b`). Commit the dress-rehearsal fixes (runbook 12.7 switch procedure, `host_check.py`) and push the local commits when authorized. **Use only the corrected 12.7 procedure** for any switch to restored data.
+9. **B9 – Source control.** The 8.4e work, the dress-rehearsal fixes (`222ccd3`) and the network-rehearsal fixes are committed locally. Pushing them needs separate authorization. **Use only the corrected 12.7 procedure** for any switch to restored data.
 
 ## 9. Authorizations needed
 
