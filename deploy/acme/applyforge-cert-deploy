@@ -1,0 +1,49 @@
+#!/bin/bash
+# lego deploy hook: install a newly issued/renewed certificate for nginx, roll back on failure, and verify
+# what nginx actually serves (deploy/README.md sections 13.3 and 15.2). Runs as root from applyforge-acme.
+#
+# Input (set by lego): LEGO_CERT_PATH, LEGO_CERT_KEY_PATH. Settings: /etc/applyforge/monitoring.env
+# (APP_HOST, VPN_ADDR). Exit status non-zero = the old certificate is still in place (or nginx disagrees);
+# the renewal unit's OnFailure then raises an alert.
+set -u
+SRC_CERT=${LEGO_CERT_PATH:-}; SRC_KEY=${LEGO_CERT_KEY_PATH:-}
+DIR=${APPLYFORGE_TLS_DIR:-/etc/ssl/applyforge}
+CERT=$DIR/applyforge.crt; KEY=$DIR/applyforge.key
+MON=${APPLYFORGE_MON_CONF:-/etc/applyforge/monitoring.env}; [ -r "$MON" ] && . "$MON"
+APP_HOST=${APP_HOST:-}; VPN_ADDR=${VPN_ADDR:-10.99.0.1}; WAIT=${APPLYFORGE_CERT_VERIFY_WAIT:-5}
+log() { echo "applyforge-cert-deploy: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+[ -r "$SRC_CERT" ] && [ -r "$SRC_KEY" ] || die "LEGO_CERT_PATH/LEGO_CERT_KEY_PATH not readable"
+[ -n "$APP_HOST" ] || die "APP_HOST is not set ($MON)"
+# 1. The new pair must belong together, cover the host name and be currently valid.
+[ "$(openssl x509 -noout -pubkey -in "$SRC_CERT" 2>/dev/null | openssl sha256)" = \
+  "$(openssl pkey -pubout -in "$SRC_KEY" 2>/dev/null | openssl sha256)" ] || die "certificate and key do not match"
+openssl x509 -noout -checkhost "$APP_HOST" -in "$SRC_CERT" 2>/dev/null | grep -q "does match" \
+  || die "certificate does not cover $APP_HOST"
+openssl x509 -noout -checkend 0 -in "$SRC_CERT" >/dev/null 2>&1 || die "certificate is already expired"
+
+# 2. Keep the current pair, install the new one atomically (same directory, rename).
+umask 077
+cp -p "$CERT" "$CERT.previous" 2>/dev/null; cp -p "$KEY" "$KEY.previous" 2>/dev/null
+install -m 0644 "$SRC_CERT" "$CERT.new" && install -m 0600 "$SRC_KEY" "$KEY.new" || die "could not stage the new files"
+mv -f "$KEY.new" "$KEY" && mv -f "$CERT.new" "$CERT" || die "could not install the new files"
+
+rollback() {
+  log "$1 - restoring the previous certificate"
+  [ -e "$CERT.previous" ] && mv -f "$CERT.previous" "$CERT"
+  [ -e "$KEY.previous" ] && mv -f "$KEY.previous" "$KEY"
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx
+  exit 1
+}
+# 3. nginx must accept it, then reload.
+nginx -t >/dev/null 2>&1 || rollback "nginx -t failed with the new certificate"
+systemctl reload nginx || rollback "nginx reload failed"
+
+# 4. reload returns before old workers exit: check a NEW connection after a short wait.
+sleep "$WAIT"
+want=$(openssl x509 -noout -serial -in "$CERT" 2>/dev/null)
+got=$(echo | openssl s_client -connect "$VPN_ADDR:443" -servername "$APP_HOST" 2>/dev/null | openssl x509 -noout -serial 2>/dev/null)
+[ -n "$want" ] && [ "$want" = "$got" ] || die "nginx serves '${got:-nothing}', expected '$want' (check nginx)"
+rm -f "$CERT.previous" "$KEY.previous"
+log "deployed: $want, $(openssl x509 -noout -enddate -in "$CERT")"

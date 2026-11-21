@@ -1,0 +1,24 @@
+#!/bin/bash
+# Send one dead-man's-switch ping (Healthchecks.io-compatible) for a named check.
+#
+#   applyforge-ping <check> [success|fail|start]
+#
+# The ping URL comes from /etc/applyforge/healthchecks.env (root 0600), one line per check:
+#   HC_<CHECK>=https://hc-ping.com/<uuid>      (check "backup-disk" -> HC_BACKUP_DISK)
+# The URL is never printed. Exit status: 0 sent, 1 ping failed, 2 usage/configuration error.
+# Installed as /usr/local/sbin/applyforge-ping (deploy/README.md section 15.6).
+set -u
+CONF=${APPLYFORGE_HC_CONF:-/etc/applyforge/healthchecks.env}
+check=${1:-}; kind=${2:-success}
+[[ "$check" =~ ^[a-z][a-z0-9-]{0,40}$ ]] || { echo "usage: applyforge-ping <check> [success|fail|start]" >&2; exit 2; }
+case "$kind" in success) suffix="" ;; fail) suffix="/fail" ;; start) suffix="/start" ;;
+  *) echo "applyforge-ping: unknown kind '$kind'" >&2; exit 2 ;; esac
+[ -r "$CONF" ] || { echo "applyforge-ping: $CONF is not readable" >&2; exit 2; }
+var="HC_$(printf '%s' "$check" | tr 'a-z-' 'A-Z_')"
+url=$(sed -n "s/^${var}=//p" "$CONF" | tail -n 1 | tr -d '[:space:]')
+[[ "$url" =~ ^https?://[^[:space:]]+$ ]] || { echo "applyforge-ping: no valid $var in $CONF" >&2; exit 2; }
+if curl -fsS -m 10 --retry 3 --retry-delay 2 -o /dev/null "$url$suffix" 2>/dev/null; then
+  exit 0
+fi
+echo "applyforge-ping: could not deliver the $kind ping for '$check'" >&2
+exit 1

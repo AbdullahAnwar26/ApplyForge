@@ -2391,6 +2391,134 @@ class RealAgeTests(BackupTestCase):
         self.assert_no_leftovers()
 
 
+class SealTests(BackupTestCase):
+    """seal (two-server rehearsal): the backup server copies finished archives into a root-only vault
+    the application server cannot reach, and detects later changes on the export."""
+
+    def setUp(self):
+        super().setUp()
+        self.vault = self.mkdir("srv/applyforge-vault")
+        os.chmod(self.vault, 0o700)
+        self.seal_lock = os.path.join(self.lock_dir, "applyforge-seal.lock")
+
+    def seal(self, *extra, min_age="0"):
+        return self.run_tool("seal", "--source", self.dest, "--vault", self.vault, "--min-age-seconds", min_age,
+                             "--lock-file", self.seal_lock, *extra)
+
+    def vault_names(self):
+        return sorted(n for n in os.listdir(self.vault) if afbackup.ARCHIVE_RE.match(n))
+
+    def test_finished_archive_is_copied_read_only_and_source_untouched(self):
+        archive = self.make_backup()
+        with open(archive, "rb") as fh:
+            original = fh.read()
+        self.assertEqual(self.seal(), 0, self.stderr)
+        sealed = os.path.join(self.vault, os.path.basename(archive))
+        with open(sealed, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+        self.assertEqual(os.stat(sealed).st_mode & 0o777, 0o400)
+        with open(archive, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+        self.assertIn("1 sealed", self.stderr)
+        self.assertEqual([n for n in os.listdir(self.vault) if n.endswith(".sealing")], [])
+
+    def test_young_archive_is_left_until_it_settles(self):
+        self.make_backup()
+        self.assertEqual(self.seal(min_age="3600"), 0, self.stderr)
+        self.assertEqual(self.vault_names(), [])
+
+    def test_partial_symlink_and_unrelated_files_are_not_sealed(self):
+        victim = self.touch(os.path.join(self.tmp, "victim.txt"), afbackup.AGE_HEADER + b"outside the export")
+        os.symlink(victim, os.path.join(self.dest, "applyforge-backup-20261101T000000Z.tar.age"))
+        self.touch(os.path.join(self.dest, ".applyforge-backup-20261102T000000Z.tar.age.partial"), afbackup.AGE_HEADER)
+        self.touch(os.path.join(self.dest, "notes.txt"), b"x")
+        self.touch(os.path.join(self.dest, "applyforge-backup-20261103T000000Z.tar.age"), b"not an age file")
+        self.assertEqual(self.seal(), 1, self.stderr)          # archive-like files that cannot be sealed alert
+        self.assertEqual(self.vault_names(), [])
+        self.assertIn("not a regular file", self.stderr)
+        self.assertIn("no age header", self.stderr)
+        self.assertIn("2 archive-like file(s) could not be sealed", self.stderr)
+
+    def test_lease_eagain_right_after_publication_is_retried(self):
+        # Regression (two-server rehearsal): an NFS delegation on a just-published archive makes the
+        # server-side O_NONBLOCK open fail with EAGAIN; it used to be skipped silently with exit 0.
+        archive = self.make_backup()
+        real, calls = afbackup.open_regular_nofollow, {"n": 0}
+
+        def busy_twice(path):
+            if path == archive and calls["n"] < 2:
+                calls["n"] += 1
+                raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+            return real(path)
+        with mock.patch.object(afbackup, "SEAL_EAGAIN_SLEEP", 0),                 mock.patch.object(afbackup, "open_regular_nofollow", side_effect=busy_twice):
+            self.assertEqual(self.seal(), 0, self.stderr)
+        self.assertEqual(self.vault_names(), [os.path.basename(archive)])
+
+    def test_persistent_eagain_fails_the_run(self):
+        archive = self.make_backup()
+        real = afbackup.open_regular_nofollow
+
+        def always_busy(path):
+            if path == archive:
+                raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+            return real(path)
+        with mock.patch.object(afbackup, "SEAL_EAGAIN_SLEEP", 0),                 mock.patch.object(afbackup, "open_regular_nofollow", side_effect=always_busy):
+            self.assertEqual(self.seal(), 1)
+        self.assertIn("could not be sealed", self.stderr)
+        self.assertEqual(os.listdir(self.vault), [])
+
+    def test_sealed_copy_survives_deletion_on_the_export(self):
+        archive = self.make_backup()
+        self.assertEqual(self.seal(), 0, self.stderr)
+        os.unlink(archive)
+        self.assertEqual(self.seal(), 0, self.stderr)
+        self.assertEqual(self.vault_names(), [os.path.basename(archive)])
+
+    def test_change_on_the_export_after_sealing_is_reported_and_sealed_copy_kept(self):
+        archive = self.make_backup()
+        self.assertEqual(self.seal(), 0, self.stderr)
+        sealed = os.path.join(self.vault, os.path.basename(archive))
+        with open(sealed, "rb") as fh:
+            before = fh.read()
+        with open(archive, "r+b") as fh:
+            fh.seek(len(afbackup.AGE_HEADER) + 5)
+            fh.write(b"TAMPERED")
+        self.assertEqual(self.seal(), 1)
+        self.assertIn("changed on the export after sealing", self.stderr)
+        with open(sealed, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_second_run_is_idempotent(self):
+        self.make_backup()
+        self.assertEqual(self.seal(), 0, self.stderr)
+        self.assertEqual(self.seal(), 0, self.stderr)
+        self.assertIn("0 sealed", self.stderr)
+        self.assertEqual(len(self.vault_names()), 1)
+
+    def test_vault_retention_keeps_the_newest(self):
+        for days in (90, 80, 70, 60, 1):
+            self.write_old_archive(days)
+        self.assertEqual(self.seal("--retention-days", "30", "--min-keep", "2"), 0, self.stderr)
+        kept = self.vault_names()
+        self.assertEqual(len(kept), 2, kept)          # the 1-day-old one + the newest old one (min-keep 2)
+        self.assertIn("removed by retention", self.stderr)
+
+    def test_unsafe_vault_is_refused(self):
+        os.chmod(self.vault, 0o755)
+        self.assertEqual(self.seal(), 2)
+        self.assertIn("vault", self.stderr)
+
+    def test_vault_inside_the_export_is_refused(self):
+        inner = os.path.join(self.dest, "vault")
+        os.mkdir(inner, 0o700)
+        self.assertEqual(self.run_tool("seal", "--source", self.dest, "--vault", inner, "--lock-file", self.seal_lock), 2)
+        self.assertIn("separate directories", self.stderr)
+
+    def test_refused_while_locked(self):
+        with self.hold_lock(self.seal_lock):
+            self.assertEqual(self.seal(), 2)
+
+
 class SuiteStructureTests(unittest.TestCase):
     """Regression (network rehearsal 2026-11-21): the 'age installed' skip belongs to RealAgeTests only."""
 

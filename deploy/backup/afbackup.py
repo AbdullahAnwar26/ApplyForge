@@ -17,6 +17,8 @@ POSIX systems with age.
                                       [--config FILE] [--media-owner USER] [--allow-unindexed]
     applyforge-backup recover-service [--config FILE] [--discard-marker]
     applyforge-backup probe-destination [--config FILE]
+    applyforge-backup seal            --source DIR --vault DIR [--min-age-seconds N]
+                                      [--retention-days N] [--min-keep N] [--lock-file FILE]
 
 Trust model. age encrypts and integrity-protects an archive, but anyone holding the
 PUBLIC recipient can create a valid archive, and the off-host share controls what it
@@ -2002,6 +2004,142 @@ def cmd_recover_service(args):
     return EXIT_OK
 
 
+# --- Seal: storage-side copies the application server cannot touch (two-server rehearsal) -------------
+
+SEAL_LOCK_FILE = "/run/lock/applyforge-seal.lock"
+# Right after the application server publishes an archive, the NFS server may still hold a client
+# delegation (lease) on it; a local O_NONBLOCK open then fails with EAGAIN until the lease is recalled.
+# Found in the two-server rehearsal: retry for a while instead of skipping silently.
+SEAL_EAGAIN_RETRIES = 30
+SEAL_EAGAIN_SLEEP = 1.0
+SEALING_RE = re.compile(r"^\.applyforge-backup-\d{8}T\d{6}Z\.tar\.age\.sealing$")
+
+
+def _retry_eagain(func, *args):
+    for attempt in range(SEAL_EAGAIN_RETRIES):
+        try:
+            return func(*args)
+        except BlockingIOError:
+            if attempt == SEAL_EAGAIN_RETRIES - 1:
+                raise
+            time.sleep(SEAL_EAGAIN_SLEEP)
+
+
+def cmd_seal(args):
+    """Runs on the BACKUP server. The export (--source) is written by the application server, which
+    can therefore also delete or overwrite what is there (root_squash maps it to the owner of those
+    files). This copies every finished archive into a root-only vault that is not exported, and
+    applies retention there. An archive that changes on the export after it was sealed is reported
+    as tampering; the sealed copy is never touched."""
+    require_posix()
+    require_root()
+    source, vault = os.path.abspath(args.source), os.path.abspath(args.vault)
+    if overlaps(source, vault):
+        raise Refused("--source and --vault must be separate directories (one is inside the other)")
+    if os.path.islink(source) or not os.path.isdir(source):
+        raise Refused(f"source {source} does not exist or is a symbolic link")
+    try:
+        check_private_dir(vault, "vault")
+    except FileNotFoundError:
+        raise Refused(f"vault {vault} does not exist") from None
+    if args.min_age_seconds < 0 or not 1 <= args.retention_days <= 3650 or not 1 <= args.min_keep <= 1000:
+        raise Refused("--min-age-seconds must be >= 0, --retention-days 1-3650, --min-keep 1-1000")
+
+    with exclusive_lock(args.lock_file):
+        now = time.time()
+        for entry in os.scandir(vault):   # temporary files of crashed runs
+            if SEALING_RE.match(entry.name) and entry.is_file(follow_symlinks=False):
+                if now - entry.stat(follow_symlinks=False).st_mtime > STALE_GRACE_SECONDS:
+                    os.unlink(entry.path)
+                    log(f"removed stale temporary file {entry.name}")
+        sealed, tampered, skipped, problems = [], [], 0, []
+        for entry in sorted(os.scandir(source), key=lambda e: e.name):
+            if not ARCHIVE_RE.match(entry.name):
+                continue
+            st = os.lstat(entry.path)
+            if not stat.S_ISREG(st.st_mode):
+                log(f"not sealing {entry.name}: not a regular file")
+                problems.append(entry.name)
+                continue
+            if now - st.st_mtime < args.min_age_seconds:
+                skipped += 1
+                continue
+            target = os.path.join(vault, entry.name)
+            if os.path.lexists(target):
+                try:
+                    changed = _retry_eagain(sha256_file, entry.path) != sha256_file(target)
+                except OSError as exc:
+                    log(f"could not compare {entry.name} with its sealed copy ({exc.strerror or exc})")
+                    problems.append(entry.name)
+                    continue
+                if changed:
+                    tampered.append(entry.name)
+                    log(f"WARNING: {entry.name} on the export differs from its sealed copy (sealed copy kept)")
+                continue
+            result = seal_one(entry.path, vault, entry.name)
+            if result:
+                sealed.append(entry.name)
+                log(f"sealed {entry.name} sha256={result[0]} size={result[1]}")
+            else:
+                problems.append(entry.name)
+        deleted = apply_retention(vault, args.retention_days, utcnow(), keep_name=None, min_keep=args.min_keep,
+                                  trusted={})
+        kept = sum(1 for e in os.scandir(vault) if ARCHIVE_RE.match(e.name))
+        log(f"seal: {len(sealed)} sealed, {skipped} not yet settled, {len(problems)} could not be sealed, "
+            f"{len(deleted)} removed by retention, {kept} in the vault")
+        if tampered:
+            raise Failed(f"{len(tampered)} archive(s) changed on the export after sealing ({', '.join(tampered[:5])}); "
+                         "the sealed copies are intact - investigate the application server")
+        if problems:
+            raise Failed(f"{len(problems)} archive-like file(s) could not be sealed ({', '.join(problems[:5])}); "
+                         "they stay unprotected until a later run succeeds - check the log above")
+    return EXIT_OK
+
+
+def seal_one(path, vault, name):
+    """Copy one archive into the vault: O_EXCL temporary file (0400), fsync, re-hash the source after
+    the copy, publish without replacing anything. Returns (sha256, size) or None when skipped."""
+    tmp = os.path.join(vault, f".{name}.sealing")
+    try:
+        with _retry_eagain(open_regular_nofollow, path) as src:
+            head = src.read(len(AGE_HEADER))
+            if head != AGE_HEADER:
+                log(f"not sealing {name}: no age header")
+                return None
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o400)
+            digest, size = hashlib.sha256(head), len(head)
+            try:
+                os.write(fd, head)
+                while True:
+                    chunk = src.read(CHUNK)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(fd, view):]
+                    digest.update(chunk)
+                    size += len(chunk)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except (OSError, Failed) as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        log(f"not sealing {name}: {exc}")
+        return None
+    if _retry_eagain(sha256_file, path) != (digest.hexdigest(), size):
+        os.unlink(tmp)
+        log(f"not sealing {name}: it changed while being copied (will retry next run)")
+        return None
+    try:
+        rename_noreplace(tmp, os.path.join(vault, name))
+    except FileExistsError:
+        os.unlink(tmp)
+        return None
+    fsync_directory(vault)
+    return digest.hexdigest(), size
+
+
 # --- Probe the backup destination (Milestone 8.4e) ------------------------------------------------
 
 PROBE_PREFIX = ".applyforge-probe-"
@@ -2311,6 +2449,15 @@ def build_parser():
     recover.add_argument("--discard-marker", action="store_true",
                          help="after investigating: remove the marker without starting or stopping anything")
     recover.set_defaults(func=cmd_recover_service)
+
+    seal = commands.add_parser("seal", help="BACKUP server: copy finished archives into a root-only vault")
+    seal.add_argument("--source", required=True, help="the exported directory the application server writes")
+    seal.add_argument("--vault", required=True, help="root-owned 0700 directory that is NOT exported")
+    seal.add_argument("--min-age-seconds", type=int, default=600, help="leave archives younger than this alone")
+    seal.add_argument("--retention-days", type=int, default=30)
+    seal.add_argument("--min-keep", type=int, default=7)
+    seal.add_argument("--lock-file", default=SEAL_LOCK_FILE)
+    seal.set_defaults(func=cmd_seal)
 
     probe = commands.add_parser("probe-destination",
                                 help="check that the mounted destination supports what create relies on")

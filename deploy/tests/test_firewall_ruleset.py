@@ -11,15 +11,17 @@ import subprocess
 import unittest
 
 RULESET = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "nftables", "applyforge.nft")
+BACKUP_RULESET = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "nftables",
+                              "applyforge-backup-server.nft")
 
 
-def rules():
-    with open(RULESET, encoding="utf-8") as fh:
+def rules(path=RULESET):
+    with open(path, encoding="utf-8") as fh:
         return [line.split("#", 1)[0].strip() for line in fh if line.split("#", 1)[0].strip()]
 
 
-def input_chain():
-    text = "\n".join(rules())
+def input_chain(path=RULESET):
+    text = "\n".join(rules(path))
     match = re.search(r"chain input \{(.*?)\n\}", text, re.S)
     if not match:
         raise AssertionError("no input chain")
@@ -61,13 +63,55 @@ class RulesetTextTests(unittest.TestCase):
         self.assertIn('counter comment "dropped inbound"', input_chain())
 
 
+class AppRulesetDnsTests(unittest.TestCase):
+    """Two-server rehearsal: the private resolver answers on the VPN interface only."""
+
+    def test_dns_only_on_the_vpn_interface(self):
+        chain = input_chain()
+        self.assertIn('iifname "wg0" udp dport 53 accept', chain)
+        self.assertIn('iifname "wg0" tcp dport 53 accept', chain)
+        for line in chain:
+            if "dport 53" in line:
+                self.assertTrue(line.startswith('iifname "wg0" '), line)
+
+
+class BackupServerRulesetTests(unittest.TestCase):
+    """deploy/nftables/applyforge-backup-server.nft (two-server rehearsal)."""
+
+    def chain(self):
+        return input_chain(BACKUP_RULESET)
+
+    def test_default_drop(self):
+        self.assertIn("type filter hook input priority filter; policy drop;", self.chain())
+        self.assertIn("type filter hook forward priority filter; policy drop;", rules(BACKUP_RULESET))
+
+    def test_nfs_only_on_the_backup_link_from_the_app_link_address(self):
+        nfs = [l for l in self.chain() if "2049" in l]
+        self.assertEqual(nfs, ['iifname "wg1" ip saddr $APP_LINK_ADDR tcp dport 2049 accept'])
+        self.assertIn("define APP_LINK_ADDR = 10.98.0.1", rules(BACKUP_RULESET))
+
+    def test_ssh_only_on_the_admin_interface(self):
+        self.assertEqual([l for l in self.chain() if "dport 22" in l], ['iifname "wg0" tcp dport 22 accept'])
+
+    def test_only_the_two_wireguard_ports_from_outside(self):
+        outside = [l for l in self.chain() if l.endswith("accept")
+                   and not l.startswith(('iifname "wg0"', 'iifname "wg1"', 'iifname "lo"'))
+                   and "ct state" not in l and not l.startswith(("icmp type", "icmpv6 type"))]
+        self.assertEqual(sorted(outside), sorted(["udp dport $WG_ADMIN_PORT accept",
+                                                  "ip saddr $APP_PUBLIC_V4 udp dport $WG_LINK_PORT accept"]))
+
+    def test_no_other_tcp_service(self):
+        self.assertEqual(len([l for l in self.chain() if "tcp dport" in l]), 2)
+
+
 @unittest.skipUnless(shutil.which("nft") and hasattr(os, "geteuid") and os.geteuid() == 0,
                      "nft -c needs root and the nft tool")
 class RulesetSyntaxTests(unittest.TestCase):
 
-    def test_nft_check_accepts_the_ruleset(self):
-        result = subprocess.run(["nft", "-c", "-f", RULESET], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_nft_check_accepts_the_rulesets(self):
+        for path in (RULESET, BACKUP_RULESET):
+            result = subprocess.run(["nft", "-c", "-f", path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

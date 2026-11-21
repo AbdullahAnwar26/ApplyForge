@@ -1,0 +1,11 @@
+# Runs applyforge-check@dns every 5min (app server). Healthchecks alerts when these pings stop.
+[Unit]
+Description=ApplyForge monitoring timer: dns
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=applyforge-check@dns.service
+
+[Install]
+WantedBy=timers.target

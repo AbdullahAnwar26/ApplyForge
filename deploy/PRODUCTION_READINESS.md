@@ -16,6 +16,20 @@ The first deployment can proceed once the blockers in section 8 are closed and t
 
 **Update after the 2026-11-20 dress rehearsal (Step 1.1).** The runbook was executed end to end, sections 2–13 in order, on a fresh disposable Ubuntu 26.04 instance with fictional data (section 3a). The deployment procedure, backup, offline verification, restore, upgrade and rollback all worked as written. The documented **switch-to-restored-data** procedure did not work at all; it has been rewritten and the new version rehearsed successfully. Smaller defects were fixed in `host_check.py` and the runbook. The verdict stands: the remaining blockers all need real infrastructure.
 
+**Update 2026-11-21 (later): the two-server architecture was rehearsed in disposable VMs (section 3c).** Private DNS, DNS-01 (with Let's Encrypt's test server), backup isolation with a sealed vault, monitoring (mock receiver) and application-server loss were all exercised. Six defects were found and fixed. Nothing is production-verified.
+
+**Earlier on 2026-11-21: the production architecture was planned.** `deploy/INFRASTRUCTURE_DECISIONS.md` holds the decision register:
+
+- Hetzner app and backup servers in different countries;
+- WireGuard device and backup links;
+- split DNS with Let's Encrypt DNS-01;
+- storage-side snapshots;
+- key custody;
+- Healthchecks.io monitoring;
+- emergency access.
+
+The proposed procedures are in runbook section 15. They are **proposals**: nothing in them is counted as verified until rehearsed (U12–U17). The verified procedures in sections 2–14 are unchanged.
+
 ## 2. Selected architecture
 
 | Layer | Decision | Why |
@@ -157,6 +171,102 @@ Timings are for a few KB of fictional data on local disks. Production timings mu
 
 **Not covered.** The real provider network, router and NAT, the public interface and the real VPN endpoint. The Hyper-V virtual switch (not available). IPv6 reachability beyond the rules. A real provider console. Clock synchronisation (the VMs had no NTP).
 
+## 3c. Two-server rehearsal: private DNS, DNS-01, sealed backups, monitoring, recovery (2026-11-21)
+
+> **Everything in this section ran in disposable VMs** with fictional zones, keys and data. Nothing was verified on real infrastructure, real DNS providers, Let's Encrypt, Healthchecks.io or Hetzner.
+
+**Environment.**
+
+- A new WSL instance, `af84h-2srv-112103471598`, running four QEMU/KVM VMs (Ubuntu 26.04, kernel 7.0) on a private, routeless bridge (`10.20.0.0/24`).
+- The VMs were controlled out of band through the guest agent; no Windows or shared-network change.
+
+| VM | Role |
+|---|---|
+| **app** 10.20.0.10 | ApplyForge (release `431902b`, runbook 2–8); `wg0` 10.99.0.1 (devices); `wg1` 10.98.0.1 (backup link); unbound on 10.99.0.1; lego + deploy hook; monitoring timers; NFS client |
+| **backup** 10.20.0.11 | admin `wg0` 10.97.0.1 (admin device only); `wg1` 10.98.0.2; NFSv4.2 export to 10.98.0.1 only (`sync`, `root_squash`); root-only vault; seal timer; heartbeat |
+| **client** 10.20.0.20 | admin device: tunnels to both servers, split DNS, the "offline machine" for verification |
+| **inet** 10.20.0.40 | the simulated internet: public DNS (BIND, fictional `af84h.test` + validation zone `af84h-acme.test`), Pebble ACME CA, mock Healthchecks receiver, attacker vantage point |
+
+**Results.** Final runs; the first runs' failures are explained under defects.
+
+| Area | Result |
+|---|---|
+| **U12 private DNS** | 30+ checks passed. |
+| | Public DNS has no address for the app hostname (NOERROR/NODATA), only the `_acme-challenge` CNAME. |
+| | The VPN resolver answers through `wg0` only; queries from the LAN and the routing trick are dropped. |
+| | Laptop split DNS: the app name resolves via the VPN; public names are unaffected when the tunnel or resolver is down. |
+| | Route-all clients (phones) lose all DNS while the resolver is down. Recovery by hosts entry, unbound restart or tunnel off works. |
+| | unbound restarts itself after a crash. Cached answers survive tunnel-down until their TTL expires. |
+| **DNS-01 (Pebble)** | Issuance through the CNAME into the validation zone, with the credential only in the environment. |
+| | Scope: TXT in the validation zone allowed; A records in the owned zone and non-TXT records in the validation zone refused. |
+| | The served certificate is trusted by the client without `-k`, and TXT records are cleaned up. |
+| | Forced renewal installs and serves the new serial. A broken nginx config makes the hook roll back (the old certificate keeps serving) and fail, which alerts. |
+| **U14 isolation** | 36 checks. The export is reachable only from 10.98.0.1 on `wg1`: dropped from the LAN, the admin tunnel and the internet; port 111 dropped. |
+| | The vault and `/srv` cannot be mounted. Root on the app is squashed and cannot chown. |
+| | With the **admin SSH key in hand**, the app server still cannot SSH to the backup server; of 20 likely ports, only 2049 is reachable on the link address. |
+| | **Compromise:** the app server *can* delete and overwrite archives on the export. The vault copies kept their recorded hashes, and the next seal run alerted (exit 1). |
+| **Backup server down** | The current unit **hung** (still running after 70 s; it would end only at 6 h, with no alert). With the new fast-fail pre-check it failed in **31 s**, ApplyForge stayed up, and the `/fail` ping was sent. |
+| | When the server returned, the `hard` mount resumed without a remount and the backup succeeded. |
+| **Reboots** | Backup server: NFS server after `wg1`; export served; backups resume. |
+| | App server: NFS mounted at boot after `wg1`; boot order nftables → `wg0`/`wg1` → unbound → mount → nginx → ApplyForge; DNS answers; backups work. |
+| **U16 monitoring** (mock receiver) | All 8 checks up. |
+| | Detected failure **and recovery** for: application stopped (health), resolver stopped (dns, while health stayed up), disk at 90 %, certificate inside its threshold. |
+| | Seal tamper → alert. Missed heartbeat with the backup server powered off; **all app checks went late with the app server powered off**, so monitoring is independent of it. Backup age → late alert. |
+| | 20+ simulated notifications. |
+| **Independent verification** | The admin device copied the hash record (via the app's `wg0`) and the newest sealed archive (via the backup's admin `wg0`). Verification passed with the primary **and** escrow identity. |
+| | A vault copy that had been altered *before* it was sealed was **refused** by the trusted hash from the offline record. |
+| **Restore drill** | The archive the "attacker" deleted from the export was recovered from the vault: restore 1.3 s; data and media identical. |
+| **App server lost** | VM killed and **disk deleted**, then rebuilt from the image with the server's WireGuard keys from the "password manager". |
+| | Devices and the backup link worked **without re-enrolment**; NFS mounted at boot. |
+| | Data restored from the backup server using the **offline** hash record (the index died with the server), then switched. Data and media identical; backups resumed. |
+| | The API token is new (users re-enter it); the SSH host key changed (admins re-pin it). |
+
+**Recovery time for application-server loss**, small fictional dataset, nested VMs, packages from the internet:
+
+| Phase | Time |
+|---|---|
+| Rebuild (image, packages, wheels, runbook 2–8) | 328 s |
+| First boot on the network | 25 s |
+| Configuration from the password manager | 21 s |
+| Certificate | failed first (clock skew); about 10 s after the clock was aligned |
+| Data restore | 1.4 s |
+| Switch + health | 74 s (inflated: the health check waited on the failed certificate) |
+| **Total** | **≈ 8 minutes**, plus human decision time and cloud provisioning |
+
+Real-data timings remain U11.
+
+**Defects found and fixed** (each with a regression test or a runbook change):
+
+1. **High – seal skipped freshly published archives silently.** The NFS server holds a client delegation (lease) right after publication, so the server-side open returned `EAGAIN`. The seal skipped the archive with exit 0, so it stayed unprotected and an attacker could alter it before the next run. In the first run, the vault really did seal an altered copy.
+
+   **Fixed:** retry for about 30 s, and fail (alert) on any archive-like file that cannot be sealed. Two tests added, plus mutant E6.
+2. **High – the backup unit hung for up to 6 h when the backup server was unreachable** (`hard` NFS mount), with no alert. **Fixed:** an `ExecStartPre` fast-fail check (`timeout -s KILL 30 stat -f`) in `deploy/systemd/applyforge-backup.service`.
+3. **High – Ubuntu 26.04's AppArmor `wg-quick` profile denies `resolve1.RevertLink`.** A client `PreDown = resolvectl revert` therefore failed, wg-quick aborted before deleting the interface, the tunnel could not be stopped, and the next start failed ("already exists"). **Fixed** in runbook 15.1: no `PreDown`. Verified on a clean boot.
+4. **Medium – `unbound-checkconf` fails on a fresh install** until `/var/lib/unbound/root.key` exists. **Fixed** in runbook 15.1 (`unbound-anchor` first).
+5. **Medium – `applyforge-acme renew` could not be forced:** `acme.env` overrode `ACME_RENEW_DAYS`. **Fixed** with `renew --days N`. Tested.
+6. **Medium – DNS-01 with TSIG fails at clock skew above 5 minutes** ("bad authentication"); the rebuilt VM was 1.8 h off. **Documented:** check NTP before issuing (runbook 15.8 step 3).
+7. **Low – rehearsal-fidelity items, not product defects:**
+   - an authoritative-only "internet" DNS cannot chase the validation CNAME; real validators recurse;
+   - unbound blocks the special-use `.test` TLD;
+   - Pebble forgets accounts on restart;
+   - commands run through the guest agent cannot make privileged D-Bus calls, so the harness used `systemd-run`;
+   - concurrent boots on a busy host stalled one VM once.
+
+**Single points of failure (assessment).**
+
+| Component | Failure effect | Mitigation now | Residual |
+|---|---|---|---|
+| App server (one instance) | service down | rebuild + restore (≈ 8 min tool time, rehearsed); monitoring alerts | the RTO depends on provisioning; there is no standby |
+| App server **public IP** | rebuild with a new IP breaks every client `Endpoint` and the backup server's firewall rule | **keep the Hetzner Primary IP when rebuilding** (it can be detached and reassigned) | unverified on Hetzner (D) |
+| Private resolver (on the app server) | app name unresolvable | split DNS on laptops; hosts-file fallback; `dns` check | phones lose DNS while the tunnel is up |
+| Server identity secrets (WireGuard keys) | lost → every device and the backup link must be re-enrolled | kept in the password manager (15.5) | the password manager itself |
+| Offline hash record + age identities | both identities lost → archives unrecoverable; record lost → restores need an untrusted hash | the escrow key on paper; monthly offline record (15.4) | owner discipline |
+| Backup server | no new backups (alerts); vault lost | Hetzner Backups of the backup server; monthly offline copy | up to 1 month of history if both are lost |
+| Provider account (both servers) | lockout or compromise affects everything | 2FA, recovery codes offline, monthly offline copy | provider-level incident |
+| Healthchecks.io | silence instead of alerts | none (external) | accepted; check the dashboard occasionally |
+| Clock (NTP) | DNS-01 and TLS failures | host check warns; runbook 15.8 | add an NTP check to monitoring (backlog) |
+| Admin devices | lockout | two enrolled devices; console (15.7) | — |
+
 ## 4. Verified requirements
 
 | # | Requirement | Evidence |
@@ -182,6 +292,9 @@ Timings are for a few KB of fictional data on local disks. Production timings mu
 | V19 | Key-only SSH administration through the VPN; password and root login refused; the valid key alone is not enough from the LAN | network rehearsal |
 | V20 | Reboot and cold-start persistence of the firewall, VPN, nginx (with the ordering fix) and ApplyForge | network rehearsal |
 | V21 | Safe firewall change: syntax check, automatic rollback timer, confirmation, serial-console and reset recovery | network rehearsal |
+| V22 | Backup isolation: the app server can only write to its export; it cannot administer the backup server or reach the vault; archives deleted or altered through it survive in the vault and trigger an alert | two-server rehearsal (3c), in VMs |
+| V23 | The backup unit fails fast (31 s) when the backup server is unreachable; the mount resumes on return; both servers survive reboots | two-server rehearsal, in VMs |
+| V24 | Application-server loss: rebuild with restored identity, restore from the backup server with the offline hash record, no device re-enrolment (≈ 8 min tool time) | two-server rehearsal, in VMs |
 
 ## 5. Unverified requirements (need the real host or real infrastructure)
 
@@ -198,6 +311,12 @@ Timings are for a few KB of fictional data on local disks. Production timings mu
 | U9 | Monitoring and alerting (unit failures, health, disk, certificate) | operator setup (runbook 13.2) |
 | U10 | Offline age key custody and the offline copy of the hash index | operator procedure (runbook 12.2, 12.4) |
 | U11 | Restore and switch time on real data volumes (the RTO). Rehearsed: about 11 s for a tiny fictional dataset, which says nothing about real volumes | restore drill on the production host |
+| U12 | **Rehearsed in VMs (3c), not production-verified:** split DNS. unbound on 10.99.0.1, answering only on `wg0`; the extra nftables rules for port 53 on `wg0`; WireGuard client `DNS =` on each real device type; behaviour with the tunnel up and the server down (runbook 15.1) | VM rehearsal, then each real device |
+| U13 | **Rehearsed with Pebble (3c); the real Let's Encrypt and your DNS provider are untested:** Let's Encrypt DNS-01 with CNAME delegation to a validation zone and a zone-scoped token; renewal timer; deploy hook (atomic install, `nginx -t`, reload, delayed verification) (15.2) | staging issuance, then production issuance (authorized) |
+| U14 | **Rehearsed in VMs (3c), not production-verified:** the backup server: `wg1` link, NFSv4.2 over WireGuard across regions, its own admin `wg0`, nfs-server ordered after `wg1`, its firewall, Hetzner Backups as storage-side history, capacity (37 × archive size × 1.3 + 2 GB) (15.3) | VM rehearsal of the two-server layout, then production (authorized) |
+| U15 | **Offline copy and both-identity verification rehearsed (3c); the quarterly routine is untested:** the monthly offline copy and verification from an admin device (15.4); the quarterly key-access test and the escrow restore (15.5) | first month of operation |
+| U16 | **Rehearsed against a mock receiver (3c); the real Healthchecks.io is untested:** Healthchecks.io checks and timers on both servers (`ExecStartPost=`/`OnFailure=` for backups); alert delivery (15.6) | VM rehearsal with a dummy endpoint, then a real account (authorized) |
+| U17 | **Partly rehearsed (WireGuard-down recovery steps, rebuild with restored keys); the provider console and 2FA are untested:** emergency access: the provider console and 2FA, the second admin device, WireGuard-down recovery including the time-boxed SSH exception (15.7) | console test on the real servers before the first firewall change |
 
 ## 6. Host and PostgreSQL requirements
 
@@ -246,12 +365,12 @@ Timings are for a few KB of fictional data on local disks. Production timings mu
 
 1. **B1 – No production host.** Provision Ubuntu 26.04 per runbook sections 2–3. Then run `host_check.py` until there are no `FAIL` lines.
 2. **B2 – Production network access controls.** Apply the rehearsed configuration (runbook section 14) on the real host: WireGuard, `deploy/nftables/applyforge.nft` with the rollback timer, the nginx drop-in, and private DNS. Verify the provider console and console password **before** the first firewall change. Then run an authorized scan from outside the VPN (U2, U3).
-3. **B3 – TLS.** Issue a certificate from the private CA, distribute the CA to clients, and monitor expiry (U4).
-4. **B4 – Backup storage.** Provision NFSv4.1+ with a `sync` export restricted to the server, and snapshots. Run `probe-destination`. Then do the first backup, offline verify and restore drill (U7, U8, U11). Also test the shutdown/reboot behaviour of the `hard` mount with the real NAS (the rehearsal saw a 60 s shutdown delay when the NFS server went away first).
+3. **B3 – TLS and DNS.** Planned, and rehearsed in VMs with Pebble (3c): a domain-owned hostname, split DNS (no public A record), Let's Encrypt DNS-01 with a zone-scoped token and automated renewal (U4, U12, U13). Alternative, already verified: a private CA.
+4. **B4 – Backup storage.** Planned, and rehearsed in VMs (3c): a separate backup server in another country, NFSv4.2 over a dedicated WireGuard link (`wg1`), `sync`/`hard`/`root_squash`, Hetzner Backups as storage-side history (U14). The final disk size waits for the first real archive. Run `probe-destination`. Then do the first backup, offline verify and restore drill (U7, U8, U11). Also test the shutdown/reboot behaviour of the `hard` mount with the real NAS (the rehearsal saw a 60 s shutdown delay when the NFS server went away first).
 5. **B5 – Key custody.** Generate the age key pair offline with a second (escrow) recipient. Store the private keys offline, and keep the offline hash record (U10).
 6. **B6 – Production PostgreSQL hardening and drill.** Create the roles and `pg_hba`, revoke PUBLIC, and run a restore drill on the host (U5).
 7. **B7 – First real maintenance window.** Run the first backup with ApplyForge running and review the journal (U6).
-8. **B8 – Monitoring and alerting** for runbook 13.2 (U9).
+8. **B8 – Monitoring and alerting.** Planned, and rehearsed against a mock receiver (3c): Healthchecks.io dead-man's-switch pings with email alerts, from both servers (U9, U16).
 9. **B9 – Source control.** The 8.4e work, the dress-rehearsal fixes (`222ccd3`) and the network-rehearsal fixes are committed locally. Pushing them needs separate authorization. **Use only the corrected 12.7 procedure** for any switch to restored data.
 
 ## 9. Authorizations needed

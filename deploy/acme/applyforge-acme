@@ -1,0 +1,38 @@
+#!/bin/bash
+# Obtain or renew the ApplyForge certificate with lego (ACME DNS-01). deploy/README.md section 15.2.
+#
+#   applyforge-acme issue     first issuance (then the deploy hook installs it for nginx)
+#   applyforge-acme renew     renew when it expires within ACME_RENEW_DAYS (default 30); run by the timer
+#
+# Settings and the DNS credential come from /etc/applyforge/acme/acme.env (root 0600). They are passed
+# to lego as environment variables only, never on a command line (no exposure in process listings):
+#   ACME_DOMAIN=applyforge.example.org   ACME_EMAIL=owner@example.org   ACME_DNS_PROVIDER=cloudflare|rfc2136|...
+#   ACME_SERVER=https://acme-v02.api.letsencrypt.org/directory   (staging first: ...acme-staging-v02...)
+#   ACME_DNS_RESOLVERS=1.1.1.1:53        ACME_RENEW_DAYS=30
+#   plus the provider's own variables for lego, e.g. CLOUDFLARE_DNS_API_TOKEN=... (scoped to the
+#   validation zone only) or RFC2136_NAMESERVER/RFC2136_TSIG_KEY/RFC2136_TSIG_SECRET/RFC2136_TSIG_ALGORITHM.
+set -u
+CONF=${APPLYFORGE_ACME_CONF:-/etc/applyforge/acme/acme.env}
+[ -r "$CONF" ] || { echo "applyforge-acme: $CONF is not readable" >&2; exit 2; }
+set -a; . "$CONF"; set +a
+for v in ACME_DOMAIN ACME_EMAIL ACME_DNS_PROVIDER; do
+  [ -n "${!v:-}" ] || { echo "applyforge-acme: $v is not set in $CONF" >&2; exit 2; }
+done
+ACME_SERVER=${ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+ACME_PATH=${ACME_PATH:-/etc/applyforge/acme/lego}
+HOOK=${ACME_DEPLOY_HOOK:-/usr/local/sbin/applyforge-cert-deploy}
+umask 077
+args=(--path "$ACME_PATH" --accept-tos --email "$ACME_EMAIL" --server "$ACME_SERVER" --dns "$ACME_DNS_PROVIDER" -d "$ACME_DOMAIN")
+[ -n "${ACME_DNS_RESOLVERS:-}" ] && args+=(--dns.resolvers "$ACME_DNS_RESOLVERS")
+days=${ACME_RENEW_DAYS:-30}
+if [ "${1:-}" = renew ] && [ "${2:-}" = "--days" ]; then
+  # Explicit override, e.g. to force renewal after a key exposure: applyforge-acme renew --days 100000.
+  # (A caller's ACME_RENEW_DAYS environment variable would be overridden by acme.env; the argument is not.)
+  [[ "${3:-}" =~ ^[0-9]{1,6}$ ]] || { echo "applyforge-acme: --days needs a whole number" >&2; exit 2; }
+  days=$3
+fi
+case "${1:-}" in
+  issue) exec lego "${args[@]}" run --run-hook "$HOOK" ;;
+  renew) exec lego "${args[@]}" renew --days "$days" --renew-hook "$HOOK" ;;
+  *) echo "usage: applyforge-acme issue | renew [--days N]" >&2; exit 2 ;;
+esac

@@ -1,0 +1,10 @@
+# Certificate renewal (Let's Encrypt DNS-01, deploy/README.md 15.2). Installed in /etc/systemd/system/.
+[Unit]
+Description=ApplyForge certificate renewal (ACME DNS-01)
+Wants=network-online.target
+After=network-online.target nginx.service
+OnFailure=applyforge-ping-fail@cert.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/applyforge-acme renew

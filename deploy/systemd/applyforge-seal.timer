@@ -1,0 +1,11 @@
+# Hourly; archives younger than 10 minutes are left for the next run (the app server may still publish).
+[Unit]
+Description=ApplyForge backup seal timer
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

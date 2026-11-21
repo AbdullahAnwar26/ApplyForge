@@ -1,0 +1,11 @@
+# Runs applyforge-check@disk every 1h (both servers). Healthchecks alerts when these pings stop.
+[Unit]
+Description=ApplyForge monitoring timer: disk
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Unit=applyforge-check@disk.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,51 @@
+#!/bin/bash
+# Run one monitoring check and report it with applyforge-ping (success, or fail with the reason in the journal).
+#
+#   applyforge-check health|dns|disk|cert|heartbeat
+#
+# Settings (non-secret) come from /etc/applyforge/monitoring.env:
+#   APP_HOST=applyforge.example.org   VPN_ADDR=10.99.0.1
+#   DISK_PATHS="/ /var/lib/postgresql"  DISK_MAX_PCT=80
+#   CERT_FILE=/etc/ssl/applyforge/applyforge.crt  CERT_MIN_DAYS=21
+#   CHECK_NAME_PREFIX=                (e.g. "backup-" on the backup server: disk -> backup-disk)
+# Installed as /usr/local/sbin/applyforge-check (deploy/README.md section 15.6).
+set -u
+ENV_FILE=${APPLYFORGE_MON_CONF:-/etc/applyforge/monitoring.env}
+PING=${APPLYFORGE_PING:-/usr/local/sbin/applyforge-ping}
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+APP_HOST=${APP_HOST:-}; VPN_ADDR=${VPN_ADDR:-10.99.0.1}
+DISK_PATHS=${DISK_PATHS:-/}; DISK_MAX_PCT=${DISK_MAX_PCT:-80}
+CERT_FILE=${CERT_FILE:-/etc/ssl/applyforge/applyforge.crt}; CERT_MIN_DAYS=${CERT_MIN_DAYS:-21}
+PREFIX=${CHECK_NAME_PREFIX:-}
+
+what=${1:-}
+reason=""
+case "$what" in
+  health)
+    body=$(curl -fsS --max-time 10 --resolve "$APP_HOST:443:$VPN_ADDR" "https://$APP_HOST/api/v1/health/" 2>&1)
+    grep -q '"status": *"ok"' <<<"$body" || reason="health endpoint: ${body:0:200}" ;;
+  dns)
+    got=$(dig +short +time=2 +tries=1 @"$VPN_ADDR" "$APP_HOST" A 2>&1)
+    [ "$got" = "$VPN_ADDR" ] || reason="private resolver answered '${got:0:100}' for $APP_HOST" ;;
+  disk)
+    for p in $DISK_PATHS; do
+      pct=$(df --output=pcent "$p" 2>/dev/null | tail -n 1 | tr -dc '0-9')
+      if [ -z "$pct" ]; then reason="${reason}$p: unavailable; "
+      elif [ "$pct" -ge "$DISK_MAX_PCT" ]; then reason="${reason}$p: ${pct}% used (limit ${DISK_MAX_PCT}%); "; fi
+    done ;;
+  cert)
+    if [ ! -r "$CERT_FILE" ]; then reason="$CERT_FILE is not readable"
+    elif ! openssl x509 -checkend $(( CERT_MIN_DAYS * 86400 )) -noout -in "$CERT_FILE" >/dev/null 2>&1; then
+      reason="certificate expires within $CERT_MIN_DAYS days ($(openssl x509 -enddate -noout -in "$CERT_FILE" 2>&1))"
+    fi ;;
+  heartbeat) ;;
+  *) echo "usage: applyforge-check health|dns|disk|cert|heartbeat" >&2; exit 2 ;;
+esac
+
+name="$what"; [ "$what" = disk ] && name="${PREFIX}disk"
+if [ -z "$reason" ]; then
+  "$PING" "$name" success; exit $?
+fi
+echo "applyforge-check $what: FAILED: $reason" >&2
+"$PING" "$name" fail
+exit 1

@@ -1,0 +1,11 @@
+# Runs applyforge-check@health every 5min (app server). Healthchecks alerts when these pings stop.
+[Unit]
+Description=ApplyForge monitoring timer: health
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=applyforge-check@health.service
+
+[Install]
+WantedBy=timers.target

@@ -7,7 +7,7 @@
 # Change it only with the rollback procedure in deploy/README.md (an automatic revert timer).
 #
 # Reachable from outside the VPN: nothing except the WireGuard UDP port.
-# Reachable through the VPN (interface wg0 only): SSH 22, HTTP 80 (redirect), HTTPS 443.
+# Reachable through the VPN (interface wg0 only): SSH 22, HTTP 80 (redirect), HTTPS 443, DNS 53 (private resolver).
 # The server makes outbound connections freely (updates, NTP, DNS, the backup NFS share).
 # If the backup share is on the LAN, NFS needs no inbound rule (the server is the client).
 
@@ -32,6 +32,9 @@ table inet applyforge {
 
         # Administration and the application: VPN only.
         iifname "wg0" tcp dport { 22, 80, 443 } accept
+        # Private DNS for VPN clients (unbound on 10.99.0.1, runbook 15.1): VPN only.
+        iifname "wg0" udp dport 53 accept
+        iifname "wg0" tcp dport 53 accept
         iifname "wg0" icmp type echo-request limit rate 5/second accept
         iifname "wg0" icmpv6 type echo-request limit rate 5/second accept
 

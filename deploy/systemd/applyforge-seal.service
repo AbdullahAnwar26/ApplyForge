@@ -1,0 +1,16 @@
+# BACKUP SERVER: copy finished archives from the export into the root-only vault (deploy/README.md 15.3).
+[Unit]
+Description=ApplyForge backup seal (export -> vault)
+OnFailure=applyforge-ping-fail@seal.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/local/sbin/applyforge-backup seal --source /srv/applyforge-backups --vault /srv/applyforge-vault
+ExecStartPost=-/usr/local/sbin/applyforge-ping seal success
+ProtectSystem=strict
+ReadWritePaths=/srv/applyforge-vault /run/lock
+ReadOnlyPaths=/srv/applyforge-backups
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes

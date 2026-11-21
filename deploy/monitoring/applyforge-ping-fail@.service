@@ -1,0 +1,7 @@
+# Sends the /fail ping for check %i; used as OnFailure= of the backup, seal and renewal units.
+[Unit]
+Description=ApplyForge failure notification: %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/applyforge-ping %i fail

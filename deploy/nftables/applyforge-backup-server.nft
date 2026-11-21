@@ -1,0 +1,46 @@
+#!/usr/sbin/nft -f
+# ApplyForge BACKUP server firewall: default-deny inbound (runbook 15.3). Rehearsed in the two-server VM
+# rehearsal (2026-11-21); not yet used on real infrastructure.
+# Install as /etc/nftables.conf on the backup server; change it only with the rollback procedure (14.3).
+#
+# Reachable from outside: the admin WireGuard port (admin devices) and the backup-link WireGuard port,
+# the latter only from the application server's public address(es).
+# Through the admin tunnel (wg0): SSH. Through the backup link (wg1): NFS from the app server's link
+# address only. The app server can therefore write backups but can neither log in nor reach anything else.
+
+define WG_ADMIN_PORT = 51820
+define WG_LINK_PORT  = 51821
+define APP_PUBLIC_V4 = { 10.20.0.10 }    # the application server's public IPv4 address(es): EDIT for production
+define APP_LINK_ADDR = 10.98.0.1         # the application server's address on the backup link (wg1)
+
+flush ruleset
+
+table inet applyforge_backup {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state invalid drop
+        ct state { established, related } accept
+        iifname "lo" accept
+
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, packet-too-big } accept
+        icmp type { destination-unreachable, time-exceeded } accept
+
+        udp dport $WG_ADMIN_PORT accept
+        ip saddr $APP_PUBLIC_V4 udp dport $WG_LINK_PORT accept
+
+        iifname "wg0" tcp dport 22 accept
+        iifname "wg0" icmp type echo-request limit rate 5/second accept
+        iifname "wg1" ip saddr $APP_LINK_ADDR tcp dport 2049 accept
+
+        counter comment "dropped inbound"
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

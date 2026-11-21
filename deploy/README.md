@@ -55,8 +55,14 @@ Files in this directory:
 | `host_check.py` | used in place from the release | read-only host readiness check (section 13.1) |
 | `systemd/nginx-applyforge-vpn.conf` | `/etc/systemd/system/nginx.service.d/applyforge-vpn.conf` | starts nginx after the VPN interface it listens on (section 14) |
 | `nftables/applyforge.nft` | `/etc/nftables.conf` | default-deny inbound firewall: WireGuard from outside, SSH/HTTP/HTTPS only through the VPN (section 14) |
-| `tests/` | not installed | `test_host_check.py`; `test_firewall_ruleset.py`; `stack_test.sh`, the nginx + Gunicorn end-to-end test (section 13.1) |
+| `tests/` | not installed | `test_host_check.py`; `test_firewall_ruleset.py`; `test_monitoring_acme.py`; `stack_test.sh`, the nginx + Gunicorn end-to-end test (section 13.1) |
 | `PRODUCTION_READINESS.md` | not installed | readiness assessment, verified/unverified requirements, blockers and go/no-go checklist |
+| `INFRASTRUCTURE_DECISIONS.md` | not installed | planned production infrastructure: decision register, region and cost estimates, owner inputs, authorizations (section 15) |
+| `nftables/applyforge-backup-server.nft` | backup server `/etc/nftables.conf` | backup server firewall (section 15.3) |
+| `unbound/applyforge.conf` | `/etc/unbound/unbound.conf.d/applyforge.conf` | private resolver for VPN clients (section 15.1) |
+| `acme/` | `/usr/local/sbin/`, `/etc/systemd/system/` | DNS-01 issuance/renewal wrapper, deploy hook, renewal timer (section 15.2) |
+| `monitoring/` | `/usr/local/sbin/`, `/etc/systemd/system/` | Healthchecks pings and checks, timers (section 15.6) |
+| `systemd/applyforge-seal.{service,timer}` | backup server `/etc/systemd/system/` | seal archives into the root-only vault (section 15.3) |
 
 ### Why one Gunicorn worker
 
@@ -86,8 +92,10 @@ These are prepared outside this milestone. This runbook does not install or conf
 - **Readiness check.** After provisioning, and before every deployment, run the read-only host check: `sudo python3 -I "$REL/deploy/host_check.py" --release "$REL"` (section 13.1).
 - **PostgreSQL 14 or later** on the same host, listening on `localhost` only, on the **default port 5432**. The Milestone 8.4b rehearsal used PostgreSQL 18.6. The backup tool runs `pg_dump`, `createdb`, `psql` and `pg_restore` with a scrubbed environment (no `PG*` variables) through the default Unix socket, so it reaches only a cluster on port 5432.
 - **A working VPN.** The server needs a fixed VPN address (example: `10.99.0.1`), and clients need a known subnet (example: `10.99.0.0/24`). The host firewall must not expose ports 80 or 443 on any public interface. nginx binds to the VPN address only, but the firewall is the primary control. Section 14 has the rehearsed WireGuard setup, the default-deny ruleset (`deploy/nftables/applyforge.nft`) and the safe procedure for changing it.
-- **Name resolution.** A private host name (example: `applyforge.vpn.example`) must resolve to the VPN address for VPN clients, through internal DNS or a hosts file.
-- **TLS certificate.** You need a certificate and key for that host name, typically from a private CA that the client devices trust. Install them as `/etc/ssl/applyforge/applyforge.crt` (`0644`) and `/etc/ssl/applyforge/applyforge.key` (`0600`, `root`).
+- **Name resolution.** A private host name (example: `applyforge.vpn.example`) must resolve to the VPN address for VPN clients, through internal DNS or a hosts file. **Never publish the VPN address in public DNS.** The planned production setup (section 15.1; rehearsed in VMs, not yet on real infrastructure) uses a resolver on the server's VPN address.
+- **TLS certificate.** You need a certificate and key for that host name, installed as `/etc/ssl/applyforge/applyforge.crt` (`0644`) and `/etc/ssl/applyforge/applyforge.key` (`0600`, `root`). Two ways to get them:
+  - **Planned for production (rehearsed in VMs with Let's Encrypt's test server; not yet against the real service): a publicly trusted Let's Encrypt certificate via DNS-01** for a hostname under a domain you own, renewed and deployed automatically (section 15.2). No CA has to be installed on devices.
+  - **Alternative (verified in the rehearsals): a private CA** that the client devices trust. Use it when no domain is available.
   - **The private CA must issue RFC 5280-conformant certificates.** The CA certificate needs `basicConstraints = critical, CA:TRUE` and `keyUsage = critical, keyCertSign, cRLSign`. The server certificate needs `subjectAltName = DNS:<host name>`, `extendedKeyUsage = serverAuth`, and subject/authority key identifiers. Strict clients reject a CA without `keyUsage`, even though curl and browsers may accept it: in the 8.4e rehearsal, Python 3.13+ failed with "CA cert does not include key usage extension". Check with `openssl verify -x509_strict -CAfile ca.crt applyforge.crt`.
 - **Admin workstation.** Git, Node.js LTS (to build the frontend) and `scp`/`ssh` access to the server over the VPN.
 
@@ -1098,3 +1106,267 @@ Both paths were rehearsed (F2 and F4). Before go-live, confirm that the provider
 - **nginx after the VPN.** nginx listens on `10.99.0.1`, which exists only once `wg-quick@wg0` has run. Without the drop-in from section 6 (`deploy/systemd/nginx-applyforge-vpn.conf`), nginx can start first, fail with `bind() to 10.99.0.1:443 failed (99: Cannot assign requested address)` and **stay down** until restarted by hand. The rehearsal reproduced this; the host check now fails when the ordering is missing.
 - **DNS configuration.** On Ubuntu 26.04, netplan runs `systemd-networkd-wait-online --dns`. If the server's network configuration has **no DNS server**, boot waits the full 120 s timeout before `network-online.target`, and with it the VPN, nginx and ApplyForge. Make sure netplan (or DHCP) provides a resolver.
 - **Restarting nginx while `wg0` is down** fails for the same reason as at boot. Bring the VPN up first: `sudo systemctl start wg-quick@wg0`.
+
+---
+
+## 15. Production architecture: two servers, private DNS, ACME, sealed backups, monitoring
+
+> **Status: rehearsed in disposable VMs, NOT verified on production infrastructure.** Every procedure in this section ran in the two-server rehearsal of 2026-11-21 (`deploy/PRODUCTION_READINESS.md` section 3c). That rehearsal used QEMU/KVM VMs on an isolated network, a fictional domain, Let's Encrypt's test server (Pebble) and a mock Healthchecks receiver. Real DNS providers, Let's Encrypt, Healthchecks.io, Hetzner and real devices remain unverified (`deploy/INFRASTRUCTURE_DECISIONS.md`, register D).
+
+Layout:
+
+```
+ Internet ──UDP 51820──▶ APP SERVER                                 BACKUP SERVER (other country)
+                          wg0 10.99.0.1/24  (devices: SSH, HTTPS, DNS)  wg0 10.97.0.1/24 (admin devices only: SSH)
+                          wg1 10.98.0.1  ═══ UDP 51821 (app's IP only) ═══▶ wg1 10.98.0.2 (NFS 2049 from 10.98.0.1 only)
+                          nginx, Gunicorn, PostgreSQL, unbound          /srv/applyforge-backups  (export: drop box)
+                          NFS client: /mnt/applyforge-backups (hard)    /srv/applyforge-vault    (root-only, NOT exported)
+```
+
+Repository files used here:
+
+| Path | Purpose |
+|---|---|
+| `deploy/nftables/applyforge.nft` | app server ruleset (now including DNS on `wg0`) |
+| `deploy/nftables/applyforge-backup-server.nft` | backup server ruleset |
+| `deploy/unbound/applyforge.conf` | private resolver configuration |
+| `deploy/systemd/unbound-applyforge-vpn.conf`, `nfs-server-applyforge-vpn.conf` | start-order drop-ins |
+| `deploy/acme/` | ACME wrapper, deploy hook, renewal units |
+| `deploy/monitoring/` | ping and check scripts, units |
+| `deploy/systemd/applyforge-seal.{service,timer}` | backup server seal |
+
+### 15.1 Private DNS for VPN clients
+
+The app hostname, for example `applyforge.<domain>`, **has no public A/AAAA record**; only the ACME challenge CNAME is public (15.2). VPN clients resolve the name through unbound on the app server.
+
+```bash
+sudo apt install unbound unbound-anchor
+# Fresh Ubuntu 26.04: the packaged DNSSEC config needs root.key BEFORE unbound-checkconf works (rehearsal finding).
+sudo unbound-anchor -a /var/lib/unbound/root.key; sudo chown unbound: /var/lib/unbound/root.key
+sudo install -m 0644 "$REL/deploy/unbound/applyforge.conf" /etc/unbound/unbound.conf.d/applyforge.conf
+sudoedit /etc/unbound/unbound.conf.d/applyforge.conf          # replace <applyforge.example.org>
+sudo install -d /etc/systemd/system/unbound.service.d
+sudo install -m 0644 "$REL/deploy/systemd/unbound-applyforge-vpn.conf" /etc/systemd/system/unbound.service.d/applyforge-vpn.conf
+sudo unbound-checkconf && sudo systemctl daemon-reload && sudo systemctl enable --now unbound
+dig +short @10.99.0.1 applyforge.<domain>                     # from a VPN client: 10.99.0.1
+```
+
+- **Firewall.** `deploy/nftables/applyforge.nft` already accepts DNS (53/udp and 53/tcp) on `wg0` only. Apply changes with the rollback procedure (14.3).
+- **Laptops: split DNS.** Only the app name goes to the VPN resolver, so public DNS keeps working when the server is down. Add to the device's `wg0.conf`:
+
+  ```
+  PostUp = resolvectl dns %i 10.99.0.1; resolvectl domain %i ~applyforge.<domain>
+  ```
+
+  **Do not add `PreDown = resolvectl revert %i`.** On Ubuntu 26.04 the AppArmor `wg-quick` profile denies the `RevertLink` D-Bus call, so the `PreDown` fails and wg-quick aborts **before removing the interface**. The tunnel then cannot be brought down, and the next start fails with "wg0 already exists". This was reproduced in the rehearsal. Without `PreDown`, systemd-resolved drops the link's DNS settings when wg-quick deletes the interface.
+- **Phones: route-all.** Use the WireGuard app's `DNS = 10.99.0.1`. While the tunnel is up, all DNS goes through the server: if the server or unbound is down, the phone has no DNS until the tunnel is switched off.
+- **Caching.** Devices cache the answer for the record's TTL. The template sets 300 s; unbound's default would be 3600 s. After the tunnel goes down, the name keeps resolving (to an unreachable address) until the cache expires.
+- **Recovery, from least to most invasive:**
+  1. `sudo systemctl restart unbound` on the server. unbound also restarts itself after a crash (rehearsed).
+  2. On an admin laptop, add a hosts entry `10.99.0.1 applyforge.<domain>`. HTTPS works without the resolver; remove the entry afterwards.
+  3. Switch the tunnel off to get normal DNS back.
+
+  The `dns` monitoring check (15.6) alerts on resolver failure independently of the application health check.
+
+### 15.2 TLS: Let's Encrypt via DNS-01 (CNAME delegation, scoped credential)
+
+**Public DNS, done once by the owner:**
+
+- `_acme-challenge.applyforge.<domain>  CNAME  applyforge.<validation-zone>.`
+- The validation zone is a separate zone (or a separate DNS account) holding nothing but ACME TXT records.
+- Create an API credential **limited to TXT records in the validation zone**. In the rehearsal, a TSIG key with `update-policy { grant <key> zonesub TXT; }` could add TXT records there, and was refused for an A record in the owned zone and for non-TXT records in the validation zone.
+
+```bash
+sudo apt install lego
+sudo install -m 0755 "$REL/deploy/acme/applyforge-acme" "$REL/deploy/acme/applyforge-cert-deploy" /usr/local/sbin/
+sudo install -d -m 0700 /etc/applyforge/acme
+sudo install -m 0600 "$REL/deploy/acme/acme.env.example" /etc/applyforge/acme/acme.env
+sudoedit /etc/applyforge/acme/acme.env              # domain, e-mail, provider + its scoped credential; STAGING server first
+sudo install -m 0644 "$REL/deploy/monitoring/monitoring.env.example" /etc/applyforge/monitoring.env   # APP_HOST, VPN_ADDR
+sudo applyforge-acme issue                           # issues, then the deploy hook installs it for nginx
+# after a successful staging run: set ACME_SERVER to the production URL in acme.env, remove the staging account
+# directory (/etc/applyforge/acme/lego/accounts/acme-staging-*), run issue again
+sudo install -m 0644 "$REL/deploy/acme/applyforge-acme-renew.service" "$REL/deploy/acme/applyforge-acme-renew.timer" /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now applyforge-acme-renew.timer
+```
+
+- **Credential handling.** It is passed to lego only through the environment, never on a command line (tested).
+- **The deploy hook (`applyforge-cert-deploy`):**
+  1. checks that the certificate and key match, that the certificate covers the host and that it is currently valid;
+  2. installs the files atomically;
+  3. **rolls back** if `nginx -t` fails;
+  4. reloads nginx, waits, and checks the served serial on a **new** connection.
+
+  Any failure exits non-zero, and the unit's `OnFailure=` alerts. Rehearsed:
+  - issuance through the CNAME;
+  - a forced renewal (the new serial was served);
+  - a renewal with a broken nginx config (rolled back; the old certificate kept serving).
+- **Forcing a renewal** (for example after a key exposure): `sudo applyforge-acme renew --days 100000`. Setting `ACME_RENEW_DAYS` in the environment does **not** work, because `acme.env` overrides it (rehearsal finding).
+- **Private CA alternative:** section 2. It is verified in the earlier rehearsals and needs CA installation on every device.
+
+### 15.3 Backup server, backup link and sealed archives
+
+**Backup server** (smallest amd64 plan, Ubuntu 26.04, Hetzner Backups enabled):
+
+```bash
+sudo apt install nfs-kernel-server wireguard-tools nftables age
+# wg0.conf: Address 10.97.0.1/24, ListenPort 51820, [Peer] per admin device (AllowedIPs 10.97.0.N/32)
+# wg1.conf: Address 10.98.0.2/30, ListenPort 51821, [Peer] app server link key (AllowedIPs 10.98.0.1/32)
+sudo systemctl enable --now wg-quick@wg0 wg-quick@wg1
+sudo install -d -m 0700 -o nobody -g nogroup /srv/applyforge-backups      # export = drop box (root_squash -> nobody)
+sudo install -d -m 0700 -o root -g root /srv/applyforge-vault             # vault: root only, NEVER exported
+echo "/srv/applyforge-backups 10.98.0.1(rw,sync,root_squash,no_subtree_check,sec=sys)" | sudo tee /etc/exports.d/applyforge.exports
+printf '[nfsd]\nvers3=n\n' | sudo tee /etc/nfs.conf.d/applyforge.conf      # NFSv4 only
+sudo install -d /etc/systemd/system/nfs-server.service.d
+sudo install -m 0644 "$REL/deploy/systemd/nfs-server-applyforge-vpn.conf" /etc/systemd/system/nfs-server.service.d/applyforge-vpn.conf
+sudo systemctl daemon-reload && sudo systemctl restart nfs-server && sudo exportfs -ra
+sudo nft -c -f "$REL/deploy/nftables/applyforge-backup-server.nft"         # edit APP_PUBLIC_V4 first; apply with 14.3
+sudo install -m 0755 "$REL/deploy/backup/afbackup.py" /usr/local/sbin/applyforge-backup
+sudo install -m 0644 "$REL/deploy/systemd/applyforge-seal.service" "$REL/deploy/systemd/applyforge-seal.timer" /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now applyforge-seal.timer
+```
+
+**App server (NFS client):**
+
+- `wg1.conf`: `Address 10.98.0.1/30`, `[Peer]` backup link key, `Endpoint <backup public IP>:51821`, `AllowedIPs 10.98.0.2/32`, `PersistentKeepalive 25`.
+- fstab:
+
+  ```
+  10.98.0.2:/srv/applyforge-backups /mnt/applyforge-backups nfs4 vers=4.2,hard,proto=tcp,_netdev,x-systemd.requires=wg-quick@wg1.service 0 0
+  ```
+
+- Then the marker file and `probe-destination` (12.3).
+
+**Why the vault.** With `root_squash`, the app server's root writes the archives as `nobody`, so a compromised app server **can delete or overwrite archives on the export**; the rehearsal confirmed this. `applyforge-backup seal`, running hourly on the backup server:
+
+- copies every finished archive (at least 10 minutes old) into the vault (`0400`, root-only, not exported) and re-hashes the source after copying;
+- applies retention there (30 days, 7 newest always kept);
+- **exits 1 (alert) if an archive on the export changed after it was sealed**, or if an archive-like file cannot be sealed (a planted symlink, no age header, persistent lock contention).
+
+What the rehearsal showed:
+- An archive deleted or altered through the app server stayed intact in the vault.
+- The app server could not mount the vault or `/srv`.
+- It could not SSH to the backup server, even holding the admin key.
+- Of the 20 likely service ports probed, it could reach only port 2049 on the link address.
+
+**NFS delegations.** Just after publication, the NFS server may hold a client delegation on the archive. A local open then fails with `EAGAIN` until the lease is recalled. The seal retries for about 30 s. The first version skipped silently with exit 0 and left the archive unprotected; a regression test now guards this.
+
+**Clearing a seal alert** (`seal` check down, "differs from its sealed copy"):
+1. Treat it as a possible compromise of the app server (13.4).
+2. Compare the export copy and the vault copy against the trusted hash in the offline record (15.4). The vault copy is the one to keep.
+3. On the backup server, replace the export copy with the vault copy:
+
+   ```
+   sudo install -o nobody -g nogroup -m 0600 /srv/applyforge-vault/<name> /srv/applyforge-backups/<name>
+   ```
+
+4. The next seal run passes, and the check returns to up.
+
+**Backup server unreachable.** Any access to a `hard` mount blocks until the server returns. The backup unit therefore has a fast-fail pre-check: `ExecStartPre=/usr/bin/timeout -s KILL 30 /usr/bin/stat -f /mnt/applyforge-backups`.
+- Rehearsed: the unit failed after 31 s, ApplyForge stayed up, and the failure alert fired.
+- Without the pre-check, the unit hung until `TimeoutStartSec` (6 h) with no alert.
+- When the server returns, the mount resumes by itself; no remount is needed.
+
+**Restoring from the vault** (the export copy is missing or damaged): on the backup server, run `sudo install -o nobody -g nogroup -m 0600 /srv/applyforge-vault/<name> /srv/applyforge-backups/<name>`, then restore on the app server as in 12.6, with the hash from the offline record.
+
+### 15.4 Monthly offline copy and independent verification
+
+From an admin device; each server is reached through its own tunnel:
+
+```bash
+D=~/applyforge-offline/$(date +%Y-%m); mkdir -p "$D" && chmod 700 "$D"
+ssh admin@10.99.0.1 'sudo cat /var/lib/applyforge-backup/index.tsv' > "$D/index.tsv"            # the trusted hash record
+NEWEST=$(ssh admin@10.97.0.1 'sudo ls /srv/applyforge-vault' | grep '^applyforge-backup-' | sort | tail -n 1)
+ssh admin@10.97.0.1 "sudo cat /srv/applyforge-vault/$NEWEST" > "$D/$NEWEST"                      # the sealed copy
+HASH=$(awk -F'\t' -v n="$NEWEST" '$2==n && $7=="recorded"{h=$3} END{print h}' "$D/index.tsv")
+applyforge-backup verify --archive "$D/$NEWEST" --identity <identity file> --expected-sha256 "$HASH" \
+     --work-dir "$D" --lock-file "$D/verify.lock"
+```
+
+- Rehearsed with both the primary and the escrow identity.
+- A vault copy that had been altered before sealing was **refused** by the trusted hash. The seal cannot know the trusted hash, so the offline record is what catches this case.
+- Run it on Linux/macOS, or in WSL on Windows. Keep the last three months.
+
+### 15.5 Key custody, access test and recovery
+
+- **Generate both age identities offline, on your own computer:** the primary (A) and the escrow (B). Put **only** the two public recipients on the server (12.2).
+  - A goes into the password manager, as a secure note.
+  - B is printed on paper (one 74-character line) and stored in a separate physical location.
+  - Delete the files.
+- **Quarterly access test:** open each identity in a temporary file on an offline device, run `age-keygen -y <file>`, compare the output with a line of `/etc/applyforge/backup-recipients.txt`, then delete the file. Better still, run 15.4 with each identity in turn; both were rehearsed.
+- **Yearly:** a restore drill with identity B (12.6).
+- **Primary key lost:** use B → create a new pair → replace the recipients → take and verify a new backup → print a new escrow.
+- **Exposure:** section 13.4.
+- **Server identity, also kept in the password manager** (none of it is in the backups):
+  - the app server's `wg0` and `wg1` private keys and the backup server's `wg0`/`wg1` keys. With them, a rebuilt server is reachable by existing devices without re-enrolment (rehearsed, 15.8);
+  - `/etc/applyforge/acme/acme.env` (the scoped DNS credential);
+  - `/etc/applyforge/healthchecks.env`;
+  - optionally the SSH host keys. Without them, admins must re-pin the host key after a rebuild (rehearsed: "REMOTE HOST IDENTIFICATION HAS CHANGED").
+
+  `SECRET_KEY`, `API_TOKEN` and the database password are regenerated on a rebuild; users re-enter the new API token.
+
+### 15.6 Monitoring (Healthchecks.io dead-man's switch)
+
+```bash
+sudo install -m 0755 "$REL/deploy/monitoring/applyforge-ping" "$REL/deploy/monitoring/applyforge-check" /usr/local/sbin/
+sudo install -m 0600 "$REL/deploy/monitoring/healthchecks.env.example" /etc/applyforge/healthchecks.env   # then sudoedit: real ping URLs
+sudo install -m 0644 "$REL/deploy/monitoring/monitoring.env.example" /etc/applyforge/monitoring.env      # then sudoedit
+sudo install -m 0644 "$REL"/deploy/monitoring/applyforge-check@.service "$REL"/deploy/monitoring/applyforge-ping-fail@.service \
+     "$REL"/deploy/monitoring/applyforge-check-{health,dns,disk,cert}.timer /etc/systemd/system/   # backup server: -heartbeat, -disk
+sudo install -d /etc/systemd/system/applyforge-backup.service.d
+sudo install -m 0644 "$REL/deploy/monitoring/applyforge-backup-monitoring.conf" /etc/systemd/system/applyforge-backup.service.d/monitoring.conf
+sudo systemctl daemon-reload && sudo systemctl enable --now applyforge-check-{health,dns,disk,cert}.timer
+```
+
+| Check | Server | Period / grace (Healthchecks) | Fires when |
+|---|---|---|---|
+| `health` | app | 5 min / 10 min | the health endpoint fails, or the server/timer is dead |
+| `dns` | app | 5 min / 10 min | the private resolver fails |
+| `disk` | app | 1 h / 2 h | a watched filesystem is at 80 % or more |
+| `cert` | app | 1 d / 1 d | the certificate expires within 21 days (renewal also alerts via `OnFailure`) |
+| `backup` | app | 1 d / 3 h | a backup fails (`OnFailure`), or no successful backup within 27 h |
+| `heartbeat`, `backup-disk` | backup | 15 min / 30 min, 1 h / 2 h | the backup server is down or its disk is filling |
+| `seal` | backup | 1 h / 2 h | tampering, an unsealable archive, or seal not running |
+
+Rehearsed against a mock receiver:
+- every check up;
+- application, resolver, disk and certificate failures, each followed by recovery ("up" notifications);
+- seal tampering;
+- **missed heartbeats with a whole server powered off**, which shows monitoring is independent of the monitored server;
+- backup age.
+
+No real account was created.
+
+### 15.7 Emergency access
+
+1. **Provider account:** 2FA (TOTP; add a security key or passkey if offered). Recovery codes printed and stored with the escrow key.
+2. **Console:** before the first firewall change, open the provider console on **both** servers and log in with the console password.
+3. **Second admin device:** enrolled on both `wg0` interfaces with its own keys, kept for emergencies.
+4. **Firewall mistake:** rollback timer (14.3), then console (14.4).
+5. **WireGuard unavailable:**
+   1. Console → `systemctl status wg-quick@wg0`, `journalctl -u wg-quick@wg0 -b`, `wg show`, `nft list ruleset | grep 51820`.
+   2. **"wg0 already exists"** (an interface left behind, e.g. by a failed `PreDown` on a client) → `sudo ip link delete wg0 && sudo systemctl reset-failed wg-quick@wg0 && sudo systemctl start wg-quick@wg0`.
+   3. Broken config → restore `/etc/wireguard/wg0.conf.bak`. Make that copy before every change.
+   4. Check the provider firewall still allows UDP 51820/51821 to the right IPs.
+   5. **Time-boxed last resort:**
+      - allow TCP 22 at the provider firewall from your current IP only;
+      - on the console, run `systemd-run --on-active=1800 /usr/sbin/nft -f /etc/nftables.conf`, then `nft insert rule inet applyforge input ip saddr <your-ip> tcp dport 22 accept`;
+      - fix the problem;
+      - remove the provider rule.
+   6. Rescue system, or a Backups/snapshot restore, if the system does not boot.
+6. **All admin devices lost:** console → new key on a new device → add its `[Peer]` on both servers → restart the tunnels.
+
+### 15.8 Application server lost: rebuild and restore
+
+The rehearsal killed the app server, **deleted its disk** and rebuilt it. Timings are in `PRODUCTION_READINESS.md` 3c.
+
+1. **Provision** a new server, then follow sections 2–8 with the current release.
+2. **Restore the server identity from the password manager:** the WireGuard keys, so devices and the backup link work unchanged; then `acme.env` and `healthchecks.env`.
+3. **Check the clock first:** `timedatectl show -p NTPSynchronized --value` must print `yes`. DNS-01 through a TSIG/RFC 2136 credential fails with "bad authentication" when the clock is more than 5 minutes off; the rehearsal's rebuilt VM was 1.8 h off. Then install unbound (15.1), the ACME tooling (15.2) and monitoring (15.6), and run `applyforge-acme issue`.
+4. Wait for the NFS mount (fstab, after `wg1`) and run `probe-destination`.
+5. **Choose the archive and its hash from the offline record** (15.4); the old index died with the server.
+6. **Restore** into a new database and directory (12.6), then **switch** (12.7).
+7. **Verify** HTTPS from a device.
+   - Re-pin the SSH host key (`ssh-keygen -R 10.99.0.1`) unless it was restored.
+   - Give users the new API token.
+8. **Take a backup** and check that it is sealed. Re-enable the timers.

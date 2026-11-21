@@ -28,6 +28,11 @@ RequiresMountsFor=/mnt/applyforge-backups
 
 [Service]
 Type=oneshot
+# Fail fast when the network share is unreachable. With a `hard` NFS mount, any access blocks until the
+# server returns, so without this the unit hung until TimeoutStartSec (6 h) with no failure and no
+# alert (two-server rehearsal, 2026-11-21). NFS waits are killable, so SIGKILL after 30 s ends the
+# check; the unit then fails before ApplyForge is touched and OnFailure= (monitoring) alerts.
+ExecStartPre=/usr/bin/timeout -s KILL 30 /usr/bin/stat -f /mnt/applyforge-backups
 ExecStart=/usr/local/sbin/applyforge-backup create --config /etc/applyforge/backup.conf
 # Runs after ExecStart in every case - success, failure, timeout or SIGKILL. It starts
 # ApplyForge again ONLY if the durable marker was written by THIS invocation

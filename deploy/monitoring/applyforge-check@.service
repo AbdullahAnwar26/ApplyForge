@@ -1,0 +1,9 @@
+# One monitoring check (applyforge-check %i); the check pings success or fail itself (deploy/README.md 15.6).
+[Unit]
+Description=ApplyForge monitoring check: %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/applyforge-check %i

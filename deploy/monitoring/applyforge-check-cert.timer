@@ -1,0 +1,11 @@
+# Runs applyforge-check@cert every 1d (app server). Healthchecks alerts when these pings stop.
+[Unit]
+Description=ApplyForge monitoring timer: cert
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1d
+Unit=applyforge-check@cert.service
+
+[Install]
+WantedBy=timers.target

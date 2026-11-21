@@ -1,0 +1,11 @@
+# Runs applyforge-check@heartbeat every 15min (backup server). Healthchecks alerts when these pings stop.
+[Unit]
+Description=ApplyForge monitoring timer: heartbeat
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=applyforge-check@heartbeat.service
+
+[Install]
+WantedBy=timers.target
