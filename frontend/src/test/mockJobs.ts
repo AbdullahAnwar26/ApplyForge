@@ -10,10 +10,12 @@ import { delay, http, HttpResponse, type HttpHandler } from "msw";
 
 import type { Company, JobDetail, JobSummary, ScreeningOutcome } from "../api/types";
 import { JOB_SOURCES, JOB_STATUSES, SCREENING_OUTCOMES, SCREENING_REASONS } from "../api/types";
+import { makeApplication } from "./mockApplications";
 import type { Call, MockState } from "./mockBackend";
 import { API } from "./server";
 
 const NOW = "2026-03-01T10:00:00Z";
+const REVIEW_FIELDS = ["status", "title", "company_name", "location", "work_mode", "recruiter_name", "required_experience_text", "full_jd", "contacts", "contacts_verified"];
 
 export function makeJob(id: number, overrides: Partial<JobDetail> = {}): JobDetail {
   return {
@@ -39,6 +41,16 @@ export function makeJob(id: number, overrides: Partial<JobDetail> = {}): JobDeta
     full_jd: "We're hiring a Backend Developer. Python and Django. 2-4 years of experience.",
     screening_details: {},
     contacts: [],
+    recruiter_name: "",
+    jd_complete: true,
+    contacts_verified_at: null,
+    contact_summary: { emails: [], phones: [], whatsapp: [] },
+    application: null,
+    eligibility: { eligible: true, issues: [] },
+    matching_resume: null,
+    recruiter_headline: "",
+    source_post_text: "",
+    extraction: {},
     ...overrides,
   };
 }
@@ -48,6 +60,9 @@ export function toSummary(job: JobDetail): JobSummary {
   delete summary.full_jd;
   delete summary.screening_details;
   delete summary.contacts;
+  delete summary.recruiter_headline;
+  delete summary.source_post_text;
+  delete summary.extraction;
   return summary as JobSummary;
 }
 
@@ -86,6 +101,22 @@ export function jobHandlers(
   }
 
   const find = (id: unknown) => state.jobs.find((j) => j.id === Number(id));
+  /** Like select_job: shortlist + one application; true when it was created. */
+  const selectInState = (job: JobDetail): boolean => {
+    if (job.application) return false;
+    job.status = "SHORTLISTED";
+    job.application = { id: 3000 + job.id, status: "SHORTLISTED", sent_at: null };
+    // Like the backend: one application per job, with the post's contact.
+    if (!state.applications.some((x) => x.id === 3000 + job.id)) {
+      state.applications.push(makeApplication(3000 + job.id, {
+        job: { id: job.id, title: job.title, company: job.company, status: "SHORTLISTED", screening_outcome: job.screening_outcome },
+        resume: job.matching_resume?.id ?? null,
+        recipient_email: job.contact_summary.emails[0] ?? "",
+        recipient_phone: job.contact_summary.whatsapp[0] ?? job.contact_summary.phones[0] ?? "",
+      }));
+    }
+    return true;
+  };
 
   return [
     http.get(`${API}/jobs/`, ({ request }) => {
@@ -115,8 +146,21 @@ export function jobHandlers(
       }
       const company = q.get("company");
       if (company) jobs = jobs.filter((j) => j.company?.id === Number(company));
+      const run = q.get("run");
+      if (run) {
+        const ids = state.runs.find((r) => r.id === Number(run))?.job_ids ?? [];
+        jobs = jobs.filter((j) => ids.includes(j.id));
+      }
       const profile = q.get("profile");
       if (profile) jobs = jobs.filter((j) => j.screening_details.profile_id === Number(profile));
+      // Like the backend: every word must appear in the title, company, location or description.
+      const words = (q.get("search") ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+      if (words.length) {
+        jobs = jobs.filter((j) => {
+          const haystack = [j.title, j.company?.name, j.location, j.full_jd].filter(Boolean).join(" ").toLowerCase();
+          return words.every((w) => haystack.includes(w));
+        });
+      }
 
       const items = jobs.map(toSummary);
       if (!q.has("page") && !q.has("page_size")) return HttpResponse.json(items);
@@ -143,13 +187,62 @@ export function jobHandlers(
       await delay(options.writeDelay);
       const job = find(params.id);
       if (!job) return HttpResponse.json({ detail: "Not found." }, { status: 404 });
-      const unexpected = Object.keys(body).filter((k) => k !== "status");
+      const unexpected = Object.keys(body).filter((k) => !REVIEW_FIELDS.includes(k));
       if (unexpected.length) return HttpResponse.json(Object.fromEntries(unexpected.map((k) => [k, ["This field is read-only."]])), { status: 400 });
-      if (!(JOB_STATUSES as readonly string[]).includes(String(body.status))) {
+      if ("status" in body && !(JOB_STATUSES as readonly string[]).includes(String(body.status))) {
         return HttpResponse.json({ status: [`"${String(body.status)}" is not a valid choice.`] }, { status: 400 });
       }
-      job.status = body.status as JobDetail["status"];
+      if ("full_jd" in body && String(body.full_jd).trim().length < 40) {
+        return HttpResponse.json({ full_jd: ["Paste the complete job description (at least 40 characters)."] }, { status: 400 });
+      }
+      if ("status" in body) job.status = body.status as JobDetail["status"];
+      for (const key of ["title", "location", "work_mode", "recruiter_name"] as const) {
+        if (key in body) (job as unknown as Record<string, unknown>)[key] = body[key];
+      }
+      if ("company_name" in body) job.company = body.company_name ? { id: 99, name: String(body.company_name) } : null;
+      if ("full_jd" in body) {
+        job.full_jd = String(body.full_jd);
+        job.jd_complete = true;
+        job.eligibility = { ...job.eligibility, issues: job.eligibility.issues.filter((i) => i.code !== "incomplete_jd") };
+      }
+      if (Array.isArray(body.contacts)) {
+        const contacts = body.contacts as { email?: string; phone?: string; whatsapp?: string }[];
+        job.contact_summary = {
+          emails: contacts.map((c) => c.email ?? "").filter(Boolean),
+          phones: contacts.map((c) => c.phone ?? "").filter(Boolean),
+          whatsapp: contacts.map((c) => c.whatsapp ?? "").filter(Boolean),
+        };
+        job.contacts = contacts.map((c, i) => ({ id: 500 + i, name: null, email: c.email || null, phone: c.phone || null, whatsapp: c.whatsapp || null, company: null, created_at: NOW, updated_at: NOW }));
+        job.contacts_verified_at = NOW;
+      }
       return HttpResponse.json(job);
+    }),
+    http.post(`${API}/jobs/:id/select/`, async ({ request, params }) => {
+      record(request, { body: await request.json() });
+      await delay(options.writeDelay);
+      const job = find(params.id);
+      if (!job) return HttpResponse.json({ detail: "Not found." }, { status: 404 });
+      const created = selectInState(job);
+      return HttpResponse.json({ application: { id: job.application!.id }, created, job }, { status: created ? 201 : 200 });
+    }),
+    http.post(`${API}/jobs/select/`, async ({ request }) => {
+      const body = (await request.json()) as { jobs: number[] };
+      record(request, { body });
+      const results = body.jobs.map((id) => {
+        const job = find(id)!;
+        const created = selectInState(job);
+        return { job: id, application: job.application!.id, created };
+      });
+      return HttpResponse.json({ results, created: results.filter((r) => r.created).length, already_selected: results.filter((r) => !r.created).length });
+    }),
+    http.post(`${API}/jobs/bulk-status/`, async ({ request }) => {
+      const body = (await request.json()) as { jobs: number[]; status: JobDetail["status"] };
+      record(request, { body });
+      for (const id of body.jobs) {
+        const job = find(id);
+        if (job) job.status = body.status;
+      }
+      return HttpResponse.json({ updated: body.jobs.length });
     }),
     http.post(`${API}/jobs/:id/screen/`, async ({ request, params }) => {
       const body = (await request.json()) as { profile?: number };

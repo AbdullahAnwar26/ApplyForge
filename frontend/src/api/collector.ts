@@ -1,34 +1,41 @@
 /**
- * Collector API (backend/collector/api.py, collector/runs.py):
+ * Collector API (backend/collector/api.py, collector/progressive.py):
  *
- *   GET  collector/runs/        newest first; filters status, trigger, profile; optional paging
- *   GET  collector/runs/{id}/   one run (read-only; no PATCH/PUT/DELETE)
- *   POST collector/runs/        {keywords?, limit?, profile?} - unknown fields rejected.
- *        Starts a LinkedIn collection through the backend machine's saved browser
- *        session and WAITS for it (synchronous):
- *          201 {run, outcomes}               SUCCEEDED
- *          502 {run, outcomes, detail}       PARTIAL or FAILED
- *          400 {<field>: [..], run?}         invalid input (run recorded when the service rejected it)
- *          409 {detail, run}                 another run is RUNNING
- *          429                               throttled ("collector-run", 6/min)
- *          500 {detail, run}                 unexpected error (details only in the server log)
- *        One run at a time; RUNNING rows older than COLLECTOR_STALE_RUN_MINUTES (30) are
- *        marked FAILED when the next run is attempted.
+ *   GET  collector/runs/               newest first; filters status, trigger, profile; optional paging
+ *   GET  collector/runs/{id}/          one run, with live progress (counts, stage) while RUNNING
+ *   GET  collector/runs/{id}/items/    what happened to each examined post
+ *   POST collector/runs/               {query, target, date_range, date_from?, date_to?, profile?}
+ *        Starts a collection in the BACKGROUND and answers at once:
+ *          202 {run}                     the run (poll it for progress)
+ *          400 {<field>: [..]}           invalid input (nothing recorded)
+ *          409 {detail, run}             a collection is already running on the server
+ *          429                           throttled ("collector-run")
+ *   POST collector/runs/{id}/cancel/   stop after the current post/page (keeps what was collected)
+ *   POST collector/runs/{id}/continue/ new run with the same search for the jobs still missing
  *
- * This module never retries a POST (see api/queryClient.ts: mutations never retry).
+ * POSTs are never retried (api/queryClient.ts: mutations never retry).
  */
 
 import type { ApiClient } from "./client";
 import type { ListResult } from "./pagination";
-import type { CollectorRun, CollectorRunInput, CollectorRunResult, CollectorRunStatus, CollectorRunTrigger } from "./types";
+import type {
+  CollectedPost,
+  CollectedPostStatus,
+  CollectionInput,
+  CollectorRun,
+  CollectorRunStatus,
+  CollectorRunTrigger,
+  DateRange,
+} from "./types";
 
-/** Backend limits: MAX_KEYWORDS, MAX_KEYWORD_LENGTH, COLLECTOR_API_MAX/DEFAULT_POSTS_PER_RUN (defaults). */
-export const MAX_KEYWORDS = 10;
-export const MAX_KEYWORD_LENGTH = 100;
-export const MAX_RUN_LIMIT = 10;
-export const DEFAULT_RUN_LIMIT = 5;
-export const STALE_RUN_MINUTES = 30;
+/** Backend default ceiling (COLLECTOR_API_MAX_POSTS_PER_RUN); the server has the final say. */
+export const MAX_TARGET = 500;
+export const DEFAULT_TARGET = 25;
+export const MAX_QUERY_LENGTH = 200;
 export const RUNS_PAGE_SIZE = 20;
+export const ITEMS_PAGE_SIZE = 50;
+/** How often a running collection is polled. */
+export const RUN_POLL_MS = 1500;
 
 export interface RunFilters {
   status?: CollectorRunStatus;
@@ -40,6 +47,8 @@ export const collectorKeys = {
   all: ["collector"] as const,
   runs: (filters: RunFilters, page: number) => ["collector", "runs", filters, page] as const,
   run: (id: number) => ["collector", "run", id] as const,
+  items: (id: number, status: string, page: number) => ["collector", "items", id, status, page] as const,
+  latest: ["collector", "latest"] as const,
 };
 
 export function listRuns(api: ApiClient, filters: RunFilters, page: number, signal?: AbortSignal): Promise<ListResult<CollectorRun>> {
@@ -50,38 +59,74 @@ export function getRun(api: ApiClient, id: number, signal?: AbortSignal): Promis
   return api.get<CollectorRun>(`collector/runs/${id}/`, { signal });
 }
 
-/**
- * Start ONE collection run. Only ever called from an explicit, confirmed user action.
- * A 502 is a completed-but-partial/failed run; its body is returned via ApiError.body.
- */
-export function startRun(api: ApiClient, input: CollectorRunInput): Promise<CollectorRunResult> {
-  return api.post<CollectorRunResult>("collector/runs/", input);
+export function listRunItems(
+  api: ApiClient,
+  id: number,
+  status: CollectedPostStatus | "",
+  page: number,
+  signal?: AbortSignal,
+): Promise<ListResult<CollectedPost>> {
+  return api.list<CollectedPost>(`collector/runs/${id}/items/`, {
+    query: { status: status || undefined },
+    page: { page, pageSize: ITEMS_PAGE_SIZE },
+    signal,
+  });
 }
 
-/** Keywords from free text: comma- or newline-separated, trimmed, de-duplicated (case-insensitive). */
-export function parseKeywords(text: string): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const raw of text.split(/[,\n]/)) {
-    const keyword = raw.trim().replace(/\s+/g, " ");
-    const key = keyword.toLocaleLowerCase();
-    if (keyword && !seen.has(key)) {
-      seen.add(key);
-      out.push(keyword);
-    }
+/** Start ONE background collection. Only ever called from an explicit, confirmed user action. */
+export function startCollection(api: ApiClient, input: CollectionInput): Promise<{ run: CollectorRun }> {
+  return api.post<{ run: CollectorRun }>("collector/runs/", input);
+}
+
+export function cancelRun(api: ApiClient, id: number): Promise<CollectorRun> {
+  return api.post<CollectorRun>(`collector/runs/${id}/cancel/`, {});
+}
+
+export function continueRun(api: ApiClient, id: number): Promise<{ run: CollectorRun }> {
+  return api.post<{ run: CollectorRun }>(`collector/runs/${id}/continue/`, {});
+}
+
+export interface CollectionFormValues {
+  query: string;
+  target: string;
+  dateRange: DateRange;
+  dateFrom: string;
+  dateTo: string;
+}
+
+export type CollectionFormErrors = Partial<Record<"query" | "target" | "dateFrom" | "dateTo", string>>;
+
+/** Client-side checks that mirror the backend's (the backend still validates everything). */
+export function validateCollection(values: CollectionFormValues, today: string): CollectionFormErrors {
+  const errors: CollectionFormErrors = {};
+  const query = values.query.trim();
+  if (!query) errors.query = "Enter what to search for, e.g. Python Backend Developer.";
+  else if (query.length > MAX_QUERY_LENGTH) errors.query = `Use at most ${MAX_QUERY_LENGTH} characters.`;
+  if (!/^\d+$/.test(values.target.trim()) || Number(values.target) < 1) {
+    errors.target = "Enter how many jobs to collect (a whole number).";
+  } else if (Number(values.target) > MAX_TARGET) {
+    errors.target = `Collect at most ${MAX_TARGET} jobs in one run.`;
   }
-  return out;
-}
-
-export function validateRunInput(keywords: string[], limit: string): { keywords?: string; limit?: string } {
-  const errors: { keywords?: string; limit?: string } = {};
-  if (keywords.length === 0) errors.keywords = "Enter at least one keyword.";
-  else if (keywords.length > MAX_KEYWORDS) errors.keywords = `Use at most ${MAX_KEYWORDS} keywords.`;
-  else if (keywords.some((k) => k.length > MAX_KEYWORD_LENGTH)) errors.keywords = `Each keyword can have at most ${MAX_KEYWORD_LENGTH} characters.`;
-  if (!/^\d+$/.test(limit.trim())) errors.limit = `Enter a whole number from 1 to ${MAX_RUN_LIMIT}.`;
-  else {
-    const value = Number(limit);
-    if (value < 1 || value > MAX_RUN_LIMIT) errors.limit = `Enter a whole number from 1 to ${MAX_RUN_LIMIT}.`;
+  if (values.dateRange === "custom") {
+    if (!values.dateFrom) errors.dateFrom = "Choose the first day.";
+    else if (values.dateFrom > today) errors.dateFrom = "The range cannot start in the future.";
+    if (values.dateTo && values.dateFrom && values.dateTo < values.dateFrom) {
+      errors.dateTo = "The last day must be on or after the first day.";
+    }
   }
   return errors;
 }
+
+export function collectionInput(values: CollectionFormValues, profile?: number): CollectionInput {
+  const custom = values.dateRange === "custom";
+  return {
+    query: values.query.trim().replace(/\s+/g, " "),
+    target: Number(values.target),
+    date_range: values.dateRange,
+    date_from: custom ? values.dateFrom || null : null,
+    date_to: custom ? values.dateTo || null : null,
+    ...(profile ? { profile } : {}),
+  };
+}
+
+export const isActive = (run: CollectorRun | null | undefined): boolean => run?.status === "RUNNING";

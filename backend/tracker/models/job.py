@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 from .company import Company, Contact
 from .profile import Skill
@@ -30,6 +31,13 @@ class ScreeningReason(models.TextChoices):
     POSSIBLE_DUPLICATE = 'POSSIBLE_DUPLICATE', 'Possible duplicate'
 
 class JobOpportunity(models.Model):
+    # The account this belongs to (accounts milestone). Every API query is limited to the
+    # signed-in user's rows. NULL only for data created before accounts existed; such rows
+    # are invisible until claimed (first account created, or `manage.py claim_unowned_data`).
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="jobs", on_delete=models.CASCADE,
+        null=True, blank=True, db_index=True,
+    )
     title = models.CharField(max_length=255, db_index=True)
     normalized_title = models.CharField(max_length=255, db_index=True)
     company = models.ForeignKey(Company, related_name='jobs', on_delete=models.SET_NULL, null=True, blank=True)
@@ -60,20 +68,37 @@ class JobOpportunity(models.Model):
     screening_details = models.JSONField(default=dict, blank=True)
     screened_at = models.DateTimeField(blank=True, null=True)
 
+    # Collected posts (Job Automation). The post author as LinkedIn shows them (often the
+    # recruiter); the original post text exactly as collected (never edited, while
+    # ``full_jd`` may be corrected by the user); whether the whole post could be read.
+    recruiter_name = models.CharField(max_length=255, blank=True, default="")
+    recruiter_headline = models.CharField(max_length=500, blank=True, default="")
+    source_post_text = models.TextField(blank=True, default="")
+    # False: the post was cut off ("… more" could not be opened). Such a job is not used
+    # for generation until the user pastes the full description.
+    jd_complete = models.BooleanField(default=True)
+    # {"title_source": str, "truncated": bool,
+    #  "contacts": [{"kind": "email"|"phone"|"whatsapp", "value": str, "evidence": str}],
+    #  "edited_fields": [str]}  - how each detail was found, so the user can verify it.
+    extraction = models.JSONField(default=dict, blank=True)
+    # The user checked the extracted contact details against the post.
+    contacts_verified_at = models.DateTimeField(blank=True, null=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         constraints = [
+            # Per owner (accounts milestone): the same posting may be saved by different users.
             models.UniqueConstraint(
-                fields=['source_url'],
+                fields=['owner', 'source_url'],
                 condition=models.Q(source_url__isnull=False) & ~models.Q(source_url=''),
-                name='unique_job_source_url',
+                name='unique_job_owner_source_url',
             ),
             models.UniqueConstraint(
-                fields=['jd_fingerprint'],
+                fields=['owner', 'jd_fingerprint'],
                 condition=models.Q(jd_fingerprint__isnull=False) & ~models.Q(jd_fingerprint=''),
-                name='unique_job_jd_fingerprint',
+                name='unique_job_owner_jd_fingerprint',
             ),
         ]
 

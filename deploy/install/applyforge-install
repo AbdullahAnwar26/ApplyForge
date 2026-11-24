@@ -509,7 +509,7 @@ import os, secrets, sys, urllib.parse
 os.umask(0o077)
 src, dst, host, tz = sys.argv[1:5]
 pw = secrets.token_urlsafe(32)
-repl = {"SECRET_KEY": secrets.token_urlsafe(64), "API_TOKEN": secrets.token_urlsafe(64),
+repl = {"SECRET_KEY": secrets.token_urlsafe(64),
         "DATABASE_URL": f"postgres://applyforge:{urllib.parse.quote(pw, safe='')}@127.0.0.1:5432/applyforge",
         "ALLOWED_HOSTS": host, "CSRF_TRUSTED_ORIGINS": f"https://{host}", "DJANGO_TIME_ZONE": tz}
 seen, out = set(), []
@@ -533,7 +533,7 @@ PY
     | runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1
   rm -f "$tmp.pw"
   install -o root -g applyforge -m 0640 "$tmp" "$envf"; rm -f "$tmp"
-  note "created $envf (API token: sudo grep ^API_TOKEN= $envf - share only through a trusted channel)"
+  note "created $envf (users create their own accounts in the web UI; SIGNUP_ENABLED controls sign-up)"
 }
 
 install_site_config() {

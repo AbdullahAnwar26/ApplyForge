@@ -1,5 +1,5 @@
 /**
- * Jobs list filters live in the URL (?status=…&outcome=…&page=2) so they survive
+ * Jobs list filters live in the URL (?q=…&status=…&outcome=…&page=2) so they survive
  * navigation and back/forward. Only the backend's supported filters exist here;
  * unknown or invalid values are ignored rather than sent.
  */
@@ -18,6 +18,8 @@ import {
 } from "../../api/types";
 
 export interface JobListParams {
+  /** Text search (title, company, location, description). */
+  q?: string;
   status?: JobStatus;
   outcome?: ScreeningOutcome | typeof UNSCREENED;
   reason?: ScreeningReason;
@@ -38,7 +40,9 @@ function positiveInt(value: string | null): number | undefined {
 }
 
 export function readParams(search: URLSearchParams): JobListParams {
+  const q = (search.get("q") ?? "").trim().slice(0, 200);
   return {
+    q: q || undefined,
     status: oneOf(search.get("status"), JOB_STATUSES),
     outcome: oneOf(search.get("outcome"), [...SCREENING_OUTCOMES, UNSCREENED] as const),
     reason: oneOf(search.get("reason"), SCREENING_REASONS),
@@ -54,6 +58,7 @@ export function writeParams(current: JobListParams, changes: Partial<JobListPara
   const next = { ...current, ...changes };
   if (!("page" in changes)) next.page = 1;
   const search = new URLSearchParams();
+  if (next.q) search.set("q", next.q);
   if (next.status) search.set("status", next.status);
   if (next.outcome) search.set("outcome", next.outcome);
   if (next.reason) search.set("reason", next.reason);
@@ -65,12 +70,13 @@ export function writeParams(current: JobListParams, changes: Partial<JobListPara
 }
 
 export function hasFilters(params: JobListParams): boolean {
-  return Boolean(params.status || params.outcome || params.reason || params.source || params.company || params.mine);
+  return Boolean(params.q || params.status || params.outcome || params.reason || params.source || params.company || params.mine);
 }
 
 /** API filters for the backend; `profile` only when "screened for my profile" is on. */
 export function toApiFilters(params: JobListParams, activeProfileId: number | null): JobFilters {
   const filters: JobFilters = {};
+  if (params.q) filters.search = params.q;
   if (params.status) filters.status = params.status;
   if (params.outcome) filters.screening_outcome = params.outcome;
   if (params.reason) filters.screening_reason = params.reason;

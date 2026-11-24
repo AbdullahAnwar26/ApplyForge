@@ -134,6 +134,15 @@ class BuildPayloadTests(SimpleTestCase):
             "location": "Bengaluru",
             "required_experience_text": "3-5 years",
             "posted_date": "2026-11-10T09:30:00+00:00",
+            "recruiter_name": "Priya",
+            "jd_complete": True,
+            "source_post_text": text,
+            "extraction": {
+                "title_source": "hiring_phrase",
+                "truncated": False,
+                "contacts": [{"kind": "email", "value": "careers@acme.example",
+                              "evidence": "Send your CV to careers@acme.example"}],
+            },
         })
 
     def test_full_jd_is_exact_post_text(self):

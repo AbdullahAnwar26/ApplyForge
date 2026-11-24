@@ -38,6 +38,9 @@ class RawPost:
     # The relative-time label as displayed (e.g. "3h"); for -v 3 diagnostics only,
     # never stored. posted_at above is what ingestion uses.
     posted_label: str | None = None
+    # The source could not reveal the whole post (its "… more" control was still
+    # there after expansion). Such a post is never treated as a complete JD.
+    truncated: bool = False
 
 
 class PostSkipped(Exception):
@@ -62,7 +65,7 @@ _HIRING_CUES = re.compile(
 )
 _EMAIL = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w-])")
 # Phone candidates: optional +, then digits with spaces/dashes/dots/parentheses.
-_PHONE = re.compile(r"(?<![\w+])\+?\(?\d[\d\s().-]{8,20}\d(?!\w)")
+_PHONE = re.compile(r"(?<![\w+(])\(?\+?\(?\d[\d\s().-]{8,20}\d(?!\w)")
 _WHATSAPP_CUE = re.compile(r"whats\s*app|\bwa\b|\bwa\.me\b", re.I)
 
 _LABEL = r"^[^\w\n]*{label}\s*[:\-–]\s*(?P<value>[^\n]+)$"
@@ -171,13 +174,41 @@ def is_job_seeker_post(text):
     return bool(_SEEKER_CUES.search(text)) and not _EMPLOYER_CUES.search(text)
 
 
+# Things that look like an email or a phone number but are not one.
+_FILE_LIKE_TLD = re.compile(r"\.(?:png|jpe?g|gif|webp|svg|pdf|docx?|zip)$", re.I)
+_DATE_LIKE = re.compile(r"^\(?\d{1,4}[./-]\d{1,2}[./-]\d{2,4}(?!\d)")
+_TRUNCATION_TAIL = re.compile(r"(?:…|\.\.\.)\s*(?:(?:see|show)\s+more)?\s*$", re.I)
+
+
+def looks_truncated(text):
+    """True when the text visibly stops mid-way ("…", "... see more")."""
+    return bool(_TRUNCATION_TAIL.search((text or "").rstrip()))
+
+
+def _valid_email(email):
+    local, _, domain = email.partition("@")
+    return bool(local and "." in domain and not _FILE_LIKE_TLD.search(domain)
+                and ".." not in email and not domain.startswith("."))
+
+
 def extract_emails(text):
     seen = []
     for match in _EMAIL.finditer(text or ""):
         email = match.group(0).strip(".").lower()
-        if email not in seen:
+        if _valid_email(email) and email not in seen:
             seen.append(email)
     return seen
+
+
+def _phone_problem(raw, digits):
+    """Why a phone-shaped string is not a usable number, or None."""
+    if not MIN_PHONE_DIGITS <= len(digits) <= MAX_PHONE_DIGITS:
+        return "wrong number of digits"
+    if _DATE_LIKE.match(raw):
+        return "looks like a date"
+    if len(set(digits[-MIN_PHONE_DIGITS:])) == 1:
+        return "repeated digit"
+    return None
 
 
 def extract_phones(text):
@@ -190,7 +221,7 @@ def extract_phones(text):
             digits = re.sub(r"\D", "", raw)
             # Same number with and without country code -> compare the last 10 digits.
             key = digits[-MIN_PHONE_DIGITS:]
-            if not MIN_PHONE_DIGITS <= len(digits) <= MAX_PHONE_DIGITS or key in seen_digits:
+            if _phone_problem(raw, digits) or key in seen_digits:
                 continue
             seen_digits.add(key)
             (whatsapp if is_whatsapp_line else phones).append(raw)
@@ -334,6 +365,33 @@ def extract_experience_text(text):
     return (_clean(label.group("value"), 255) or None) if label else None
 
 
+def contact_evidence(text):
+    """Every email/phone found in the post, with the line it was found on.
+
+    Stored with the job so the user can check each extracted detail against the
+    post. Only what is written in the post; nothing is looked up or guessed.
+    """
+    evidence = []
+    emails = set(extract_emails(text))
+    phones, whatsapp = extract_phones(text)
+    phones, whatsapp = set(phones), set(whatsapp)
+    for line in (text or "").splitlines():
+        snippet = " ".join(line.split())[:300]
+        for match in _EMAIL.finditer(line):
+            value = match.group(0).strip(".").lower()
+            if value in emails and not any(e["value"] == value for e in evidence):
+                evidence.append({"kind": "email", "value": value, "evidence": snippet})
+        for match in _PHONE.finditer(line):
+            raw = match.group(0).strip(" .-")
+            if any(e["value"] == raw for e in evidence):
+                continue
+            if raw in whatsapp:
+                evidence.append({"kind": "whatsapp", "value": raw, "evidence": snippet})
+            elif raw in phones:
+                evidence.append({"kind": "phone", "value": raw, "evidence": snippet})
+    return evidence
+
+
 def build_contacts(text, author_name=None):
     """Contacts from identifiers written in the post.
 
@@ -383,11 +441,19 @@ def build_payload(post):
     if not title:
         raise PostParseError("No title could be taken from the post.")
 
+    truncated = bool(post.truncated) or looks_truncated(text)
     payload = {
         "title": title,
         "full_jd": text,
         "source": "LINKEDIN",
         "contacts": build_contacts(text, post.author_name),
+        "jd_complete": not truncated,
+        "source_post_text": text,
+        "extraction": {
+            "title_source": _title_source,
+            "contacts": contact_evidence(text),
+            "truncated": truncated,
+        },
     }
     optional = {
         "source_url": (post.url or "").strip() or None,
@@ -396,6 +462,8 @@ def build_payload(post):
         "work_mode": extract_work_mode(text),
         "required_experience_text": extract_experience_text(text),
         "posted_date": post.posted_at.isoformat() if post.posted_at else None,
+        "recruiter_name": _clean(post.author_name, 255) or None,
+        "recruiter_headline": _clean(post.author_headline, 500) or None,
     }
     payload.update({key: value for key, value in optional.items() if value})
     return payload

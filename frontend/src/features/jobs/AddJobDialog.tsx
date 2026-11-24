@@ -13,7 +13,7 @@ import { useNavigate } from "react-router-dom";
 import { isApiError } from "../../api/errors";
 import { companyKeys, ingestJob, jobKeys } from "../../api/jobs";
 import { JOB_SOURCES, type JobContactInput, type JobIngestInput, type JobSource, type Profile } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { Button } from "../../components/Button";
 import { Dialog } from "../../components/Dialog";
 import { Field, FormErrors } from "../../components/Field";

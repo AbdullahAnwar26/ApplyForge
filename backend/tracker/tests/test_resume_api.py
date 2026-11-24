@@ -311,7 +311,7 @@ class ResumeCrudTests(ResumeAPITestCase):
     def test_list_paginated_and_query_count(self):
         for i in range(3):
             Resume.objects.create(name=f"r{i}", profile=self.profile)
-        with self.assertNumQueries(1):
+        with self.assertNumQueries(3):
             response = self.client.get("/api/v1/resumes/")
         self.assertEqual(len(response.data), 3)
         response = self.client.get("/api/v1/resumes/?page_size=2")

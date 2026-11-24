@@ -11,7 +11,7 @@ import { useId, useRef, useState, type DragEvent, type FormEvent } from "react";
 import { isApiError } from "../../api/errors";
 import { resumeKeys, uploadResume } from "../../api/resources";
 import type { Resume } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { Button } from "../../components/Button";
 import { Field, FormErrors } from "../../components/Field";
 import { useToast } from "../../components/Toast";

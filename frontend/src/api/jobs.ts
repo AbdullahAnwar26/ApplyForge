@@ -5,13 +5,17 @@
  *                                (or UNSCREENED), screening_reason, source, company,
  *                                profile (= screened against); optional page/page_size
  *   GET   jobs/{id}/             detail: + full_jd, screening_details, contacts
- *   PATCH jobs/{id}/             {status} only
+ *   PATCH jobs/{id}/             {status} and review corrections (title, company_name, location,
+ *                                work_mode, recruiter_name, full_jd, contacts, contacts_verified)
+ *   POST  jobs/{id}/select/      select for application: shortlist + ONE application (201 / 200 existing)
+ *   POST  jobs/select/           {jobs: [...]} the same for several jobs
+ *   POST  jobs/bulk-status/      {jobs, status} mark to review / selected / skipped
  *   POST  jobs/{id}/screen/      {profile?} -> job detail (never changes status)
  *   POST  jobs/screen/           {profile?, jobs?} -> {profile, screened, outcomes}
  *   POST  jobs/ingest/           manual, idempotent ingest (screens on create)
  *   GET   companies/, companies/{id}/   read-only
  *
- * There is no text search and no sort parameter.
+ * Filters also: search (text), run (jobs a collection run found), jd_complete.
  */
 
 import type { ApiClient } from "./client";
@@ -21,12 +25,15 @@ import type {
   JobDetail,
   JobIngestInput,
   JobIngestResult,
+  JobReviewUpdate,
   JobSource,
   JobStatus,
   JobSummary,
   ScreenAllResult,
   ScreeningOutcome,
   ScreeningReason,
+  SelectJobResult,
+  SelectJobsResult,
 } from "./types";
 
 export const JOBS_PAGE_SIZE = 25;
@@ -39,6 +46,11 @@ export interface JobFilters {
   company?: number;
   /** Only jobs last screened against this profile. */
   profile?: number;
+  /** Text search: every word must appear in the title, company, location or description. */
+  search?: string;
+  /** Jobs found by this collection run. */
+  run?: number;
+  jd_complete?: boolean;
 }
 
 export const jobKeys = {
@@ -81,6 +93,22 @@ export function getJob(api: ApiClient, id: number, signal?: AbortSignal): Promis
 
 export function updateJobStatus(api: ApiClient, id: number, status: JobStatus): Promise<JobDetail> {
   return api.patch<JobDetail>(`jobs/${id}/`, { status });
+}
+
+export function updateJob(api: ApiClient, id: number, update: JobReviewUpdate): Promise<JobDetail> {
+  return api.patch<JobDetail>(`jobs/${id}/`, update);
+}
+
+export function selectJob(api: ApiClient, id: number, profile?: number): Promise<SelectJobResult> {
+  return api.post<SelectJobResult>(`jobs/${id}/select/`, profile ? { profile } : {});
+}
+
+export function selectJobs(api: ApiClient, jobs: number[], profile?: number): Promise<SelectJobsResult> {
+  return api.post<SelectJobsResult>("jobs/select/", profile ? { jobs, profile } : { jobs });
+}
+
+export function bulkJobStatus(api: ApiClient, jobs: number[], status: JobStatus): Promise<{ updated: number }> {
+  return api.post<{ updated: number }>("jobs/bulk-status/", { jobs, status });
 }
 
 export function screenJob(api: ApiClient, id: number, profile: number): Promise<JobDetail> {

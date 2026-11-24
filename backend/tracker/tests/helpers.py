@@ -5,11 +5,13 @@ import shutil
 import tempfile
 
 import docx
+from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db.models.signals import pre_save
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
-TEST_TOKEN = "test-api-token"
+TEST_PASSWORD = "a-Fictional-test-passw0rd"
 
 
 def make_pdf_bytes(text="Jane Doe Python Django Engineer"):
@@ -69,19 +71,38 @@ def upload(name, data, content_type="application/octet-stream"):
     return SimpleUploadedFile(name, data, content_type=content_type)
 
 
+def make_user(username="tester", password=TEST_PASSWORD):
+    return get_user_model().objects.create_user(username=username, password=password)
+
+
 class APITestCase(TestCase):
-    """Authenticated client, a fixed token and an isolated temporary MEDIA_ROOT."""
+    """A signed-in user (session), an anonymous client and an isolated temporary MEDIA_ROOT.
+
+    Rows of owned models that a test creates directly without an ``owner`` get ``self.user``
+    as their owner, so existing tests keep meaning "my data". Isolation tests create another
+    account's rows with an explicit ``owner``.
+    """
 
     def setUp(self):
         super().setUp()
         self.media_root = tempfile.mkdtemp(prefix="applyforge-test-media-")
         self.addCleanup(shutil.rmtree, self.media_root, ignore_errors=True)
-        settings_override = override_settings(
-            API_TOKEN=TEST_TOKEN, MEDIA_ROOT=self.media_root
-        )
+        settings_override = override_settings(MEDIA_ROOT=self.media_root)
         settings_override.enable()
         self.addCleanup(settings_override.disable)
 
+        self.user = make_user()
         self.client = APIClient()
-        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {TEST_TOKEN}")
+        self.client.force_login(self.user)
         self.anon = APIClient()
+
+        from tracker.accounts import OWNED_MODELS
+
+        def default_owner(sender, instance, **kwargs):
+            if instance.owner_id is None:
+                instance.owner = self.user
+
+        for model in OWNED_MODELS:
+            # weak=False: the handler is a local function and would otherwise be garbage-collected.
+            pre_save.connect(default_owner, sender=model, weak=False, dispatch_uid=f"test-owner-{model.__name__}")
+            self.addCleanup(pre_save.disconnect, sender=model, dispatch_uid=f"test-owner-{model.__name__}")

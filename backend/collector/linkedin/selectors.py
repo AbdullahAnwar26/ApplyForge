@@ -19,12 +19,29 @@ FEED_URL = f"{BASE_URL}/feed/"
 CONTENT_SEARCH_URL = f"{BASE_URL}/search/results/content/"
 
 
-def content_search_url(keyword):
-    """Post search for ``keyword``, newest first (the normal LinkedIn UI search)."""
-    query = urlencode(
-        {"keywords": keyword, "origin": "GLOBAL_SEARCH_HEADER", "sortBy": '"date_posted"'}
-    )
-    return f"{CONTENT_SEARCH_URL}?{query}"
+# LinkedIn's own "Date posted" filter values for post search (the UI's filter chips).
+DATE_POSTED_FILTERS = ("past-24h", "past-week", "past-month")
+
+
+def content_search_url(keyword, date_posted=None):
+    """Post search for ``keyword``, newest first (the normal LinkedIn UI search),
+    optionally with LinkedIn's "Date posted" filter (see DATE_POSTED_FILTERS)."""
+    params = {"keywords": keyword, "origin": "FACETED_SEARCH", "sortBy": '"date_posted"'}
+    if date_posted:
+        if date_posted not in DATE_POSTED_FILTERS:
+            raise ValueError(f"Unknown date filter: {date_posted!r}")
+        params["datePosted"] = f'"{date_posted}"'
+    else:
+        params["origin"] = "GLOBAL_SEARCH_HEADER"
+    return f"{CONTENT_SEARCH_URL}?{urlencode(params)}"
+
+
+# "Show more results" at the end of a results list (a normal reader click; some
+# layouts load the next page with it instead of infinite scroll).
+SHOW_MORE_RESULTS = (
+    "//button[contains(concat(' ', normalize-space(@class), ' '), ' scaffold-finite-scroll__load-button ')]"
+    " | //main//button[normalize-space(.)='Show more results' or normalize-space(.)='See more results']"
+)
 
 
 # --- Page state, from the URL after navigation --------------------------------

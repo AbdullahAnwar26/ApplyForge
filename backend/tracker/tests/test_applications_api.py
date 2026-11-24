@@ -328,7 +328,7 @@ class EventHistoryTests(ApplicationAPITestCase):
         self.assertEqual(ids, sorted(ids, reverse=True))
         self.assertEqual(events[-1]["notes"], "Application created.")
         self.assertEqual(events[0]["notes"], "Status changed from SKIPPED to SHORTLISTED.")
-        self.assertEqual(set(events[0]), {"id", "status", "notes", "timestamp"})
+        self.assertEqual(set(events[0]), {"id", "kind", "status", "notes", "timestamp"})
 
         page = self.client.get(f"{URL}{app_id}/events/?page_size=2").data
         self.assertEqual(page["count"], 5)
@@ -399,7 +399,7 @@ class ListFilterTests(ApplicationAPITestCase):
         self.assertEqual(ids[:2], [self.apps["SKIPPED"].id, self.apps["SENT"].id])
 
     def test_list_query_count(self):
-        with self.assertNumQueries(1):
+        with self.assertNumQueries(4):  # + the send records (send_state)
             self.client.get(URL)
 
 
@@ -416,7 +416,7 @@ class SummaryTests(ApplicationAPITestCase):
         self.assertEqual(data["by_status"]["SHORTLISTED"], 2)
         self.assertEqual(data["by_status"]["FAILED"], 1)
         self.assertEqual(data["by_status"]["GENERATED"], 0)
-        self.assertEqual(len(data["by_status"]), 9)
+        self.assertEqual(len(data["by_status"]), 13)
         self.assertEqual(data["awaiting_action"]["count"], 5)  # 2 shortlisted, ready, follow-up, failed
         self.assertEqual(len(data["awaiting_action"]["oldest"]), 5)
         self.assertEqual(len(data["recent"]), 7)

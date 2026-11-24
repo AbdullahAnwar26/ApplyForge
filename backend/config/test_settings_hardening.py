@@ -90,13 +90,15 @@ class DebugFailsClosedTests(SimpleTestCase):
                 self.assertNotEqual(code, 0)
                 self.assertIn("SECRET_KEY must be configured", err)
 
-    def test_production_still_requires_api_token_and_database(self):
-        code, err = load_settings(SECRET_KEY=PRODUCTION["SECRET_KEY"], API_TOKEN=PRODUCTION["API_TOKEN"])
+    def test_production_still_requires_the_database(self):
+        code, err = load_settings(SECRET_KEY=PRODUCTION["SECRET_KEY"])
         self.assertNotEqual(code, 0)
         self.assertIn("DATABASE_URL must be configured", err)
-        code, err = load_settings(SECRET_KEY=PRODUCTION["SECRET_KEY"], DATABASE_URL=PRODUCTION["DATABASE_URL"])
-        self.assertNotEqual(code, 0)
-        self.assertIn("API_TOKEN must be configured", err)
+
+    def test_production_no_longer_needs_an_api_token(self):
+        # Accounts milestone: users sign in with their own accounts; the shared API token is gone.
+        code, data = load_settings(SECRET_KEY=PRODUCTION["SECRET_KEY"], DATABASE_URL=PRODUCTION["DATABASE_URL"])
+        self.assertEqual(code, 0, data)
 
     def test_explicit_local_development(self):
         for value in ("True", "true", "1", "yes"):

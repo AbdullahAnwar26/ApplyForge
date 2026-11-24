@@ -19,6 +19,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from collector import api as collector_api
+from collector import progressive
 from collector.models import CollectorRun, CollectorRunStatus, CollectorRunTrigger
 from collector.posts import RawPost
 from collector.runs import active_run, record_collection, status_for
@@ -26,7 +27,7 @@ from collector.service import CollectionInputError
 from collector.sources import JsonFilePostSource, SourceError, StaticPostSource
 from tracker.models import JobOpportunity, Profile, Skill
 from tracker.screening import ScreeningInputError
-from tracker.tests.helpers import APITestCase
+from tracker.tests.helpers import APITestCase, make_user
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_posts.json"
 POST_URL = "https://www.linkedin.com/feed/update/urn:li:activity:{}/"
@@ -230,10 +231,20 @@ class CollectorApiTests(APITestCase):
         cache.clear()  # throttle history
         self.addCleanup(cache.clear)
         self.profile = make_profile()
+        self.other_user = make_user("other-account")
         self.source = StaticPostSource([hiring_post(1), hiring_post(2, "Backend Engineer")])
-        patcher = mock.patch.object(collector_api, "make_api_source", side_effect=lambda: self.source)
-        self.make_source = patcher.start()
-        self.addCleanup(patcher.stop)
+        self.source_patch = mock.patch.object(collector_api, "make_api_source", side_effect=lambda: self.source)
+        self.make_source = self.source_patch.start()
+        self.addCleanup(mock.patch.stopall)
+        # Background runs execute inline in tests (same thread, same test transaction).
+        self.launched = []
+
+        def inline(run):
+            self.launched.append(CollectorRun.objects.order_by("-id").first().pk)
+            run()
+
+        launch_patch = mock.patch.object(progressive, "launch", side_effect=inline)
+        launch_patch.start()
 
     # --- authentication -------------------------------------------------
     def test_requires_token(self):
@@ -242,38 +253,54 @@ class CollectorApiTests(APITestCase):
         self.make_source.assert_not_called()
 
     # --- start a run -----------------------------------------------------
-    def test_post_runs_a_collection(self):
-        response = self.client.post(RUNS_URL, {"keywords": ["Python Developer"], "limit": 2}, format="json")
-        self.assertEqual(response.status_code, 201, response.data)
+    def test_post_starts_a_background_collection(self):
+        response = self.client.post(RUNS_URL, {"query": "Python Developer", "target": 2}, format="json")
+        self.assertEqual(response.status_code, 202, response.data)
         run = CollectorRun.objects.get()
         self.assertEqual(response.data["run"]["id"], run.pk)
+        self.assertEqual(self.launched, [run.pk])
+        # Launched inline in tests: the run has already finished.
         self.assertEqual(response.data["run"]["status"], "SUCCEEDED")
         self.assertEqual(response.data["run"]["trigger"], "api")
+        self.assertEqual(response.data["run"]["search_query"], "Python Developer")
         self.assertEqual(response.data["run"]["counts"]["created"], 2)
-        self.assertEqual(len(response.data["outcomes"]), 2)
-        self.assertNotIn("extraction", response.data["outcomes"][0])
-        self.assertEqual(self.source.calls, [(["Python Developer"], 2)])
+        self.assertEqual(response.data["run"]["remaining"], 0)
+        self.assertEqual(response.data["run"]["stop_reason"], "target_reached")
+        self.assertEqual(self.source.calls[0][0], ["Python Developer"])
+        self.assertEqual(run.owner, self.user)
 
     def test_defaults(self):
-        response = self.client.post(RUNS_URL, {}, format="json")
-        self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(response.data["run"]["keywords"], ["Python Developer"])
+        response = self.client.post(RUNS_URL, {"query": "Python Developer"}, format="json")
+        self.assertEqual(response.status_code, 202, response.data)
         self.assertEqual(response.data["run"]["limit"], settings.COLLECTOR_API_DEFAULT_POSTS_PER_RUN)
+        self.assertEqual(response.data["run"]["date_range"], "any")
         self.assertEqual(response.data["run"]["profile"], self.profile.pk)
 
-    @override_settings(COLLECTOR_API_MAX_POSTS_PER_RUN=10)
+    def test_targets_above_ten_are_accepted(self):
+        for target in (11, 50, 100, 200, 500):
+            with self.subTest(target=target):
+                cache.clear()
+                response = self.client.post(RUNS_URL, {"query": "Python", "target": target}, format="json")
+                self.assertEqual(response.status_code, 202, response.data)
+                self.assertEqual(response.data["run"]["limit"], target)
+
+    @override_settings(COLLECTOR_API_MAX_POSTS_PER_RUN=300)
     def test_invalid_input_is_rejected_before_any_run(self):
         cases = [
-            ({"limit": 11}, "limit"),
-            ({"limit": 0}, "limit"),
-            ({"limit": "x"}, "limit"),
-            ({"keywords": []}, "keywords"),
-            ({"keywords": "Python"}, "keywords"),
-            ({"keywords": ["x" * 101]}, "keywords"),
-            ({"keywords": ["k"] * 11}, "keywords"),
-            ({"profile": 999}, "profile"),
-            ({"source": "file"}, "source"),
-            ({"file": "posts.json"}, "file"),
+            ({"target": 5}, "query"),
+            ({"query": "   ", "target": 5}, "query"),
+            ({"query": "x" * 201}, "query"),
+            ({"query": "Python", "target": 301}, "target"),
+            ({"query": "Python", "target": 0}, "target"),
+            ({"query": "Python", "target": "x"}, "target"),
+            ({"query": "Python", "date_range": "past-year"}, "date_range"),
+            ({"query": "Python", "date_range": "custom"}, "date_from"),
+            ({"query": "Python", "date_range": "custom", "date_from": "2999-01-01"}, "date_from"),
+            ({"query": "Python", "date_range": "custom", "date_from": "2026-11-10",
+              "date_to": "2026-11-01"}, "date_to"),
+            ({"query": "Python", "profile": 999}, "profile"),
+            ({"query": "Python", "source": "file"}, "source"),
+            ({"query": "Python", "limit": 5}, "limit"),
         ]
         for body, field in cases:
             with self.subTest(body=body):
@@ -282,76 +309,101 @@ class CollectorApiTests(APITestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertIn(field, response.data)
         self.assertFalse(CollectorRun.objects.exists())
-        self.make_source.assert_not_called()
+        self.assertEqual(self.source.calls, [])
 
     def test_non_object_body(self):
         response = self.client.post(RUNS_URL, ["Python"], format="json")
         self.assertEqual(response.status_code, 400)
         self.assertFalse(CollectorRun.objects.exists())
 
-    def test_service_input_error_records_failed_run(self):
+    def test_profile_problem_is_400_and_records_nothing(self):
         make_profile(name="Other")  # two profiles and none chosen
-        response = self.client.post(RUNS_URL, {}, format="json")
+        response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
         self.assertEqual(response.status_code, 400)
-        run = CollectorRun.objects.get()
-        self.assertEqual(response.data["run"], run.pk)
-        self.assertEqual(run.status, CollectorRunStatus.FAILED)
-        self.assertEqual(self.source.calls, [])  # the source was never used
+        self.assertIn("profile", response.data)
+        self.assertFalse(CollectorRun.objects.exists())
+        self.assertEqual(self.source.calls, [])
 
     def test_explicit_profile(self):
         other = make_profile(name="Other", target_roles="Backend Engineer")
-        response = self.client.post(RUNS_URL, {"profile": other.pk}, format="json")
-        self.assertEqual(response.status_code, 201, response.data)
+        response = self.client.post(RUNS_URL, {"query": "Backend", "profile": other.pk}, format="json")
+        self.assertEqual(response.status_code, 202, response.data)
         self.assertEqual(response.data["run"]["profile"], other.pk)
-        self.assertEqual(response.data["run"]["keywords"], ["Backend Engineer"])
 
-    def test_source_failure_is_502_with_the_run(self):
+    def test_another_accounts_profile_is_not_found(self):
+        theirs = Profile.objects.create(owner=self.other_user, name="Theirs", target_roles="Dev")
+        response = self.client.post(RUNS_URL, {"query": "Python", "profile": theirs.pk}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("profile", response.data)
+
+    def test_source_failure_is_recorded_on_the_run(self):
         self.source = FailingSource([hiring_post(1)])
-        response = self.client.post(RUNS_URL, {}, format="json")
-        self.assertEqual(response.status_code, 502)
+        response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
+        self.assertEqual(response.status_code, 202)
         self.assertEqual(response.data["run"]["status"], "PARTIAL")
-        self.assertEqual(response.data["detail"], "browser crashed")
+        self.assertEqual(response.data["run"]["error"], "browser crashed")
+        self.assertEqual(response.data["run"]["stop_reason"], "source_error")
         self.assertEqual(JobOpportunity.objects.count(), 1)  # what succeeded is kept
 
+        cache.clear()
         self.source = FailingSource([], error="Not logged in")
-        response = self.client.post(RUNS_URL, {}, format="json")
-        self.assertEqual(response.status_code, 502)
+        response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
         self.assertEqual(response.data["run"]["status"], "FAILED")
+        self.assertEqual(response.data["run"]["error"], "Not logged in")
 
-    def test_failed_posts_are_502(self):
-        with mock.patch("collector.service.ingest_job", side_effect=RuntimeError("db down")):
-            response = self.client.post(RUNS_URL, {}, format="json")
-        self.assertEqual(response.status_code, 502)
+    def test_failed_posts_make_the_run_partial(self):
+        with mock.patch("collector.service.ingest_job", side_effect=RuntimeError("db down")), \
+                self.assertLogs("collector", "ERROR"):
+            response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
         self.assertEqual(response.data["run"]["status"], "PARTIAL")
-        self.assertIn("failed to ingest", response.data["detail"])
+        self.assertEqual(response.data["run"]["counts"]["failed"], 2)
 
-    def test_unexpected_error_is_500_and_recorded(self):
-        with mock.patch("collector.runs.run_collection", side_effect=RuntimeError("secret detail")),                 self.assertLogs("collector", "ERROR"):
-            response = self.client.post(RUNS_URL, {}, format="json")
-        self.assertEqual(response.status_code, 500)
+    def test_unexpected_error_is_recorded_as_failed(self):
+        with mock.patch("collector.progressive._consume", side_effect=RuntimeError("secret detail")), \
+                self.assertLogs("collector", "ERROR"):
+            response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
+        self.assertEqual(response.status_code, 202)
         run = CollectorRun.objects.get()
-        self.assertEqual(response.data["run"], run.pk)
-        self.assertNotIn("secret detail", json.dumps(response.data))
         self.assertEqual(run.status, CollectorRunStatus.FAILED)
+        self.assertEqual(response.data["run"]["status"], "FAILED")
 
     def test_active_run_blocks_a_new_one(self):
         running = CollectorRun.objects.create(trigger="command", source="linkedin")
-        response = self.client.post(RUNS_URL, {}, format="json")
+        response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.data["run"], running.pk)
-        self.make_source.assert_not_called()
+        self.assertEqual(self.launched, [])
+
+    def test_another_accounts_run_blocks_without_revealing_it(self):
+        CollectorRun.objects.create(trigger="api", source="linkedin", owner=self.other_user,
+                                    heartbeat_at=timezone.now())
+        response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
+        self.assertEqual(response.status_code, 409)
+        self.assertIsNone(response.data["run"])
+        self.assertIn("Another collection", response.data["detail"])
 
     @override_settings(COLLECTOR_STALE_RUN_MINUTES=30)
     def test_stale_run_does_not_block(self):
         CollectorRun.objects.create(trigger="command", source="linkedin",
                                     started_at=timezone.now() - timedelta(hours=2))
-        response = self.client.post(RUNS_URL, {}, format="json")
-        self.assertEqual(response.status_code, 201, response.data)
+        response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
+        self.assertEqual(response.status_code, 202, response.data)
+
+    @override_settings(COLLECTOR_HEARTBEAT_STALE_SECONDS=90)
+    def test_run_without_heartbeat_is_interrupted_and_does_not_block(self):
+        dead = CollectorRun.objects.create(trigger="api", source="linkedin", limit=50, search_query="Python",
+                                           heartbeat_at=timezone.now() - timedelta(minutes=5),
+                                           counts={"created": 12})
+        response = self.client.get(f"{RUNS_URL}{dead.pk}/")
+        self.assertEqual(response.data["status"], "INTERRUPTED")
+        self.assertEqual(response.data["stop_reason"], "interrupted")
+        self.assertEqual(response.data["remaining"], 38)
+        self.assertEqual(self.client.post(RUNS_URL, {"query": "Python"}, format="json").status_code, 202)
 
     def test_concurrent_request_in_the_same_process_is_409(self):
         self.assertTrue(collector_api._run_lock.acquire(blocking=False))
         try:
-            response = self.client.post(RUNS_URL, {}, format="json")
+            response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
         finally:
             collector_api._run_lock.release()
         self.assertEqual(response.status_code, 409)
@@ -360,26 +412,81 @@ class CollectorApiTests(APITestCase):
     def test_starting_runs_is_throttled(self):
         rates = {**settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"], "collector-run": "2/min"}
         with mock.patch("rest_framework.throttling.ScopedRateThrottle.THROTTLE_RATES", rates):
-            codes = [self.client.post(RUNS_URL, {}, format="json").status_code for _ in range(3)]
-            self.assertEqual(codes, [201, 201, 429])
+            codes = [self.client.post(RUNS_URL, {"query": "Python"}, format="json").status_code
+                     for _ in range(3)]
+            self.assertEqual(codes, [202, 202, 429])
             # Reading history is not throttled.
             self.assertEqual([self.client.get(RUNS_URL).status_code for _ in range(3)], [200] * 3)
 
     def test_nothing_is_sent(self):
         from django.core import mail
-        self.client.post(RUNS_URL, {}, format="json")
+        self.client.post(RUNS_URL, {"query": "Python"}, format="json")
         self.assertEqual(mail.outbox, [])
 
     def test_real_api_source_cannot_reach_network_in_tests(self):
         # Without the patch the API builds the real LinkedIn source; the test-mode
         # guard stops it before Chromium starts and the run is recorded as FAILED.
-        mock.patch.stopall()  # restore the real make_api_source
+        self.source_patch.stop()  # restore the real make_api_source
         with mock.patch("playwright.sync_api.sync_playwright") as start:
-            response = self.client.post(RUNS_URL, {}, format="json")
+            response = self.client.post(RUNS_URL, {"query": "Python"}, format="json")
             start.assert_not_called()
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.status_code, 202)
         self.assertEqual(response.data["run"]["status"], "FAILED")
-        self.assertIn("Live browser access is disabled", response.data["detail"])
+        self.assertIn("Live browser access is disabled", response.data["run"]["error"])
+
+    # --- cancel / continue / items ----------------------------------------
+    def test_cancel_a_running_run(self):
+        run = CollectorRun.objects.create(trigger="api", source="linkedin", heartbeat_at=timezone.now(),
+                                          limit=50, search_query="Python")
+        response = self.client.post(f"{RUNS_URL}{run.pk}/cancel/", {}, format="json")
+        self.assertEqual(response.status_code, 202)
+        run.refresh_from_db()
+        self.assertTrue(run.cancel_requested)
+        # A finished run cannot be cancelled; another account's run is not found.
+        run.status = CollectorRunStatus.SUCCEEDED
+        run.save()
+        self.assertEqual(self.client.post(f"{RUNS_URL}{run.pk}/cancel/", {}, format="json").status_code, 400)
+        theirs = CollectorRun.objects.create(trigger="api", source="linkedin", owner=self.other_user,
+                                             heartbeat_at=timezone.now())
+        self.assertEqual(self.client.post(f"{RUNS_URL}{theirs.pk}/cancel/", {}, format="json").status_code, 404)
+        theirs.refresh_from_db()
+        self.assertFalse(theirs.cancel_requested)
+
+    def test_continue_collects_only_what_is_missing(self):
+        self.source = StaticPostSource([hiring_post(n) for n in range(1, 6)])
+        self.client.post(RUNS_URL, {"query": "Python", "target": 2}, format="json")
+        first = CollectorRun.objects.get()
+        first.limit = 5  # as if it had been interrupted after 2 of 5
+        first.status = CollectorRunStatus.INTERRUPTED
+        first.save()
+        cache.clear()
+        response = self.client.post(f"{RUNS_URL}{first.pk}/continue/", {}, format="json")
+        self.assertEqual(response.status_code, 202, response.data)
+        second = response.data["run"]
+        self.assertEqual(second["limit"], 3)
+        self.assertEqual(second["search_query"], "Python")
+        self.assertEqual(second["counts"]["existing"], 2)   # already collected: recognised
+        self.assertEqual(second["counts"]["created"], 3)
+        self.assertEqual(JobOpportunity.objects.count(), 5)
+        # Nothing left: refused.
+        cache.clear()
+        done = CollectorRun.objects.get(pk=second["id"])
+        self.assertEqual(self.client.post(f"{RUNS_URL}{done.pk}/continue/", {}, format="json").status_code, 400)
+
+    def test_items_list_every_examined_post(self):
+        self.source = StaticPostSource([hiring_post(1), RawPost(text="Lovely weather today. " * 5)])
+        self.client.post(RUNS_URL, {"query": "Python", "target": 5}, format="json")
+        run = CollectorRun.objects.get()
+        response = self.client.get(f"{RUNS_URL}{run.pk}/items/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([i["status"] for i in response.data], ["created", "skipped"])
+        self.assertEqual(response.data[0]["job"], JobOpportunity.objects.get().pk)
+        filtered = self.client.get(f"{RUNS_URL}{run.pk}/items/?status=skipped")
+        self.assertEqual(len(filtered.data), 1)
+        self.client.force_login(self.other_user)
+        self.assertEqual(self.client.get(f"{RUNS_URL}{run.pk}/items/").status_code, 404)
+        self.assertEqual(self.client.get(f"{RUNS_URL}{run.pk}/").status_code, 404)
+        self.assertEqual(self.client.get(RUNS_URL).data, [])
 
     # --- history ---------------------------------------------------------
     def _runs(self):

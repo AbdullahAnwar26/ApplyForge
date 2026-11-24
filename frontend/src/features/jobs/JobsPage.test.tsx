@@ -58,7 +58,9 @@ describe("job list", () => {
     expect(rows).toHaveLength(2);
 
     expect(within(rows[0]!).getByRole("link", { name: "Python Backend Developer" })).toHaveAttribute("href", "/jobs/7");
-    expect(rows[0]).toHaveTextContent("Acme Fictional Labs · Remote · Remote");
+    // Location and work mode are both "Remote": shown once.
+    expect(rows[0]).toHaveTextContent("Acme Fictional Labs · Remote");
+    expect(rows[0]).not.toHaveTextContent("Remote · Remote");
     expect(within(rows[0]!).getByText("Needs review")).toHaveClass("badge--warning");
     expect(rows[0]).toHaveTextContent("Experience unknown");
     expect(within(rows[0]!).getByText("Shortlisted")).toHaveClass("badge--success");
@@ -123,6 +125,39 @@ describe("job list", () => {
     await user.click(screen.getAllByRole("button", { name: "Clear filters" })[0]!);
     await waitFor(() => expect(Object.fromEntries(seen.at(-1)!)).toEqual({ page: "1", page_size: "25" }));
     server.events.removeAllListeners();
+  });
+
+  it("searches by text: sent to the backend, kept in the URL, cleared with the filters", async () => {
+    const seen: URLSearchParams[] = [];
+    server.events.on("request:start", ({ request }) => {
+      if (new URL(request.url).pathname === "/api/v1/jobs/") seen.push(new URL(request.url).searchParams);
+    });
+    const { user } = setup({
+      jobs: [
+        makeJob(2, { title: "Data Engineer", company: GLOBEX, full_jd: "Spark and Airflow pipelines" }),
+        makeJob(1, { title: "Python Backend Developer", company: ACME, full_jd: "Django REST APIs" }),
+      ],
+    });
+    const table = await screen.findByRole("table", { name: "Jobs" });
+    expect(within(table).getAllByRole("row")).toHaveLength(3);
+
+    const box = screen.getByRole("searchbox", { name: "Search" });
+    await user.type(box, "airflow{Enter}");
+    await waitFor(() => expect(seen.at(-1)?.get("search")).toBe("airflow"));
+    await waitFor(() => expect(within(screen.getByRole("table", { name: "Jobs" })).getAllByRole("row")).toHaveLength(2));
+    expect(screen.getByRole("table", { name: "Jobs" })).toHaveTextContent("Data Engineer");
+    expect(screen.getByText(/1 job/)).toBeInTheDocument();
+
+    await user.click(screen.getAllByRole("button", { name: "Clear filters" })[0]!);
+    // The unfiltered list comes back (from the cache: no new request is needed) and the box is emptied.
+    await waitFor(() => expect(within(screen.getByRole("table", { name: "Jobs" })).getAllByRole("row")).toHaveLength(3));
+    expect(screen.getByRole("searchbox", { name: "Search" })).toHaveValue("");
+    server.events.removeAllListeners();
+  });
+
+  it("restores the search from the URL", async () => {
+    setup({ jobs: [makeJob(1, { title: "Python Backend Developer" })] }, "/jobs?q=python");
+    expect(await screen.findByRole("searchbox", { name: "Search" })).toHaveValue("python");
   });
 
   it("restores filters from the URL and ignores invalid values", async () => {

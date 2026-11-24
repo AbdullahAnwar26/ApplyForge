@@ -160,7 +160,7 @@ def _process_post(index, post, profile, skills):
     return outcome
 
 
-def run_collection(source, keywords=None, profile=None, limit=None):
+def run_collection(source, keywords=None, profile=None, limit=None, *, owner=None):
     """Collect posts from ``source`` and ingest them. Returns CollectionResult.
 
     Raises ``tracker.screening.ScreeningInputError`` for profile problems and
@@ -168,7 +168,7 @@ def run_collection(source, keywords=None, profile=None, limit=None):
     source is used.
     """
     limit = _validate_limit(limit)
-    profile, skills = resolve_profile(profile)
+    profile, skills = resolve_profile(profile, owner=owner)
     if keywords is None:
         keywords = default_keywords(profile)
     keywords = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]

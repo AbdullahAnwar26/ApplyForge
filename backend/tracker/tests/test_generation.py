@@ -195,7 +195,8 @@ class GenerateSuccessTests(GenerationAPITestCase):
         self.assertEqual(app["status"], "GENERATED")
         self.assertEqual(app["generated_subject"], GOOD["subject"])
         self.assertEqual(app["generated_body"], GOOD["body"])
-        self.assertEqual(app["generated_whatsapp_message"], GOOD["whatsapp_message"])
+        # The recipient has no phone number: no WhatsApp draft is kept.
+        self.assertEqual(app["generated_whatsapp_message"], "")
         self.assertIsNotNone(app["generated_at"])
         self.assertIsNone(app["last_error"])
         self.assertIsNone(app["sent_at"])
@@ -229,8 +230,8 @@ class GenerateSuccessTests(GenerationAPITestCase):
     def test_regenerate_replaces_drafts_without_extra_event(self):
         self.generate()
         events_before = ApplicationEvent.objects.count()
-        response, _ = self.generate(json.dumps({**GOOD, "subject": "Second draft"}))
-        self.assertEqual(response.data["application"]["generated_subject"], "Second draft")
+        response, _ = self.generate(json.dumps({**GOOD, "subject": "Second draft: Backend Engineer"}))
+        self.assertEqual(response.data["application"]["generated_subject"], "Second draft: Backend Engineer")
         self.assertEqual(ApplicationEvent.objects.count(), events_before)  # GENERATED -> GENERATED
 
     def test_regenerate_from_reviewed_state_returns_to_generated(self):
@@ -407,3 +408,100 @@ class BuildMessagesUnitTests(GenerationAPITestCase):
         self.assertIn("Dear Hiring Team", user)
         self.assertIn("Location: (not provided)", user)
         self.assertFalse(jd_cut or resume_cut)
+
+class JobSpecificGenerationTests(GenerationAPITestCase):
+    """Job Automation phase 3: JD + profile + resume together, nothing generic or invented."""
+
+    def test_whatsapp_draft_only_with_a_number(self):
+        self.contact.whatsapp = "+91 98765 43210"
+        self.contact.save()
+        response, urlopen = self.generate()
+        self.assertEqual(response.data["application"]["generated_whatsapp_message"], GOOD["whatsapp_message"])
+        user = json.loads(urlopen.call_args.args[0].data)["messages"][1]["content"]
+        self.assertIn("WhatsApp available: yes", user)
+
+    def test_missing_whatsapp_message_is_a_failure_when_a_number_exists(self):
+        self.contact.phone = "+91 98765 43210"
+        self.contact.save()
+        response, _ = self.generate(json.dumps({**GOOD, "whatsapp_message": ""}))
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("WhatsApp", response.data["detail"])
+        self.assertEqual(self.reload().status, "SHORTLISTED")  # no silent fallback
+
+    def test_overlong_whatsapp_message_is_rejected(self):
+        self.contact.whatsapp = "+91 98765 43210"
+        self.contact.save()
+        response, _ = self.generate(json.dumps({**GOOD, "whatsapp_message": "Backend Engineer " * 100}))
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("too long", response.data["detail"])
+
+    def test_generic_draft_is_rejected(self):
+        generic = {"subject": "Job application", "body": "Dear Hiring Team,\n\nPlease consider me.\n\nJane Doe",
+                   "whatsapp_message": ""}
+        response, _ = self.generate(json.dumps(generic))
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("too generic", response.data["detail"])
+        self.assertIn("too generic", self.reload().last_error)
+        self.assertIsNone(self.reload().generated_body)
+
+    def test_company_name_counts_as_job_specific(self):
+        reply = {"subject": "Application to Acme", "body": "Dear Ms Smith,\nI would like to join Acme.\nJane Doe"}
+        response, _ = self.generate(json.dumps(reply))
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_attachment_is_stated_from_the_selected_resume(self):
+        _, urlopen = self.generate()
+        user = json.loads(urlopen.call_args.args[0].data)["messages"][1]["content"]
+        self.assertIn("<attachment>\nA resume is attached: CV\n</attachment>", user)
+        system = json.loads(urlopen.call_args.args[0].data)["messages"][0]["content"]
+        self.assertIn("ONLY if <attachment> says a resume is attached", system)
+
+    def test_gaps_and_unsupported_terms_are_recorded(self):
+        reply = {**GOOD, "body": "Dear Ms Smith,\nI have built Backend Engineer systems with Django and Kubernetes "
+                                 "on AWS.\nJane Doe", "gaps": ["Kubernetes", "  PostgreSQL  ", 42]}
+        response, _ = self.generate(json.dumps(reply))
+        self.assertEqual(response.status_code, 200, response.data)
+        notes = response.data["application"]["generation_notes"]
+        self.assertEqual(notes["gaps"], ["Kubernetes", "PostgreSQL"])
+        # Django is in the profile; Kubernetes and AWS are in neither the profile nor the resume.
+        self.assertEqual(notes["unsupported_terms"], ["aws", "kubernetes"])
+        self.assertEqual(notes["resume"], self.resume.pk)
+        self.assertEqual(notes["resume_name"], "CV")
+
+    def test_incomplete_job_description_is_refused_before_calling_the_model(self):
+        JobOpportunity.objects.filter(pk=self.job.pk).update(jd_complete=False)
+        response, urlopen = self.generate()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("incomplete", str(response.data["job"]))
+        urlopen.assert_not_called()
+
+    def test_inactive_resume_is_refused(self):
+        Resume.objects.filter(pk=self.resume.pk).update(is_active=False)
+        Application.objects.filter(pk=self.app.pk).update(resume=self.resume)
+        response, urlopen = self.generate()
+        self.assertEqual(response.status_code, 400)
+        urlopen.assert_not_called()
+
+    def test_recruiter_name_from_the_post_is_used_for_the_greeting(self):
+        self.contact.name = ""
+        self.contact.save()
+        JobOpportunity.objects.filter(pk=self.job.pk).update(recruiter_name="Riya Fictional")
+        _, urlopen = self.generate()
+        user = json.loads(urlopen.call_args.args[0].data)["messages"][1]["content"]
+        self.assertIn("<recipient>\nName: Riya Fictional", user)
+
+    def test_each_application_gets_its_own_drafts(self):
+        other_job = JobOpportunity.objects.create(
+            title="Data Engineer", full_jd="Data Engineer at Globex. Python and Django pipelines, 3 years.",
+            jd_fingerprint="fp2", company=Company.objects.create(name="Globex"), status=JobStatus.SHORTLISTED)
+        other_job.contacts.add(self.contact)
+        other = Application.objects.create(profile=self.profile, job=other_job, contact=self.contact)
+        self.generate()
+        reply = {"subject": "Data Engineer application", "body": "Dear Ms Smith,\nGlobex data work.\nJane Doe"}
+        with mock.patch(URLOPEN, return_value=ollama_reply(json.dumps(reply))) as urlopen:
+            self.client.post(f"/api/v1/applications/{other.id}/generate/", {}, format="json")
+        user = json.loads(urlopen.call_args.args[0].data)["messages"][1]["content"]
+        self.assertIn("Data Engineer at Globex", user)
+        self.assertNotIn(self.JD, user)
+        self.assertEqual(self.reload().generated_subject, GOOD["subject"])
+        self.assertEqual(Application.objects.get(pk=other.pk).generated_subject, "Data Engineer application")

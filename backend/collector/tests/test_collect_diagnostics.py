@@ -166,8 +166,8 @@ class CommandDiagnosticsTests(TestCase):
         for value in ("Riya Fictional", "Talent Partner", "3h", "commentary"):
             self.assertNotIn(value, log_text)
         self.assertFalse((Path(self.tmp) / "debug").exists())
-        stored = json.dumps([list(j.__dict__.values()) for j in JobOpportunity.objects.all()], default=str)
-        self.assertNotIn("Talent Partner", stored)   # headline is not persisted anywhere
+        # The headline is kept only on the job it belongs to (shown to the user for review).
+        self.assertTrue(JobOpportunity.objects.filter(recruiter_headline__contains="Talent Partner").exists())
 
     def snapshot(self):
         return sorted(

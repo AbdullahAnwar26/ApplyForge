@@ -3,7 +3,8 @@
  * and tracker/generation.py: supported filters (bad values -> 400), optional
  * pagination, create rules (job SHORTLISTED/APPLIED, 409 duplicate), PATCH field
  * whitelist and status rules, drafts locked after sending, SENT -> job APPLIED,
- * events, summary, and generation with configurable failures. No real model.
+ * events and notes, follow-up reminders (default on SENT, cleared on REJECTED, due filter),
+ * summary, and generation with configurable failures. No real model.
  */
 
 import { delay, http, HttpResponse, type HttpHandler } from "msw";
@@ -19,11 +20,20 @@ import type { Call, MockState } from "./mockBackend";
 import { API } from "./server";
 
 const NOW = "2026-03-03T09:00:00Z";
-const AWAITING: ApplicationStatus[] = ["SHORTLISTED", "GENERATED", "OPENED", "READY_TO_SEND", "FAILED", "FOLLOW_UP"];
+const AWAITING: ApplicationStatus[] = ["SHORTLISTED", "GENERATED", "OPENED", "READY_TO_SEND", "FAILED", "FOLLOW_UP", "INTERVIEW", "OFFER"];
 const PRE_SEND: ApplicationStatus[] = ["SHORTLISTED", "GENERATED", "OPENED", "READY_TO_SEND", "SKIPPED", "FAILED"];
-const POST_SEND: ApplicationStatus[] = ["SENT", "FOLLOW_UP", "REJECTED"];
+const POST_SEND: ApplicationStatus[] = ["SENT", "FOLLOW_UP", "INTERVIEW", "OFFER", "REJECTED"];
+const REQUIRES_SENT: ApplicationStatus[] = ["FOLLOW_UP", "INTERVIEW", "OFFER", "REJECTED"];
+const FOLLOW_UP_OPEN: ApplicationStatus[] = ["SENT", "FOLLOW_UP", "INTERVIEW", "OFFER"];
+/** "Today" for the fake backend (matches NOW); reminders on or before it are due. */
+export const MOCK_TODAY = "2026-03-03";
+/** NOW + 7 days: the default reminder the backend sets when an application is marked SENT. */
+export const MOCK_DEFAULT_FOLLOW_UP = "2026-03-10";
+/** Like the backend: due on and after the client's `today` (else MOCK_TODAY), while still open. */
+const isDue = (a: ApplicationDetail, today: string | null = null) =>
+  a.follow_up_on !== null && a.follow_up_on <= (today ?? MOCK_TODAY) && FOLLOW_UP_OPEN.includes(a.status);
 const GENERATABLE: ApplicationStatus[] = ["SHORTLISTED", "GENERATED", "OPENED", "READY_TO_SEND", "FAILED"];
-const UPDATABLE = ["status", "channel", "contact", "resume", "note", "generated_subject", "generated_body", "generated_whatsapp_message"];
+const UPDATABLE = ["status", "channel", "contact", "resume", "note", "follow_up_on", "generated_subject", "generated_body", "generated_whatsapp_message"];
 const DRAFTS = ["generated_subject", "generated_body", "generated_whatsapp_message"] as const;
 
 export type GenerationMode = "ok" | 503 | 504 | 502 | 422 | 409 | 429;
@@ -57,10 +67,12 @@ export function makeApplication(id: number, overrides: Partial<ApplicationDetail
     generated_at: null,
     opened_at: null,
     sent_at: null,
+    follow_up_on: null,
     updated_at: NOW,
     generated_body: null,
     generated_whatsapp_message: null,
     last_error: null,
+    generation_notes: {},
     ...overrides,
   };
 }
@@ -82,8 +94,8 @@ export function applicationHandlers(
   nextId: () => number,
 ): HttpHandler[] {
   const find = (id: unknown) => state.applications.find((a) => a.id === Number(id));
-  const addEvent = (id: number, status: ApplicationStatus, notes: string) => {
-    const event: ApplicationEvent = { id: nextId(), status, notes, timestamp: `2026-03-03T09:${String(state.events[id]?.length ?? 0).padStart(2, "0")}:00Z` };
+  const addEvent = (id: number, status: ApplicationStatus, notes: string, kind: ApplicationEvent["kind"] = "STATUS") => {
+    const event: ApplicationEvent = { id: nextId(), kind, status, notes, timestamp: `2026-03-03T09:${String(state.events[id]?.length ?? 0).padStart(2, "0")}:00Z` };
     state.events[id] = [event, ...(state.events[id] ?? [])];
   };
   const sent = (a: ApplicationDetail) => a.sent_at !== null || POST_SEND.includes(a.status);
@@ -109,6 +121,7 @@ export function applicationHandlers(
     http.get(`${API}/applications/summary/`, ({ request }) => {
       record(request);
       const profile = new URL(request.url).searchParams.get("profile");
+      const today = new URL(request.url).searchParams.get("today");
       const apps = state.applications.filter((a) => !profile || a.profile === Number(profile));
       const by_status = Object.fromEntries(APPLICATION_STATUSES.map((s) => [s, apps.filter((a) => a.status === s).length]));
       const awaiting = apps.filter((a) => AWAITING.includes(a.status));
@@ -116,6 +129,11 @@ export function applicationHandlers(
         total: apps.length,
         by_status,
         awaiting_action: { count: awaiting.length, statuses: AWAITING, oldest: awaiting.slice(0, 10).map(toSummary) },
+        sent_total: apps.filter((a) => a.sent_at !== null).length,
+        follow_ups_due: {
+          count: apps.filter((a) => isDue(a, today)).length,
+          items: apps.filter((a) => isDue(a, today)).sort((x, y) => (x.follow_up_on ?? "").localeCompare(y.follow_up_on ?? "")).slice(0, 10).map(toSummary),
+        },
         recent: apps.slice(0, 10).map(toSummary),
       });
     }),
@@ -145,6 +163,7 @@ export function applicationHandlers(
       const awaiting = q.get("awaiting_action");
       if (awaiting === "true") apps = apps.filter((a) => AWAITING.includes(a.status));
       if (awaiting === "false") apps = apps.filter((a) => !AWAITING.includes(a.status));
+      if (q.get("follow_up_due") === "true") apps = apps.filter((a) => isDue(a, q.get("today")));
 
       const items = apps.map(toSummary);
       if (!q.has("page") && !q.has("page_size")) return HttpResponse.json(items);
@@ -213,13 +232,16 @@ export function applicationHandlers(
       if (problem) return problem;
       const target = body.status as ApplicationStatus | undefined;
       if (target && target !== app.status) {
-        if (target === "GENERATED" || target === "FAILED") return bad("status", `${target} is set by content generation, not manually.`);
-        if ((target === "FOLLOW_UP" || target === "REJECTED") && !sent(app)) return bad("status", `${target} is only allowed after the application was sent.`);
+        if (target === "GENERATED" || target === "FAILED") return bad("status", `${target} is set by ApplyForge (generation or sending), not manually.`);
+        if (REQUIRES_SENT.includes(target) && !sent(app)) return bad("status", `${target} is only allowed after the application was sent.`);
         if (sent(app) && PRE_SEND.includes(target)) return bad("status", `The application was already sent; it cannot move back to ${target}.`);
+      }
+      if ("follow_up_on" in body && body.follow_up_on !== null && !/^\d{4}-\d{2}-\d{2}$/.test(String(body.follow_up_on))) {
+        return bad("follow_up_on", "Date has wrong format. Use one of these formats instead: YYYY-MM-DD.");
       }
       if (DRAFTS.some((f) => f in body) && sent(app)) return bad("non_field_errors", "Drafts of an application that was already sent cannot be edited.");
 
-      for (const field of ["contact", "resume", "channel", ...DRAFTS] as const) {
+      for (const field of ["contact", "resume", "channel", "follow_up_on", ...DRAFTS] as const) {
         if (field in body) (app as unknown as Record<string, unknown>)[field] = body[field];
       }
       if (target && target !== app.status) {
@@ -232,9 +254,22 @@ export function applicationHandlers(
           if (job) job.status = "APPLIED";
           app.job.status = "APPLIED";
         }
+        if (target === "SENT" && !app.follow_up_on) app.follow_up_on = MOCK_DEFAULT_FOLLOW_UP;
+        if (target === "REJECTED") app.follow_up_on = null;
         addEvent(app.id, target, (body.note as string) || `Status changed from ${old} to ${target}.`);
       }
       return HttpResponse.json(app);
+    }),
+    http.post(`${API}/applications/:id/notes/`, async ({ request, params }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      record(request, { body });
+      await delay(options.writeDelay);
+      const app = find(params.id);
+      if (!app) return HttpResponse.json({ detail: "Not found." }, { status: 404 });
+      const note = typeof body.note === "string" ? body.note.trim() : "";
+      if (!note) return bad("note", "This field may not be blank.");
+      addEvent(app.id, app.status, note, "NOTE");
+      return HttpResponse.json(state.events[app.id]![0], { status: 201 });
     }),
     http.post(`${API}/applications/:id/generate/`, async ({ request, params }) => {
       const text = await request.text();

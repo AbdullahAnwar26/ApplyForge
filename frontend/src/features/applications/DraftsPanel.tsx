@@ -20,7 +20,7 @@ import {
   type ApplicationUpdate,
 } from "../../api/applications";
 import type { ApplicationDetail, GenerationResult } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { Button } from "../../components/Button";
 import { CopyButton } from "../../components/CopyButton";
 import { ConfirmDialog } from "../../components/Dialog";
@@ -251,6 +251,34 @@ function DraftEditor({ application, onDirtyChange }: { application: ApplicationD
   );
 }
 
+/** What the last generation could not claim, and terms to double-check (never blocking). */
+function GenerationNotesView({ application }: { application: ApplicationDetail }) {
+  const notes = application.generation_notes ?? {};
+  const gaps = notes.gaps ?? [];
+  const unsupported = notes.unsupported_terms ?? [];
+  if (!application.generated_at || (!gaps.length && !unsupported.length && !notes.resume_name)) return null;
+  return (
+    <div className="generation-notes">
+      {notes.resume_name && (
+        <p className="muted small">
+          Written from this job's description, your profile and the resume “{notes.resume_name}”.
+        </p>
+      )}
+      {unsupported.length > 0 && (
+        <p className="notice notice--warning" role="note">
+          Check before sending: the draft mentions <strong>{unsupported.join(", ")}</strong>, which your profile and resume do
+          not mention. Remove it unless it is true.
+        </p>
+      )}
+      {gaps.length > 0 && (
+        <p className="muted small">
+          Not claimed (not in your profile or resume): {gaps.join(", ")}.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function DraftsPanel({ application }: { application: ApplicationDetail }) {
   const [dirty, setDirty] = useState(false);
   const hasDrafts = DRAFT_FIELDS.some((field) => fromApplication(application)[field]);
@@ -261,12 +289,13 @@ export function DraftsPanel({ application }: { application: ApplicationDetail })
           Draft
         </h2>
         <p className="panel__subtitle">
-          Review every line before using it. Copy the parts you need and send them yourself - ApplyForge never sends
-          anything.
+          Review every line and edit anything you want. Approve and send it below - nothing is sent without your
+          confirmation.
           {application.generated_at && <> Last generated {formatDateTime(application.generated_at)}.</>}
         </p>
       </div>
       <GenerateControl application={application} hasDrafts={hasDrafts} dirty={dirty} />
+      <GenerationNotesView application={application} />
       {/* A successful generation (new generated_at) resets the editor to the new draft. */}
       <DraftEditor
         key={`${application.id}:${application.generated_at ?? "none"}`}

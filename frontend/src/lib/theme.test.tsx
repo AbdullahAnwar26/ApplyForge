@@ -37,15 +37,15 @@ describe("theme", () => {
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("system");
   });
 
-  it("applies a remembered theme on load, including on the Connect screen", () => {
+  it("applies a remembered theme on load, including on the sign-in page", () => {
     window.localStorage.setItem(THEME_STORAGE_KEY, "dark");
-    renderApp({ connected: false });
+    renderApp({ signedIn: false });
     expect(document.documentElement.dataset.theme).toBe("dark");
   });
 
   it("ignores an unknown stored value", () => {
     window.localStorage.setItem(THEME_STORAGE_KEY, "neon");
-    renderApp({ connected: false });
+    renderApp({ signedIn: false });
     expect(document.documentElement.dataset.theme).toBeUndefined();
   });
 

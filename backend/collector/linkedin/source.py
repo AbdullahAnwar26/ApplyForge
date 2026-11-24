@@ -20,6 +20,7 @@ A keyword with genuinely no results is not an error.
 """
 
 import logging
+import threading
 
 from django.conf import settings
 
@@ -58,6 +59,9 @@ class _PartialCollection(Exception):
         self.posts = posts
         self.error = error
 
+
+# Results are exhausted when this many scrolls in a row add no new post.
+EXHAUSTED_AFTER_IDLE_SCROLLS = 3
 
 LOGIN_HELP = "The LinkedIn session is missing or expired. Run `python manage.py linkedin_login` and log in."
 CHECKPOINT_HELP = (
@@ -132,6 +136,69 @@ class LinkedInPostSource:
         self.inventory_paths.append(path)
         logger.info("Inventory-only report saved: %s", path)
         return path
+
+    def stream_posts(self, keywords, *, date_posted=None, stop=None, on_stage=None, max_scrolls=None):
+        """Progressive collection: yield each new post as soon as it is read.
+
+        For the background collection runner (collector.progressive), which calls this
+        in a thread of its own: nothing here touches the database, so Playwright's
+        event loop never overlaps database access. Keeps scrolling (and clicking
+        "Show more results") until ``stop`` is set, the scroll budget is used up, or
+        the results are exhausted (several scrolls in a row add nothing new).
+        Errors raise ``SourceError`` subclasses after the posts already yielded.
+        """
+        stop = stop or threading.Event()
+        report = on_stage or (lambda text: None)
+        budget = self.max_scrolls if max_scrolls is None else max_scrolls
+        seen = set()
+        report("Opening LinkedIn")
+        with self.browser_factory() as browser:
+            for keyword in keywords:
+                if stop.is_set():
+                    return
+                yield from self._stream_keyword(browser, keyword, date_posted, stop, report, budget, seen)
+
+    def _stream_keyword(self, browser, keyword, date_posted, stop, report, budget, seen):
+        report(f"Searching posts for “{keyword}”")
+        snapshot = browser.goto(S.content_search_url(keyword, date_posted))
+        if self._check_state(snapshot, keyword) is PageState.NO_RESULTS:
+            logger.info("No posts found for keyword %r", keyword)
+            return
+        scrolls, idle = 0, 0
+        while not stop.is_set():
+            browser.expand_see_more()
+            snapshot = browser.snapshot()
+            state = self._check_state(snapshot, keyword)  # session can expire mid-run
+            posts = extract_posts(snapshot.html) if state is PageState.RESULTS else []
+            if any(p.truncated and post_key(p) not in seen for p in posts):
+                # One more expansion pass for posts whose "… more" did not open yet.
+                browser.expand_see_more()
+                snapshot = browser.snapshot()
+                posts = extract_posts(snapshot.html) if state is PageState.RESULTS else posts
+            new_posts = []
+            for post in posts:
+                key = post_key(post)
+                if key not in seen:
+                    seen.add(key)
+                    new_posts.append(post)
+            for post in new_posts:
+                if stop.is_set():
+                    return
+                yield post
+            idle = 0 if new_posts else idle + 1
+            if idle >= EXHAUSTED_AFTER_IDLE_SCROLLS:
+                logger.info("Keyword %r: no more results after %s scroll(s)", keyword, scrolls)
+                report(f"No more results for “{keyword}”")
+                return
+            if scrolls >= budget:
+                logger.info("Keyword %r: scroll budget (%s) used", keyword, budget)
+                return
+            if stop.is_set():
+                return
+            report(f"Loading more results for “{keyword}” (page {scrolls + 2})")
+            if not browser.load_more_results():
+                browser.scroll()
+            scrolls += 1
 
     # -- internals ----------------------------------------------------------------
     def _maybe_capture_inventory(self, html, keyword):

@@ -36,11 +36,28 @@ npm install
 npm run dev
 ```
 
+## Job Automation
+
+Open **Job Automation** in the app: enter a search (e.g. *Python Backend Developer*), choose the
+date range and how many jobs you want, and start collecting. Progress is live and the collection
+can be cancelled or continued. Then review the jobs (contact details are shown with the line of the
+post they came from), select the ones to apply to, generate a personalised email and WhatsApp
+message for each with the local model, approve, and send. **Send Email** saves the email, with
+your resume attached, as a draft in your own mailbox (Account -> Email sending: an app password for
+Gmail/Outlook/Yahoo, IMAP enabled) and opens your Drafts; you check it and press Send there (or
+download it as an `.eml` file for Outlook/Thunderbird). **Send WhatsApp** opens WhatsApp with the
+message; attach the downloaded resume and send. An application becomes *Sent* only when ApplyForge
+finds the email in your Sent folder or you confirm. For local testing set
+`EMAIL_BACKEND=django.core.mail.backends.filebased.EmailBackend` so nothing leaves your machine
+(drafts then go to a local test mailbox folder).
+
 ## Configuration
 
 Copy `.env.example` to `.env` in the project root and fill in the values for your environment. Never commit the actual `.env` file to version control.
 
-The root `.env` is for **local development only**. With `DEBUG` unset or false, the backend refuses to start without a real `SECRET_KEY`, `API_TOKEN` and `DATABASE_URL`.
+The root `.env` is for **local development only**. With `DEBUG` unset or false, the backend refuses to start without a real `SECRET_KEY` and `DATABASE_URL`.
+
+**Accounts.** Open the app and choose *Create an account*. Each account sees only its own profiles, jobs and applications. The first account created receives any data that existed before accounts (or run `python manage.py claim_unowned_data <username>`). Set `SIGNUP_ENABLED=False` once everyone who needs an account has one.
 
 ## Deployment
 

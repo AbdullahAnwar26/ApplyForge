@@ -53,14 +53,19 @@ class ScreeningInputError(Exception):
 # Profile selection
 # ---------------------------------------------------------------------------
 
-def select_profile(profile=None):
-    """Return ``profile``, or the only existing profile when it is None.
+def select_profile(profile=None, *, owner=None):
+    """Return ``profile``, or ``owner``'s only profile when it is None.
 
-    Zero or several profiles without an explicit choice is an error.
+    Zero or several profiles without an explicit choice is an error. A profile of
+    another account is treated as not found (accounts milestone). ``owner=None`` is
+    the pool of data created before accounts (no owner); the API always passes the
+    signed-in user and ``collect_linkedin`` always resolves an account.
     """
     if profile is not None:
+        if profile.owner_id != getattr(owner, "pk", None):
+            raise ScreeningInputError("profile", "Profile not found.")
         return profile
-    profiles = list(Profile.objects.order_by("id")[:2])
+    profiles = list(Profile.objects.filter(owner=owner).order_by("id")[:2])
     if not profiles:
         raise ScreeningInputError("profile", "No profile exists. Create a profile first.")
     if len(profiles) > 1:
@@ -70,12 +75,12 @@ def select_profile(profile=None):
     return profiles[0]
 
 
-def resolve_profile(profile=None):
+def resolve_profile(profile=None, *, owner=None):
     """Return ``(profile, skills)`` for screening.
 
     Uses ``select_profile``; the profile must have at least one skill.
     """
-    profile = select_profile(profile)
+    profile = select_profile(profile, owner=owner)
     skills = list(profile.skills.order_by("id"))
     if not skills:
         raise ScreeningInputError(
@@ -225,7 +230,7 @@ def parse_experience(field_text, jd_text):
 # ---------------------------------------------------------------------------
 
 def find_duplicate_candidates(job):
-    """Other jobs with the same normalized title AND same company or a shared contact."""
+    """The same owner's other jobs with the same normalized title AND same company or a shared contact."""
     company_name = job.company.normalized_name if job.company_id else None
     contact_ids = set(job.contacts.values_list("id", flat=True))
     conditions = []
@@ -237,7 +242,7 @@ def find_duplicate_candidates(job):
         return []
 
     candidates = (
-        JobOpportunity.objects.filter(normalized_title=job.normalized_title)
+        JobOpportunity.objects.filter(owner_id=job.owner_id, normalized_title=job.normalized_title)
         .exclude(pk=job.pk)
         .filter(reduce(or_, conditions))
         .distinct()

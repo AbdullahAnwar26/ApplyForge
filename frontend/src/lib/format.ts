@@ -28,6 +28,20 @@ export function formatDateTime(iso: string | null | undefined): string {
   return Number.isNaN(date.getTime()) ? "—" : dateTimeFormat.format(date);
 }
 
+/** Company · location · work mode, without repeating a value (e.g. "Remote · Remote"). */
+export function placeLine(job: {
+  company: { name: string } | null;
+  location?: string | null;
+  work_mode?: string | null;
+}): string {
+  const parts: string[] = [];
+  for (const part of [job.company?.name, job.location, job.work_mode]) {
+    const value = part?.trim();
+    if (value && !parts.some((p) => p.toLowerCase() === value.toLowerCase())) parts.push(value);
+  }
+  return parts.join(" · ");
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;

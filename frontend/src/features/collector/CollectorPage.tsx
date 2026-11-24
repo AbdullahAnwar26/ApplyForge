@@ -1,8 +1,7 @@
 /**
- * Collector: start a confirmed run (StartRunPanel) and read the run history.
- * Loading this page only READS history (GET collector/runs/). History is cached
- * and refreshed only by the "Refresh" button or after a run finishes - no polling,
- * nothing on focus, and nothing here can start a run without the confirmation.
+ * Collection history (GET collector/runs/). Collections are started from Job
+ * Automation; this page only reads. Refreshed by the "Refresh" button or after a run
+ * finishes - no polling here.
  */
 
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -19,7 +18,7 @@ import {
   type CollectorRunTrigger,
   type Profile,
 } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { DataTable, type Column } from "../../components/DataTable";
@@ -30,7 +29,6 @@ import { formatDateTime } from "../../lib/format";
 import { COLLECTOR_RUN_STATUS } from "../../lib/labels";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
-import { StartRunPanel } from "./StartRunPanel";
 
 const TRIGGER_LABEL: Record<CollectorRunTrigger, string> = { command: "Command line", api: "This app" };
 
@@ -127,17 +125,20 @@ function RunHistory({ profile }: { profile: Profile }) {
     { key: "status", header: "Status", render: (run) => <StatusBadge kind="collector" value={run.status} /> },
     {
       key: "keywords",
-      header: "Keywords",
-      render: (run) => (run.keywords.length ? <span className="clamp">{run.keywords.join(", ")}</span> : <span className="muted">—</span>),
+      header: "Search",
+      render: (run) => {
+        const text = run.search_query || run.keywords.join(", ");
+        return text ? <span className="clamp">{text}</span> : <span className="muted">—</span>;
+      },
     },
-    { key: "limit", header: "Limit", numeric: true, render: (run) => run.limit ?? "—" },
+    { key: "limit", header: "Jobs wanted", numeric: true, render: (run) => run.limit ?? "—" },
     {
       key: "result",
       header: "Result",
       render: (run) =>
         typeof run.counts.found === "number" ? (
           <span>
-            {run.counts.created ?? 0} new · {run.counts.existing ?? 0} known · {run.counts.found} read
+            {run.counts.created ?? 0} new · {run.counts.existing ?? 0} duplicates · {run.counts.found} checked
           </span>
         ) : (
           <span className="muted">—</span>
@@ -176,7 +177,20 @@ function RunHistory({ profile }: { profile: Profile }) {
 
   return (
     <>
-      <StartRunPanel profile={profile} runningRun={runningRun} onRefresh={refresh} />
+      <section className="panel" aria-labelledby="start-title">
+        <h2 id="start-title" className="panel__title">
+          Collect jobs
+        </h2>
+        <p className="panel__subtitle">
+          Collections are started from <Link to="/automation">Job Automation</Link>, where you choose the search, the date range
+          and how many jobs you want, and follow the progress.
+        </p>
+        {runningRun && (
+          <p className="notice notice--info" role="note">
+            Collection <Link to={`/collector/runs/${runningRun.id}`}>#{runningRun.id}</Link> is running now.
+          </p>
+        )}
+      </section>
       <section className="panel" aria-labelledby="history-title">
         <div className="panel__header">
           <div>
@@ -220,8 +234,8 @@ export function CollectorPage() {
   return (
     <>
       <PageHeader
-        title="Collector"
-        description="LinkedIn collection runs. Each run is started by you, after confirmation, and runs on the backend machine."
+        title="Collections"
+        description="Every LinkedIn collection: what it searched for, how far it got, and each post it checked."
       />
       <RequireProfile>{profile && <RunHistory key={profile.id} profile={profile} />}</RequireProfile>
     </>

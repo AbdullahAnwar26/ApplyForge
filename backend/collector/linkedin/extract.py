@@ -8,6 +8,7 @@ synthetic pages.
 """
 
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from urllib.parse import unquote, urlsplit
@@ -421,12 +422,28 @@ def extract_posts(html, now=None):
     posts, seen = [], set()
     for container in containers:
         post = build(container, now)
+        if _still_collapsed(container):
+            post = replace(post, truncated=True)
         key = post_key(post)
         if key in seen:
             continue
         seen.add(key)
         posts.append(post)
     return posts
+
+
+# An unexpanded "… more" control inside THIS post (legacy or current layout).
+_COLLAPSED_CONTROL = (
+    ".//button[contains(concat(' ', normalize-space(@class), ' '),"
+    " ' feed-shared-inline-show-more-text__see-more-less-toggle ') and not(@aria-expanded='true')]"
+    " | .//p//button[not(@data-view-name) and not(@aria-haspopup) and not(@aria-expanded='true')"
+    " and (@aria-hidden='true' or starts-with(normalize-space(.), '…'))]"
+)
+
+
+def _still_collapsed(container):
+    """True when the post still shows its "… more" control, i.e. its text is cut off."""
+    return bool(container.xpath(_COLLAPSED_CONTROL))
 
 
 def post_key(post):

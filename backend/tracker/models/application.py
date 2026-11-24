@@ -15,6 +15,14 @@ class ApplicationStatus(models.TextChoices):
     REJECTED = 'REJECTED', 'Rejected'
     FAILED = 'FAILED', 'Failed'
     FOLLOW_UP = 'FOLLOW_UP', 'Follow-up'
+    # After sending: the employer replied with an interview, or made an offer.
+    INTERVIEW = 'INTERVIEW', 'Interviewing'
+    OFFER = 'OFFER', 'Offer'
+    # Sending through a connected provider failed; the drafts are kept and it can be retried.
+    SEND_FAILED = 'SEND_FAILED', 'Sending failed'
+    # The message was opened in the user's own email app / WhatsApp for them to send it there.
+    # Never means sent: SENT follows only a Sent-folder match or the user's confirmation.
+    COMPOSE_OPENED = 'COMPOSE_OPENED', 'Opened to send'
 
 
 class ApplicationChannel(models.TextChoices):
@@ -97,10 +105,19 @@ class Application(models.Model):
         null=True,
     )
 
+    # What the last generation could not support from the profile/resume, and terms the
+    # draft mentions that the profile/resume do not (see tracker.generation):
+    # {"gaps": [str], "unsupported_terms": [str], "model": str, "resume": int}
+    generation_notes = models.JSONField(default=dict, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     generated_at = models.DateTimeField(blank=True, null=True)
     opened_at = models.DateTimeField(blank=True, null=True)
     sent_at = models.DateTimeField(blank=True, null=True)
+    # Follow-up reminder: the day the user wants to act on this application again
+    # (chase a reply, prepare for an interview...). Due on and after that day.
+    # Defaulted when the application is marked SENT. Nothing is ever sent.
+    follow_up_on = models.DateField(blank=True, null=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -109,6 +126,11 @@ class Application(models.Model):
 
     def __str__(self):
         return f"Application for {self.job.title} ({self.status})"
+
+
+class ApplicationEventKind(models.TextChoices):
+    STATUS = 'STATUS', 'Status change'
+    NOTE = 'NOTE', 'Note'
 
 
 class ApplicationEvent(models.Model):
@@ -126,6 +148,14 @@ class ApplicationEvent(models.Model):
     notes = models.TextField(
         blank=True,
         null=True,
+    )
+
+    # STATUS: a status change (``status`` is the new status). NOTE: a note the user
+    # added without changing the status (``status`` is the status at that time).
+    kind = models.CharField(
+        max_length=10,
+        choices=ApplicationEventKind.choices,
+        default=ApplicationEventKind.STATUS,
     )
 
     timestamp = models.DateTimeField(auto_now_add=True)

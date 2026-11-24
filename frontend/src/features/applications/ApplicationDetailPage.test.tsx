@@ -6,7 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import { allowedStatusChanges } from "../../api/applications";
 import type { ApplicationDetail, Contact, JobDetail, Skill } from "../../api/types";
 import { ACTIVE_PROFILE_STORAGE_KEY } from "../../profile/ActiveProfileProvider";
-import { GENERATED_DRAFT, makeApplication } from "../../test/mockApplications";
+import { GENERATED_DRAFT, MOCK_DEFAULT_FOLLOW_UP, makeApplication } from "../../test/mockApplications";
+import { addDays, localToday } from "../../api/applications";
 import { createMockBackend, makeResume } from "../../test/mockBackend";
 import { makeJob } from "../../test/mockJobs";
 import { makeProfile, renderApp } from "../../test/renderApp";
@@ -42,7 +43,7 @@ function setup(initial: Parameters<typeof createMockBackend>[0] = {}, path = "/a
     resumes: [makeResume(5, 1, { name: "Backend CV", is_default: true }), makeResume(6, 1, { name: "Data CV" })],
     applications: [app()],
     events: {
-      50: [{ id: 2, status: "SHORTLISTED", notes: "Application created.", timestamp: "2026-03-01T09:00:00Z" }],
+      50: [{ id: 2, kind: "STATUS", status: "SHORTLISTED", notes: "Application created.", timestamp: "2026-03-01T09:00:00Z" }],
     },
     ...initial,
   });
@@ -61,8 +62,8 @@ describe("application detail", () => {
       applications: [app({ status: "OPENED", opened_at: "2026-03-02T10:00:00Z", last_error: "Ollama did not respond within 180 seconds." })],
       events: {
         50: [
-          { id: 3, status: "OPENED", notes: "Status changed from SHORTLISTED to OPENED.", timestamp: "2026-03-02T10:00:00Z" },
-          { id: 2, status: "SHORTLISTED", notes: "Application created.", timestamp: "2026-03-01T09:00:00Z" },
+          { id: 3, kind: "STATUS", status: "OPENED", notes: "Status changed from SHORTLISTED to OPENED.", timestamp: "2026-03-02T10:00:00Z" },
+          { id: 2, kind: "STATUS", status: "SHORTLISTED", notes: "Application created.", timestamp: "2026-03-01T09:00:00Z" },
         ],
       },
     });
@@ -272,7 +273,9 @@ describe("status", () => {
   it("offers only the changes the backend accepts", () => {
     expect(allowedStatusChanges({ status: "SHORTLISTED", sent_at: null })).toEqual(["OPENED", "READY_TO_SEND", "SENT", "SKIPPED"]);
     expect(allowedStatusChanges({ status: "GENERATED", sent_at: null })).toEqual(["SHORTLISTED", "OPENED", "READY_TO_SEND", "SENT", "SKIPPED"]);
-    expect(allowedStatusChanges({ status: "SENT", sent_at: "x" })).toEqual(["FOLLOW_UP", "REJECTED"]);
+    expect(allowedStatusChanges({ status: "SENT", sent_at: "x" })).toEqual(["FOLLOW_UP", "INTERVIEW", "OFFER", "REJECTED"]);
+    expect(allowedStatusChanges({ status: "INTERVIEW", sent_at: "x" })).toEqual(["FOLLOW_UP", "OFFER", "REJECTED"]);
+    expect(allowedStatusChanges({ status: "OFFER", sent_at: "x" })).toEqual(["FOLLOW_UP", "INTERVIEW", "REJECTED"]);
     expect(allowedStatusChanges({ status: "SKIPPED", sent_at: null })).toEqual(["SHORTLISTED", "OPENED", "READY_TO_SEND", "SENT"]);
   });
 
@@ -282,15 +285,15 @@ describe("status", () => {
     expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Choose…",
       "Opened",
-      "Ready to send",
+      "Approved",
       "Sent (I sent it myself)",
       "Skipped",
     ]);
-    await user.selectOptions(select, "Ready to send");
+    await user.selectOptions(select, "Approved");
     await user.type(screen.getByLabelText(/^Note/), "Reviewed the draft");
     await user.click(screen.getByRole("button", { name: "Update status" }));
 
-    expect(await screen.findByText("Status: Ready to send")).toBeInTheDocument();
+    expect(await screen.findByText("Status: Approved")).toBeInTheDocument();
     expect(backend.writes("PATCH", "applications/50/")[0]!.body).toEqual({ status: "READY_TO_SEND", note: "Reviewed the draft" });
     expect(await within(panel("History")).findByText("Reviewed the draft")).toBeInTheDocument();
   });
@@ -352,11 +355,24 @@ describe("contact, channel and resume", () => {
 describe("creating an application from a job", () => {
   const jobPage = "/jobs/7";
 
-  it("asks to shortlist the job first", async () => {
-    setup({ applications: [], jobs: [{ ...JOB, status: "DISCOVERED" }] }, jobPage);
+  it("asks to shortlist the job first, in one click", async () => {
+    const { backend, user } = setup({ applications: [], jobs: [{ ...JOB, status: "DISCOVERED" }] }, jobPage);
     const section = await screen.findByRole("region", { name: "Application" });
-    expect(await within(section).findByText(/to start an application for this job/)).toBeInTheDocument();
+    expect(await within(section).findByText(/Applications are for jobs you have shortlisted/)).toBeInTheDocument();
     expect(within(section).queryByRole("button", { name: "Create application" })).not.toBeInTheDocument();
+    await user.click(within(section).getByRole("button", { name: "Shortlist this job" }));
+    // The job is shortlisted (only its status is sent) and the create form appears in place.
+    expect(await within(section).findByRole("button", { name: "Create application" })).toBeInTheDocument();
+    const patches = backend.writes("PATCH", "jobs/7/");
+    expect(patches.map((c) => c.body)).toEqual([{ status: "SHORTLISTED" }]);
+    expect(backend.writes("POST", "applications/")).toHaveLength(0); // creating is still a separate, explicit click
+  });
+
+  it("offers to shortlist a skipped job again", async () => {
+    setup({ applications: [], jobs: [{ ...JOB, status: "SKIPPED" }] }, jobPage);
+    const section = await screen.findByRole("region", { name: "Application" });
+    expect(await within(section).findByText(/You skipped this job/)).toBeInTheDocument();
+    expect(within(section).getByRole("button", { name: "Shortlist this job" })).toBeInTheDocument();
   });
 
   it("creates the application, opens it, and does not generate", async () => {
@@ -413,5 +429,95 @@ describe("creating an application from a job", () => {
     await act(async () => create.click());
     await screen.findByRole("button", { name: "Generate draft" });
     expect(backend.writes("POST", "applications/")).toHaveLength(1);
+  });
+});
+
+describe("after sending: interview, offer, follow-up reminder", () => {
+  const sentApp = (overrides: Partial<ApplicationDetail> = {}) =>
+    app({ status: "SENT", sent_at: "2026-03-01T09:00:00Z", ...SAVED_DRAFT, ...overrides });
+
+  it("records an interview and then an offer, each in the history", async () => {
+    const { backend, user } = setup({ applications: [sentApp()] });
+    const select = await screen.findByLabelText("Change status");
+    expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Choose…",
+      "Follow-up",
+      "Interviewing",
+      "Offer",
+      "Rejected",
+    ]);
+    await user.selectOptions(select, "Interviewing");
+    await user.type(screen.getByLabelText(/^Note/), "Technical round on Monday");
+    await user.click(screen.getByRole("button", { name: "Update status" }));
+    await waitFor(() => expect(within(panel("Overview")).getAllByText("Interviewing").length).toBeGreaterThan(0));
+    const history = panel("History");
+    expect(await within(history).findByText("Technical round on Monday")).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("Change status"), "Offer");
+    await user.click(screen.getByRole("button", { name: "Update status" }));
+    await waitFor(() => expect(backend.state.applications[0]!.status).toBe("OFFER"));
+    expect(backend.writes("PATCH", "applications/50/").map((c) => c.body)).toEqual([
+      { status: "INTERVIEW", note: "Technical round on Monday" },
+      { status: "OFFER" },
+    ]);
+  });
+
+  it("sets the default reminder when the application is marked sent", async () => {
+    const { backend, user } = setup({ applications: [app({ status: "READY_TO_SEND", ...SAVED_DRAFT })] });
+    await user.selectOptions(await screen.findByLabelText("Change status"), "Sent (I sent it myself)");
+    await user.click(screen.getByRole("button", { name: "Update status" }));
+    await user.click(await screen.findByRole("button", { name: "Yes, I sent it" }));
+    // The browser's own day + 7 is sent with the status change.
+    const expected = addDays(localToday(), 7);
+    await waitFor(() => expect(backend.state.applications[0]!.follow_up_on).toBe(expected));
+    expect(await screen.findByLabelText("Remind me on")).toHaveValue(expected);
+    expect(backend.writes("PATCH", "applications/50/").at(-1)?.body).toMatchObject({ status: "SENT", follow_up_on: expected });
+    expect(MOCK_DEFAULT_FOLLOW_UP).toBe("2026-03-10"); // the server-side fallback is only for clients that send no date
+  });
+
+  it("shows an overdue reminder, lets the user move it and clear it - without writing history", async () => {
+    const yesterday = addDays(localToday(), -1);
+    const { backend, user } = setup({ applications: [sentApp({ follow_up_on: yesterday })] });
+    const reminder = await screen.findByRole("group", { name: "Follow-up reminder" });
+    expect(within(reminder).getByText(/^Due since/)).toBeInTheDocument();
+
+    await user.click(within(reminder).getByRole("button", { name: "In 7 days" }));
+    expect(within(reminder).getByLabelText("Remind me on")).toHaveValue(addDays(localToday(), 7));
+    await user.click(within(reminder).getByRole("button", { name: "Save reminder" }));
+    await waitFor(() => expect(backend.state.applications[0]!.follow_up_on).toBe(addDays(localToday(), 7)));
+    const moved = await screen.findByRole("group", { name: "Follow-up reminder" });
+    expect(within(moved).queryByText(/^Due (since|today)/)).not.toBeInTheDocument();
+    expect(within(moved).getByText(/^Next:/)).toBeInTheDocument();
+
+    await user.click(within(moved).getByRole("button", { name: "Clear reminder" }));
+    await waitFor(() => expect(backend.state.applications[0]!.follow_up_on).toBeNull());
+    expect(backend.writes("PATCH", "applications/50/").map((c) => c.body)).toEqual([
+      { follow_up_on: addDays(localToday(), 7) },
+      { follow_up_on: null },
+    ]);
+    expect(backend.state.events[50]).toHaveLength(1); // only the setup event: reminders are not history entries
+  });
+
+  it("hides the reminder for a rejected application without one", async () => {
+    setup({ applications: [sentApp({ status: "REJECTED", follow_up_on: null })] });
+    await screen.findByLabelText("Change status");
+    expect(screen.queryByRole("group", { name: "Follow-up reminder" })).not.toBeInTheDocument();
+  });
+});
+
+describe("notes", () => {
+  it("adds a note to the history without changing the status", async () => {
+    const { backend, user } = setup();
+    const history = await screen.findByRole("region", { name: "History" });
+    const add = within(history).getByRole("button", { name: "Add note" });
+    expect(add).toBeDisabled();
+    await user.type(within(history).getByLabelText("Add a note"), "  Recruiter prefers email in the morning  ");
+    await user.click(add);
+    expect(await within(history).findByText("Recruiter prefers email in the morning")).toBeInTheDocument();
+    expect(await within(history).findByText("Note")).toBeInTheDocument();
+    expect(within(history).getByLabelText("Add a note")).toHaveValue("");
+    expect(backend.writes("POST", "applications/50/notes/").map((c) => c.body)).toEqual([{ note: "Recruiter prefers email in the morning" }]);
+    expect(backend.writes("PATCH", "applications/50/")).toHaveLength(0);
+    expect(backend.state.applications[0]!.status).toBe("SHORTLISTED");
   });
 });

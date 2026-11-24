@@ -13,14 +13,14 @@ import { applicationKeys } from "../../api/applications";
 import { companyKeys, getCompany, getJob, jobKeys, screenJob, updateJobStatus } from "../../api/jobs";
 import { listSkills, skillKeys } from "../../api/resources";
 import { JOB_STATUSES, type JobDetail, type JobStatus, type Profile, type ScreeningDetails } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { FormErrors } from "../../components/Field";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyState, ErrorState, Skeleton } from "../../components/States";
 import { useToast } from "../../components/Toast";
-import { formatDateTime, formatDayUTC } from "../../lib/format";
+import { formatDateTime, formatDayUTC, placeLine } from "../../lib/format";
 import { JOB_SOURCE, JOB_STATUS, JOB_STATUS_HELP, SCREENING_OUTCOME, SCREENING_REASON } from "../../lib/labels";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
@@ -91,7 +91,7 @@ export function formatRange(min: number | null | undefined, max: number | null |
 function experienceSource(source: string | undefined) {
   if (source === "field") return "the experience field";
   if (source === "jd") return "the job description";
-  return "nowhere (no requirement found)";
+  return "";
 }
 
 function ScreeningBreakdown({ job, details }: { job: JobDetail; details: ScreeningDetails }) {
@@ -130,7 +130,8 @@ function ScreeningBreakdown({ job, details }: { job: JobDetail; details: Screeni
           <Item label="Experience check">
             <ul className="plain-list plain-list--tight">
               <li>
-                Required: {formatRange(experience.min, experience.max) ?? "unknown"}, read from {experienceSource(experience.source)}
+                Required: {formatRange(experience.min, experience.max) ?? "unknown"}
+                {experienceSource(experience.source) ? `, read from ${experienceSource(experience.source)}` : " - the posting states no experience requirement"}
               </li>
               {experience.matches && experience.matches.length > 0 && (
                 <li>
@@ -437,7 +438,7 @@ function JobDetailContent({ profile }: { profile: Profile }) {
       {back}
       <PageHeader
         title={job.data.title}
-        description={[job.data.company?.name, job.data.location, job.data.work_mode].filter(Boolean).join(" · ") || undefined}
+        description={placeLine(job.data) || undefined}
       />
       <JobView job={job.data} profile={profile} />
     </>

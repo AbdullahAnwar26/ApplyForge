@@ -10,7 +10,7 @@ import { useState, type FormEvent } from "react";
 import { isApiError } from "../../api/errors";
 import { createProfile, updateProfile } from "../../api/resources";
 import type { Profile, ProfileInput } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { Button } from "../../components/Button";
 import { Field, FormErrors } from "../../components/Field";
 
@@ -21,6 +21,7 @@ const FIELDS = [
   "experience_info",
   "preferred_locations",
   "preferred_work_modes",
+  "phone_country_code",
   "experience_years",
   "max_acceptable_experience_years",
 ] as const;
@@ -36,6 +37,7 @@ function initialValues(profile?: Profile): Values {
     experience_info: profile?.experience_info ?? "",
     preferred_locations: profile?.preferred_locations ?? "",
     preferred_work_modes: profile?.preferred_work_modes ?? "",
+    phone_country_code: profile?.phone_country_code ?? "",
     experience_years: profile?.experience_years != null ? String(profile.experience_years) : "",
     max_acceptable_experience_years:
       profile?.max_acceptable_experience_years != null ? String(profile.max_acceptable_experience_years) : "",
@@ -51,6 +53,8 @@ export function validateProfile(values: Values, mode: "create" | "edit"): { erro
   else if (name.length > 255) errors.name = "Use at most 255 characters.";
   if (!targetRoles) errors.target_roles = "Enter at least one target role.";
   if (values.preferred_work_modes.trim().length > 255) errors.preferred_work_modes = "Use at most 255 characters.";
+  const countryCode = values.phone_country_code.trim().replace(/^\+/, "");
+  if (countryCode && !/^\d{1,4}$/.test(countryCode)) errors.phone_country_code = "Enter the country calling code as digits, e.g. 91.";
 
   const payload: ProfileInput = {
     name,
@@ -59,6 +63,7 @@ export function validateProfile(values: Values, mode: "create" | "edit"): { erro
     experience_info: values.experience_info.trim(),
     preferred_locations: values.preferred_locations.trim(),
     preferred_work_modes: values.preferred_work_modes.trim(),
+    phone_country_code: countryCode,
   };
 
   // Empty on create = use the backend default; on edit a value is required
@@ -197,6 +202,9 @@ export function ProfileForm({
           </Field>
           {text("preferred_locations", "Preferred locations", { hint: "Comma-separated." })}
           {text("preferred_work_modes", "Preferred work modes", { hint: "e.g. Remote, Hybrid, On-site." })}
+          {text("phone_country_code", "Phone country code", {
+            hint: "e.g. 91. Completes WhatsApp numbers that recruiters write without a country code.",
+          })}
         </div>
         {text("professional_summary", "Professional summary", {
           multiline: true,

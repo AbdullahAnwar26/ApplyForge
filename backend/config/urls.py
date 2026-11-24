@@ -1,5 +1,3 @@
-from django.conf import settings
-from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
@@ -14,5 +12,6 @@ urlpatterns = [
     path('api/v1/collector/', include('collector.urls')),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Uploaded resumes are private: /media/ is never served (not even with DEBUG=True).
+# A user downloads their own resume through the authenticated
+# GET /api/v1/resumes/{id}/download/ endpoint, which is limited to their account.

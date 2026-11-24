@@ -4,6 +4,7 @@ import { useId, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import { Button } from "../components/Button";
+import { PageHeader } from "../components/PageHeader";
 import { EmptyState, ErrorState, Skeleton } from "../components/States";
 import { useToast } from "../components/Toast";
 import { useActiveProfile } from "./ActiveProfileProvider";
@@ -107,17 +108,21 @@ export function RequireProfile({ children }: { children: ReactNode }) {
     case "error":
       return <ErrorState title="Could not load profiles" error={state.error} onRetry={refetch} />;
     case "empty":
+      // A new account lands here first: a real page heading, then the one next step.
       return (
-        <EmptyState
-          title="No profile yet"
-          action={
-            <Link className="btn btn--primary" to="/profile">
-              Go to Profile &amp; Skills
-            </Link>
-          }
-        >
-          ApplyForge screens jobs and prepares applications for a profile. Create one to get started.
-        </EmptyState>
+        <>
+          <PageHeader title="Welcome to ApplyForge" description="Set up your profile to start tracking jobs and applications." />
+          <EmptyState
+            title="No profile yet"
+            action={
+              <Link className="btn btn--primary" to="/profile">
+                Go to Profile &amp; Skills
+              </Link>
+            }
+          >
+            ApplyForge screens jobs and prepares applications for a profile. Create one to get started.
+          </EmptyState>
+        </>
       );
     case "needs-selection":
       return <ProfileChooser reason={state.reason} />;

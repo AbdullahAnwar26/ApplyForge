@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ApplicationDetail, Skill } from "../../api/types";
 import { ACTIVE_PROFILE_STORAGE_KEY } from "../../profile/ActiveProfileProvider";
+import { addDays, localToday } from "../../api/applications";
 import { makeApplication } from "../../test/mockApplications";
 import { createMockBackend, makeResume } from "../../test/mockBackend";
 import { makeRun } from "../../test/mockCollector";
@@ -77,11 +78,12 @@ describe("dashboard metrics", () => {
 
     const jobs = card("Jobs");
     await waitFor(() => expect(metric(jobs, "Jobs in total")).toHaveTextContent("6Jobs in total"));
-    expect(metric(jobs, "Shortlisted")).toHaveTextContent("2");
-    expect(metric(jobs, "Needs review")).toHaveTextContent("1");
-    expect(metric(jobs, "Rejected")).toHaveTextContent("1");
-    expect(metric(jobs, "Unscreened")).toHaveTextContent("2");
-    expect(metric(jobs, "Needs review")).toHaveAttribute("href", "/jobs?outcome=NEEDS_REVIEW");
+    // Labelled as screening results so they are not confused with the user's own "Shortlisted" job status.
+    expect(metric(jobs, "Screened: shortlisted")).toHaveTextContent("2");
+    expect(metric(jobs, "Screened: needs review")).toHaveTextContent("1");
+    expect(metric(jobs, "Screened: rejected")).toHaveTextContent("1");
+    expect(metric(jobs, "Not screened yet")).toHaveTextContent("2");
+    expect(metric(jobs, "Screened: needs review")).toHaveAttribute("href", "/jobs?outcome=NEEDS_REVIEW");
     const recent = within(jobs).getByRole("list", { name: "Recently found jobs" });
     expect(within(recent).getAllByRole("link").map((a) => a.textContent)).toEqual([
       "Python Backend Developer",
@@ -139,7 +141,7 @@ describe("dashboard metrics", () => {
     await waitFor(() => expect(metric(card("Applications"), "Applications")).toHaveTextContent("1"));
     await waitFor(() => expect(metric(card("Profile"), "Skills")).toHaveTextContent("1Skills"));
     expect(card("Profile")).toHaveTextContent("No active default resume");
-    expect(within(card("Applications")).getByRole("list", { name: "Applications by status" })).toHaveTextContent("Ready to send1");
+    expect(within(card("Applications")).getByRole("list", { name: "Applications by status" })).toHaveTextContent("Approved1");
     expect(writes(backend)).toHaveLength(0);
   });
 });
@@ -203,15 +205,15 @@ describe("empty, loading and failure states", () => {
       ),
     );
     const jobs = await screen.findByRole("region", { name: "Jobs" });
-    await waitFor(() => expect(metric(jobs, "Rejected")).toHaveTextContent("—"));
-    expect(metric(jobs, "Rejected")).toHaveTextContent("unavailable");
-    expect(metric(jobs, "Rejected").tagName).toBe("DIV"); // not a link to a misleading list
-    await waitFor(() => expect(metric(jobs, "Shortlisted")).toHaveTextContent("2"));
+    await waitFor(() => expect(metric(jobs, "Screened: rejected")).toHaveTextContent("—"));
+    expect(metric(jobs, "Screened: rejected")).toHaveTextContent("unavailable");
+    expect(metric(jobs, "Screened: rejected").tagName).toBe("DIV"); // not a link to a misleading list
+    await waitFor(() => expect(metric(jobs, "Screened: shortlisted")).toHaveTextContent("2"));
     expect(within(jobs).getByText("Some job counts could not be loaded")).toBeInTheDocument();
 
     fail = false;
     await user.click(within(jobs).getByRole("button", { name: "Try again" }));
-    await waitFor(() => expect(metric(card("Jobs"), "Rejected")).toHaveTextContent("1Rejected"));
+    await waitFor(() => expect(metric(card("Jobs"), "Screened: rejected")).toHaveTextContent("1Screened: rejected"));
   });
 });
 
@@ -235,14 +237,14 @@ describe("refreshing", () => {
 
   it("shows changes made in other sections", async () => {
     const { user } = setup();
-    await waitFor(() => expect(metric(card("Jobs"), "Unscreened")).toHaveTextContent("2"));
+    await waitFor(() => expect(metric(card("Jobs"), "Not screened yet")).toHaveTextContent("2"));
     // Re-screen every job on the Jobs page (an explicit, confirmed action there).
     await user.click(within(screen.getByRole("navigation", { name: "Main" })).getByRole("link", { name: "Jobs" }));
     await user.click(await screen.findByRole("button", { name: "Re-screen all jobs" }));
     await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Re-screen all" }));
     await screen.findByText(/^Screened 6 jobs:/);
     await user.click(within(screen.getByRole("navigation", { name: "Main" })).getByRole("link", { name: "Dashboard" }));
-    await waitFor(() => expect(metric(card("Jobs"), "Unscreened")).toHaveTextContent("0"));
+    await waitFor(() => expect(metric(card("Jobs"), "Not screened yet")).toHaveTextContent("0"));
   });
 
   it("never screens, generates, collects or saves anything", async () => {
@@ -263,5 +265,49 @@ describe("keyboard", () => {
     await user.keyboard("{Enter}");
     expect(await screen.findByRole("heading", { level: 1, name: "Applications" })).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "Only those waiting for me" })).toBeChecked();
+  });
+});
+
+describe("outcomes and follow-ups", () => {
+  it("shows sent, interviews, offers and the follow-ups that are due", async () => {
+    setup({
+      applications: [
+        // Relative to the browser's day (sent as ?today=): overdue, later, and overdue but closed (rejected).
+        makeApplication(21, { status: "SENT", sent_at: "2026-02-20T00:00:00Z", follow_up_on: addDays(localToday(), -1), job: job(21, "Overdue Role") }),
+        makeApplication(22, { status: "INTERVIEW", sent_at: "2026-02-21T00:00:00Z", follow_up_on: addDays(localToday(), 10), job: job(22, "Interview Role") }),
+        makeApplication(23, { status: "OFFER", sent_at: "2026-02-22T00:00:00Z", job: job(23, "Offer Role") }),
+        makeApplication(24, { status: "REJECTED", sent_at: "2026-02-23T00:00:00Z", follow_up_on: addDays(localToday(), -2), job: job(24, "Closed Role") }),
+      ],
+    });
+    const apps = await screen.findByRole("region", { name: "Applications" });
+    await waitFor(() => expect(metric(apps, "Sent")).toHaveTextContent("4"));
+    expect(metric(apps, "Interviewing")).toHaveTextContent("1");
+    expect(metric(apps, "Offers")).toHaveTextContent("1");
+    expect(metric(apps, "Rejected")).toHaveTextContent("1");
+    expect(metric(apps, "Follow-ups due")).toHaveTextContent("1");
+    expect(metric(apps, "Follow-ups due")).toHaveAttribute("href", "/applications?due=1");
+    const due = within(apps).getByRole("list", { name: "Follow-ups due" });
+    expect(within(due).getAllByRole("listitem")).toHaveLength(1);
+    expect(due).toHaveTextContent("Overdue Role");
+    expect(due).toHaveTextContent(/follow up since/);
+    expect(due).not.toHaveTextContent("Closed Role");
+  });
+
+  it("shows unavailable (not zero) when an older backend does not report the new figures", async () => {
+    setup();
+    // Registered after setup so it takes precedence over the mock backend's handler.
+    server.use(
+      http.get(`${API}/applications/summary/`, () =>
+        HttpResponse.json({
+          total: 1,
+          by_status: { SHORTLISTED: 1 },
+          awaiting_action: { count: 1, statuses: ["SHORTLISTED"], oldest: [] },
+          recent: [],
+        }),
+      ),
+    );
+    const apps = await screen.findByRole("region", { name: "Applications" });
+    await waitFor(() => expect(metric(apps, "Follow-ups due")).toHaveTextContent("unavailable"));
+    expect(metric(apps, "Sent")).toHaveTextContent("unavailable");
   });
 });

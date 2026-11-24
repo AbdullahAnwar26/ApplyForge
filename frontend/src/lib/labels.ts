@@ -7,11 +7,13 @@ import type {
   ApplicationChannel,
   ApplicationStatus,
   CollectorRunStatus,
+  DateRange,
   JobSource,
   JobStatus,
   ScreeningOutcome,
   ScreeningReason,
   SkillCategory,
+  StopReason,
 } from "../api/types";
 
 export type Tone = "neutral" | "info" | "success" | "warning" | "danger" | "accent";
@@ -64,12 +66,16 @@ export const APPLICATION_STATUS: Record<ApplicationStatus, LabelTone> = {
   SHORTLISTED: { label: "Shortlisted", tone: "neutral" },
   GENERATED: { label: "Draft ready", tone: "accent" },
   OPENED: { label: "Opened", tone: "accent" },
-  READY_TO_SEND: { label: "Ready to send", tone: "warning" },
+  READY_TO_SEND: { label: "Approved", tone: "warning" },
   SENT: { label: "Sent", tone: "info" },
   FOLLOW_UP: { label: "Follow-up", tone: "warning" },
+  INTERVIEW: { label: "Interviewing", tone: "accent" },
+  OFFER: { label: "Offer", tone: "success" },
   SKIPPED: { label: "Skipped", tone: "neutral" },
   REJECTED: { label: "Rejected", tone: "danger" },
   FAILED: { label: "Generation failed", tone: "danger" },
+  SEND_FAILED: { label: "Sending failed", tone: "danger" },
+  COMPOSE_OPENED: { label: "Opened to send", tone: "warning" },
 };
 
 export const APPLICATION_CHANNEL: Record<ApplicationChannel, string> = {
@@ -83,6 +89,28 @@ export const COLLECTOR_RUN_STATUS: Record<CollectorRunStatus, LabelTone> = {
   SUCCEEDED: { label: "Succeeded", tone: "success" },
   PARTIAL: { label: "Partial", tone: "warning" },
   FAILED: { label: "Failed", tone: "danger" },
+  CANCELLED: { label: "Cancelled", tone: "neutral" },
+  INTERRUPTED: { label: "Interrupted", tone: "warning" },
+};
+
+export const DATE_RANGE_LABEL: Record<DateRange, string> = {
+  any: "Any time",
+  "past-24h": "Last 24 hours",
+  "past-week": "Last 7 days",
+  "past-month": "Last 30 days",
+  custom: "Custom range",
+};
+
+export const STOP_REASON_TEXT: Record<StopReason, string> = {
+  "": "",
+  target_reached: "Reached the number of jobs you asked for.",
+  exhausted: "No more matching posts were found.",
+  cancelled: "You cancelled the collection. Everything collected so far is kept.",
+  time_limit: "Stopped at the time limit for one collection.",
+  examined_limit: "Stopped after checking many posts without finding enough job posts.",
+  source_error: "The source stopped with an error.",
+  interrupted: "The server stopped during the collection. Everything collected before that is kept.",
+  failed: "The collection could not run.",
 };
 
 export const SKILL_CATEGORY: Record<SkillCategory, string> = {

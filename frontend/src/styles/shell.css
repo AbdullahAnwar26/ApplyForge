@@ -320,3 +320,38 @@
     max-width: 150px;
   }
 }
+
+/* Signed-in account (top bar) */
+.account-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text);
+  text-decoration: none;
+  font-size: var(--text-sm, 0.9rem);
+  padding: 2px var(--space-2) 2px 2px;
+  border-radius: 999px;
+}
+
+.account-link:hover,
+.account-link:focus-visible {
+  background: var(--surface-hover, var(--border));
+}
+
+.account-link__avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+@media (max-width: 520px) {
+  .account-link__name {
+    display: none;
+  }
+}

@@ -20,6 +20,7 @@ PROFILE_FIELDS = {
     "target_roles",
     "experience_info",
     "preferred_locations",
+    "phone_country_code",
     "preferred_work_modes",
     "experience_years",
     "max_acceptable_experience_years",
@@ -46,7 +47,7 @@ class AuthenticationRequiredTests(APITestCase):
             with self.subTest(url=url):
                 response = self.anon.get(url)
                 self.assertEqual(response.status_code, 401)
-                self.assertTrue(response["WWW-Authenticate"].startswith("Bearer"))
+                self.assertTrue(response["WWW-Authenticate"].startswith("Session"))
 
     def test_writes_require_token(self):
         response = self.anon.post(
@@ -171,7 +172,7 @@ class ProfileAPITests(APITestCase):
     def test_list_query_count(self):
         for i in range(5):
             make_profile(name=f"P{i}")
-        with self.assertNumQueries(1):
+        with self.assertNumQueries(3):
             self.client.get("/api/v1/profiles/")
 
     def test_delete_cascades_skills_and_resume_files(self):
@@ -335,11 +336,11 @@ class SkillAPITests(APITestCase):
     def test_pagination_and_query_count(self):
         for i in range(60):
             Skill.objects.create(name=f"s{i:02d}", profile=self.profile)
-        with self.assertNumQueries(1):
+        with self.assertNumQueries(3):
             response = self.client.get("/api/v1/skills/")
         self.assertEqual(len(response.data), 60)
 
-        with self.assertNumQueries(2):  # COUNT + page
+        with self.assertNumQueries(4):  # session + user, COUNT + page
             response = self.client.get("/api/v1/skills/?page=2")
         self.assertEqual(response.data["count"], 60)
         self.assertEqual(len(response.data["results"]), 10)

@@ -1,62 +1,109 @@
 /**
- * One collector run (GET collector/runs/{id}/ - read-only). Shows what the backend
- * stores: status, trigger, profile, keywords, limit, times, counts, error and the ids
- * of jobs created or matched. Per-post details are only returned when a run is
- * started from this app, so they are not available here.
+ * One collection run: live progress while it runs (with Cancel), how it ended (with
+ * Continue for runs that stopped early), its settings, and every post it examined
+ * with what happened to it (new job, duplicate, not a job post, outside the dates...).
  */
 
-import { useQueries, useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
-import { collectorKeys, getRun } from "../../api/collector";
+import { collectorKeys, getRun, ITEMS_PAGE_SIZE, listRunItems } from "../../api/collector";
 import { isApiError } from "../../api/errors";
-import { getJob, jobKeys } from "../../api/jobs";
-import { useApi } from "../../auth/TokenProvider";
-import { StatusBadge } from "../../components/Badge";
-import { Button } from "../../components/Button";
+import type { CollectedPostStatus, CollectorRun } from "../../api/types";
+import { useApi } from "../../auth/AuthProvider";
+import { Badge } from "../../components/Badge";
 import { PageHeader } from "../../components/PageHeader";
+import { Pagination } from "../../components/Pagination";
 import { EmptyState, ErrorState, Skeleton } from "../../components/States";
-import { TechnicalDetails } from "../../components/TechnicalDetails";
-import { isExceptionText } from "../../lib/diagnostics";
-import { formatDateTime } from "../../lib/format";
+import { formatDate, formatDateTime } from "../../lib/format";
+import { DATE_RANGE_LABEL, type Tone } from "../../lib/labels";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
+import { LiveRun } from "../automation/CollectStep";
 import { formatDuration } from "./CollectorPage";
-import { RunCounts } from "./RunParts";
-import { shortError, STATUS_EXPLANATION } from "./runText";
+import { shortError } from "./runText";
 
-const MAX_JOB_TITLES = 50;
+export const ITEM_STATUS: Record<CollectedPostStatus, { label: string; tone: Tone }> = {
+  created: { label: "New job", tone: "success" },
+  existing: { label: "Duplicate", tone: "info" },
+  skipped: { label: "Not a job post", tone: "neutral" },
+  out_of_range: { label: "Outside dates", tone: "neutral" },
+  invalid: { label: "Unreadable", tone: "warning" },
+  failed: { label: "Failed", tone: "danger" },
+};
 
-function RunJobs({ jobIds }: { jobIds: number[] }) {
+function RunItems({ run }: { run: CollectorRun }) {
   const api = useApi();
-  const shown = jobIds.slice(0, MAX_JOB_TITLES);
-  const jobs = useQueries({
-    queries: shown.map((id) => ({ queryKey: jobKeys.detail(id), queryFn: ({ signal }: { signal: AbortSignal }) => getJob(api, id, signal) })),
+  const [status, setStatus] = useState<CollectedPostStatus | "">("");
+  const [page, setPage] = useState(1);
+  const items = useQuery({
+    queryKey: [...collectorKeys.items(run.id, status, page), run.counts.found ?? 0],
+    queryFn: ({ signal }) => listRunItems(api, run.id, status, page, signal),
+    placeholderData: keepPreviousData,
   });
-  if (jobIds.length === 0) return <p className="muted">No jobs were created or matched by this run.</p>;
   return (
-    <ul className="run-jobs">
-      {shown.map((id, index) => {
-        const job = jobs[index];
-        return (
-          <li key={id}>
-            <Link to={`/jobs/${id}`}>{job?.data?.title ?? `Job #${id}`}</Link>
-            {job?.data && (
-              <>
-                {job.data.company && <span className="muted"> · {job.data.company.name}</span>} <StatusBadge kind="screening" value={job.data.screening_outcome} />
-              </>
-            )}
-            {isApiError(job?.error) && job.error.kind === "not_found" && <span className="muted"> (no longer exists)</span>}
-          </li>
-        );
-      })}
-      {jobIds.length > shown.length && <li className="muted">and {jobIds.length - shown.length} more</li>}
-    </ul>
+    <section className="panel" aria-labelledby="run-items-title">
+      <div className="panel__header">
+        <h2 id="run-items-title" className="panel__title">
+          Posts examined
+        </h2>
+        <label className="filter">
+          <span className="filter__label">Show</span>
+          <select
+            className="input input--compact"
+            value={status}
+            onChange={(e) => {
+              setPage(1);
+              setStatus(e.target.value as CollectedPostStatus | "");
+            }}
+          >
+            <option value="">All</option>
+            {(Object.keys(ITEM_STATUS) as CollectedPostStatus[]).map((value) => (
+              <option key={value} value={value}>
+                {ITEM_STATUS[value].label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {items.error && !items.data ? (
+        <ErrorState error={items.error} title="Could not load the posts" onRetry={() => void items.refetch()} />
+      ) : !items.data ? (
+        <Skeleton lines={4} label="Loading posts" />
+      ) : items.data.items.length === 0 ? (
+        <EmptyState title={status ? "No posts with this result" : "No posts examined (yet)"} />
+      ) : (
+        <>
+          <ol className="run-outcomes__list">
+            {items.data.items.map((item) => {
+              const tone = ITEM_STATUS[item.status] ?? { label: item.status, tone: "neutral" as Tone };
+              return (
+                <li key={item.id} className="run-outcome">
+                  <Badge tone={tone.tone}>{tone.label}</Badge>
+                  {item.job ? <Link to={`/jobs/${item.job}`}>{item.title || `Job #${item.job}`}</Link> : <span>{item.title || `Post ${item.position + 1}`}</span>}
+                  {item.truncated && <Badge tone="warning">cut off</Badge>}
+                  {item.posted_at && <span className="muted small">posted {formatDate(item.posted_at)}</span>}
+                  {item.post_url && (
+                    <a className="small" href={item.post_url} target="_blank" rel="noopener noreferrer">
+                      post ↗
+                    </a>
+                  )}
+                  {item.reason && <span className="muted small run-outcome__reason">{shortError(item.reason)}</span>}
+                </li>
+              );
+            })}
+          </ol>
+          <Pagination page={page} pageSize={ITEMS_PAGE_SIZE} count={items.data.count} onPageChange={setPage} disabled={items.isFetching} />
+        </>
+      )}
+    </section>
   );
 }
 
 function RunContent() {
   const api = useApi();
+  const navigate = useNavigate();
   const { profiles } = useActiveProfile();
   const { id: rawId } = useParams();
   const id = /^[1-9]\d*$/.test(rawId ?? "") ? Number(rawId) : null;
@@ -67,7 +114,7 @@ function RunContent() {
   });
   const back = (
     <Link className="back-link" to="/collector">
-      ← Collector
+      ← Collection history
     </Link>
   );
 
@@ -102,42 +149,31 @@ function RunContent() {
   return (
     <>
       {back}
-      <PageHeader
-        title={`Collector run #${data.id}`}
-        description={formatDateTime(data.started_at)}
-        actions={
-          <Button size="sm" onClick={() => void run.refetch()} loading={run.isFetching}>
-            Refresh
-          </Button>
-        }
-      />
+      <PageHeader title={`Collection #${data.id}`} description={formatDateTime(data.started_at)} />
       <section className="panel" aria-labelledby="run-status-title">
-        <div className="panel__header">
-          <h2 id="run-status-title" className="panel__title">
-            Result
-          </h2>
-          <StatusBadge kind="collector" value={data.status} />
-        </div>
-        <p>{STATUS_EXPLANATION[data.status]}</p>
-        {data.error && (
-          <div className="notice notice--warning">
-            <strong>Reported problem:</strong> {shortError(data.error)}
-            {isExceptionText(data.error) && <TechnicalDetails text={data.error} />}
-          </div>
-        )}
-        <RunCounts counts={data.counts} />
+        <h2 id="run-status-title" className="panel__title">
+          Progress
+        </h2>
+        <LiveRun runId={data.id} onReview={(runId) => navigate(`/automation?step=pick&run=${runId}`)} />
       </section>
       <section className="panel" aria-labelledby="run-settings-title">
         <h2 id="run-settings-title" className="panel__title">
-          Run settings
+          Settings
         </h2>
         <dl className="details">
           <div className="details__item">
-            <dt>Keywords</dt>
-            <dd>{data.keywords.length ? data.keywords.join(", ") : <span className="muted">None recorded</span>}</dd>
+            <dt>Search</dt>
+            <dd>{data.search_query || data.keywords.join(", ") || <span className="muted">None recorded</span>}</dd>
           </div>
           <div className="details__item">
-            <dt>Maximum posts</dt>
+            <dt>Date posted</dt>
+            <dd>
+              {DATE_RANGE_LABEL[data.date_range] ?? data.date_range}
+              {data.date_range === "custom" && data.date_from && ` (${data.date_from} to ${data.date_to ?? "today"})`}
+            </dd>
+          </div>
+          <div className="details__item">
+            <dt>New jobs wanted</dt>
             <dd>{data.limit ?? "—"}</dd>
           </div>
           <div className="details__item">
@@ -151,10 +187,6 @@ function RunContent() {
             </dd>
           </div>
           <div className="details__item">
-            <dt>Started</dt>
-            <dd>{formatDateTime(data.started_at)}</dd>
-          </div>
-          <div className="details__item">
             <dt>Finished</dt>
             <dd>
               {data.finished_at ? formatDateTime(data.finished_at) : "Not finished"}
@@ -163,12 +195,7 @@ function RunContent() {
           </div>
         </dl>
       </section>
-      <section className="panel" aria-labelledby="run-jobs-title">
-        <h2 id="run-jobs-title" className="panel__title">
-          Jobs from this run
-        </h2>
-        <RunJobs jobIds={data.job_ids} />
-      </section>
+      <RunItems run={data} />
     </>
   );
 }

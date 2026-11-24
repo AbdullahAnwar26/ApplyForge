@@ -1,14 +1,15 @@
 /**
  * The single HTTP client for the ApplyForge API. Every request goes through here.
  *
- * - Adds `Authorization: Bearer <token>` from `getToken()`; the token is never put
- *   in a URL, never logged and never included in an error.
- * - Only relative API paths are accepted, so the token can only go to the
- *   configured API base (same-origin `/api/v1` by default).
+ * - Signed-in state is the Django session cookie (HttpOnly; JavaScript never sees it),
+ *   sent with every same-origin request (`credentials: "same-origin"`).
+ * - Writes (POST/PUT/PATCH/DELETE) carry the CSRF token from the `csrftoken` cookie in
+ *   `X-CSRFToken`. If that cookie is missing it is fetched once from `auth/csrf/`.
+ * - Only relative API paths are accepted, so requests only go to the configured API
+ *   base (same-origin `/api/v1` by default).
  * - Error responses become ApiError (see errors.ts). A 401 calls `onUnauthorized`
- *   so the app can clear the token and show the Connect screen.
+ *   so the app can show the sign-in page.
  * - List endpoints are normalised from both pagination formats (see pagination.ts).
- * - Cookies are never sent (`credentials: "omit"`): the API uses the bearer token only.
  */
 
 import { ApiError, parseErrorBody } from "./errors";
@@ -25,13 +26,27 @@ export interface RequestOptions {
 export interface ApiClientConfig {
   /** API base: a same-origin path ("/api/v1") or an absolute http(s) URL. */
   baseUrl?: string;
-  getToken: () => string | null;
-  /** Called after any 401 response (not for a missing token). */
+  /** Called after any 401 response. */
   onUnauthorized?: () => void;
   fetchImpl?: typeof fetch;
+  /** Reads the CSRF cookie (default: `csrftoken` from document.cookie). */
+  readCsrfToken?: () => string | null;
+}
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** The `csrftoken` cookie set by Django, or null. */
+export function readCsrfCookie(cookieString: string = typeof document === "undefined" ? "" : document.cookie): string | null {
+  for (const part of cookieString.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name === "csrftoken") return decodeURIComponent(rest.join("=")) || null;
+  }
+  return null;
 }
 
 export interface ApiClient {
+  /** Absolute or root-relative URL of an API path, for plain links (e.g. file downloads). */
+  url(path: string): string;
   get<T>(path: string, options?: RequestOptions): Promise<T>;
   list<T>(path: string, options?: RequestOptions & { page?: PageParams }): Promise<ListResult<T>>;
   post<T>(path: string, body?: unknown, options?: RequestOptions): Promise<T>;
@@ -42,7 +57,7 @@ export interface ApiClient {
   upload<T>(method: "POST" | "PATCH" | "PUT", path: string, form: FormData, options?: RequestOptions): Promise<T>;
   /**
    * Multipart request with upload progress (XMLHttpRequest; fetch cannot report
-   * upload progress). Same token, error and 401 handling as every other request.
+   * upload progress). Same cookies, CSRF, error and 401 handling as every other request.
    */
   uploadWithProgress<T>(
     method: "POST" | "PATCH" | "PUT",
@@ -130,6 +145,22 @@ function isAbort(error: unknown, signal: AbortSignal | undefined): boolean {
 export function createApiClient(config: ApiClientConfig): ApiClient {
   const baseUrl = resolveBaseUrl(config.baseUrl);
   const doFetch = config.fetchImpl ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init));
+  const readCsrf = config.readCsrfToken ?? (() => readCsrfCookie());
+
+  /** The CSRF token for a write; fetches the cookie once when it is missing. */
+  async function csrfFor(method: string): Promise<string | null> {
+    if (SAFE_METHODS.has(method)) return null;
+    let token = readCsrf();
+    if (!token) {
+      try {
+        await doFetch(buildUrl(baseUrl, "auth/csrf/"), { credentials: "same-origin", cache: "no-store" });
+      } catch {
+        throw new ApiError({ status: 0 });
+      }
+      token = readCsrf();
+    }
+    return token;
+  }
 
   async function request<T>(
     method: string,
@@ -137,13 +168,9 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
     options: RequestOptions & { json?: unknown; form?: FormData } = {},
   ): Promise<T> {
     const url = buildUrl(baseUrl, path, options.query);
-    const token = config.getToken();
-    if (!token) {
-      // No request is made without a token.
-      throw new ApiError({ status: 401, detail: "Not connected. Enter the API token to continue." });
-    }
-
-    const headers = new Headers({ Accept: "application/json", Authorization: `Bearer ${token}` });
+    const headers = new Headers({ Accept: "application/json" });
+    const csrf = await csrfFor(method);
+    if (csrf) headers.set("X-CSRFToken", csrf);
     let body: BodyInit | undefined;
     if (options.form) {
       body = options.form;
@@ -159,7 +186,7 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
         headers,
         body,
         signal: options.signal,
-        credentials: "omit",
+        credentials: "same-origin",
         cache: "no-store",
         referrerPolicy: "no-referrer",
       });
@@ -185,18 +212,18 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
     options: RequestOptions & { onProgress?: (fraction: number) => void } = {},
   ): Promise<T> {
     const url = buildUrl(baseUrl, path, options.query);
-    const token = config.getToken();
-    if (!token) {
-      return Promise.reject(new ApiError({ status: 401, detail: "Not connected. Enter the API token to continue." }));
-    }
     if (options.signal?.aborted) return Promise.reject(abortError());
 
-    return new Promise<T>((resolve, reject) => {
+    return csrfFor(method).then((csrf) => new Promise<T>((resolve, reject) => {
+      // Cancelled while the CSRF cookie was being fetched: never start the upload.
+      if (options.signal?.aborted) {
+        reject(abortError());
+        return;
+      }
       const xhr = new XMLHttpRequest();
       xhr.open(method, url);
-      xhr.withCredentials = false; // never send cookies
       xhr.setRequestHeader("Accept", "application/json");
-      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      if (csrf) xhr.setRequestHeader("X-CSRFToken", csrf);
 
       const onAbortSignal = () => xhr.abort();
       options.signal?.addEventListener("abort", onAbortSignal, { once: true });
@@ -228,10 +255,14 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
         reject(abortError());
       });
       xhr.send(form);
-    });
+    }));
   }
 
   return {
+    url: (path) => {
+      assertRelativePath(path);
+      return buildUrl(baseUrl, path);
+    },
     get: (path, options) => request("GET", path, options),
     async list<T>(path: string, options: RequestOptions & { page?: PageParams } = {}) {
       const query = { ...options.query, ...pageQuery(options.page) };

@@ -16,7 +16,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useMemo, useSyncExternalStore, type ReactNode } from "react";
 
 import type { Profile } from "../api/types";
-import { useApi } from "../auth/TokenProvider";
+import { useApi } from "../auth/AuthProvider";
 import { createPreference } from "../lib/preferences";
 
 export const ACTIVE_PROFILE_STORAGE_KEY = "applyforge.activeProfileId";

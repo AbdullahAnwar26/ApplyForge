@@ -1,13 +1,17 @@
 """
 Tracker API routes, mounted at ``/api/v1/`` by ``config/urls.py``.
 
-All routes use the project defaults: ``StaticTokenAuthentication`` +
-``IsAuthenticated`` and ``OptionalPagination``. Routes planned for later
+All routes use the project defaults: ``SessionAuthentication401`` (user accounts) +
+``IsAuthenticated`` and ``OptionalPagination``, and only ever see the signed-in
+user's own data. Account routes are under ``auth/`` (``account_views.py``). Routes planned for later
 milestones are listed in ``docs/PROJECT_SPEC.md``.
 """
 
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
+
+from .account_views import CsrfView, LoginView, LogoutView, MeView, PasswordChangeView, SignupView
+from .sending_views import EmailAccountTestView, EmailAccountView
 
 from .views import (
     ApplicationViewSet,
@@ -31,6 +35,14 @@ router.register("contacts", ContactViewSet, basename="contact")
 router.register("applications", ApplicationViewSet, basename="application")
 
 urlpatterns = [
+    path("auth/csrf/", CsrfView.as_view(), name="auth-csrf"),
+    path("auth/signup/", SignupView.as_view(), name="auth-signup"),
+    path("auth/login/", LoginView.as_view(), name="auth-login"),
+    path("auth/logout/", LogoutView.as_view(), name="auth-logout"),
+    path("auth/me/", MeView.as_view(), name="auth-me"),
+    path("auth/password/", PasswordChangeView.as_view(), name="auth-password"),
+    path("sending/email-account/", EmailAccountView.as_view(), name="sending-email-account"),
+    path("sending/email-account/test/", EmailAccountTestView.as_view(), name="sending-email-account-test"),
     path(
         "skill-categories/",
         SkillCategoryListView.as_view(),

@@ -16,9 +16,10 @@ import {
   type ApplicationCreateInput,
 } from "../../api/applications";
 import { isApiError } from "../../api/errors";
+import { jobKeys, updateJobStatus } from "../../api/jobs";
 import { listResumes, resumeKeys } from "../../api/resources";
 import { APPLICATION_CHANNELS, type ApplicationChannel, type Contact, type JobDetail, type Profile } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { Field, FormErrors } from "../../components/Field";
@@ -162,6 +163,34 @@ function CreateForm({ job, profile }: { job: JobDetail; profile: Profile }) {
   );
 }
 
+/** One click from "not decided" (or skipped) to "I want to apply"; the create form then appears. */
+function ShortlistPrompt({ job }: { job: JobDetail }) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  const { notify } = useToast();
+  const mutation = useMutation({
+    mutationFn: () => updateJobStatus(api, job.id, "SHORTLISTED"),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(jobKeys.detail(job.id), updated);
+      void queryClient.invalidateQueries({ queryKey: jobKeys.all });
+      notify("Job shortlisted - you can start the application now", "success");
+    },
+  });
+  return (
+    <div className="shortlist-prompt">
+      <p className="muted">
+        {job.status === "SKIPPED"
+          ? "You skipped this job. Shortlist it if you want to apply after all."
+          : "Applications are for jobs you have shortlisted."}
+      </p>
+      <Button variant="primary" size="sm" loading={mutation.isPending} onClick={() => mutation.mutate()}>
+        Shortlist this job
+      </Button>
+      <FormErrors error={mutation.error} />
+    </div>
+  );
+}
+
 export function StartApplication({ job, profile }: { job: JobDetail; profile: Profile }) {
   const api = useApi();
   const existing = useQuery({
@@ -184,11 +213,7 @@ export function StartApplication({ job, profile }: { job: JobDetail; profile: Pr
       </div>
     );
   } else if (!applicable) {
-    body = (
-      <p className="muted">
-        Set your status to <strong>Shortlisted</strong> (above) to start an application for this job.
-      </p>
-    );
+    body = <ShortlistPrompt job={job} />;
   } else {
     body = <CreateForm job={job} profile={profile} />;
   }

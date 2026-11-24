@@ -21,13 +21,13 @@ import { applicationKeys, getApplicationsOverview } from "../../api/applications
 import { collectorKeys, listRuns } from "../../api/collector";
 import { countJobs, jobKeys, recentJobs, type JobFilters } from "../../api/jobs";
 import { listResumes, listSkills, resumeKeys, skillKeys } from "../../api/resources";
-import { APPLICATION_STATUSES, type ApplicationSummary, type Profile } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { APPLICATION_STATUSES, type ApplicationsOverview, type ApplicationSummary, type Profile } from "../../api/types";
+import { useApi } from "../../auth/AuthProvider";
 import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyState, ErrorState, Skeleton } from "../../components/States";
-import { formatDate, formatDateTime, splitList } from "../../lib/format";
+import { formatDate, formatDateTime, formatDayUTC, splitList } from "../../lib/format";
 import { SCREENING_OUTCOME, SCREENING_REASON } from "../../lib/labels";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
@@ -189,14 +189,17 @@ function JobsCard() {
         {OUTCOME_FILTERS.map(({ key, outcome }, index) => (
           <Metric
             key={key}
-            label={SCREENING_OUTCOME[outcome].label}
+            label={outcome === "UNSCREENED" ? "Not screened yet" : `Screened: ${SCREENING_OUTCOME[outcome].label.toLowerCase()}`}
             value={outcomes[index] ? valueOf(outcomes[index], (d) => d) : undefined}
             to={`/jobs?outcome=${key}`}
             tone={SCREENING_OUTCOME[outcome].tone}
           />
         ))}
       </div>
-      <p className="muted small">All jobs, whichever profile screened them; outcomes are from each job's latest screening.</p>
+      <p className="muted small">
+        Automatic screening results for all jobs (each job's latest screening). Your own decision per job is its status on
+        the <Link to="/jobs">Jobs</Link> page.
+      </p>
       {failedCounts.length > 0 && (
         <ErrorState
           title="Some job counts could not be loaded"
@@ -238,14 +241,21 @@ function JobsCard() {
 
 // --- Applications ------------------------------------------------------------------------
 
-function ApplicationList({ items, label }: { items: ApplicationSummary[]; label: string }) {
+function ApplicationList({ items, label, showFollowUp = false }: { items: ApplicationSummary[]; label: string; showFollowUp?: boolean }) {
   return (
     <ul className="dash-list" aria-label={label}>
       {items.slice(0, LIST_ITEMS).map((a) => (
         <li key={a.id} className="dash-list__item">
           <div className="dash-list__main">
             <Link to={`/applications/${a.id}`}>{a.job.title}</Link>
-            <span className="muted small">{[a.job.company?.name, `updated ${formatDate(a.updated_at)}`].filter(Boolean).join(" · ")}</span>
+            <span className="muted small">
+              {[
+                a.job.company?.name,
+                showFollowUp && a.follow_up_on ? `follow up since ${formatDayUTC(a.follow_up_on)}` : `updated ${formatDate(a.updated_at)}`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </span>
           </div>
           <StatusBadge kind="application" value={a.status} />
         </li>
@@ -261,7 +271,10 @@ function ApplicationsCard({ profile }: { profile: Profile }) {
     queryFn: ({ signal }) => getApplicationsOverview(api, profile.id, signal),
   });
   const data = overview.data;
-  const statuses = data ? APPLICATION_STATUSES.filter((s) => data.by_status[s] > 0) : [];
+  const statuses = data ? APPLICATION_STATUSES.filter((s) => (data.by_status[s] ?? 0) > 0) : [];
+  // Older backends do not report these; show them as unavailable rather than crash or claim 0.
+  const due = data?.follow_ups_due as ApplicationsOverview["follow_ups_due"] | undefined;
+  const count = (n: number | undefined) => (typeof n === "number" ? n : null);
 
   return (
     <Card
@@ -288,7 +301,25 @@ function ApplicationsCard({ profile }: { profile: Profile }) {
           <div className="metrics">
             <Metric label="Applications" value={data.total} to="/applications" />
             <Metric label="Waiting for you" value={data.awaiting_action.count} to="/applications?awaiting=1" tone="accent" />
+            <Metric
+              label="Follow-ups due"
+              value={count(due?.count)}
+              to="/applications?due=1"
+              tone={due?.count ? "warning" : undefined}
+            />
           </div>
+          <div className="metrics" aria-label="Outcomes">
+            <Metric label="Sent" value={count(data.sent_total)} to="/applications?status=SENT" tone="info" />
+            <Metric label="Interviewing" value={count(data.by_status.INTERVIEW)} to="/applications?status=INTERVIEW" tone="accent" />
+            <Metric label="Offers" value={count(data.by_status.OFFER)} to="/applications?status=OFFER" tone="success" />
+            <Metric label="Rejected" value={count(data.by_status.REJECTED)} to="/applications?status=REJECTED" />
+          </div>
+          {due && due.count > 0 && (
+            <>
+              <h3 className="dash-subtitle">Follow-ups due</h3>
+              <ApplicationList items={due.items} label="Follow-ups due" showFollowUp />
+            </>
+          )}
           <ul className="status-counts" aria-label="Applications by status">
             {statuses.map((status) => (
               <li key={status}>

@@ -1,12 +1,11 @@
 """
-Tests for the Milestone 1 API foundation: StaticTokenAuthentication and
-OptionalPagination.
+Tests for the API foundation: default authentication (session accounts, 401 when signed
+out) and OptionalPagination. Account behaviour itself is in test_accounts.py.
 
-All tests are SimpleTestCase, so Django raises if any of this code touches the
-database. That is how "authentication does not access the database" is checked.
+All tests are SimpleTestCase, so Django raises if any of this code touches the database.
 """
 
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase
 from rest_framework import serializers
 from rest_framework.generics import ListAPIView
 from rest_framework.permissions import AllowAny
@@ -15,16 +14,14 @@ from rest_framework.settings import api_settings
 from rest_framework.test import APIRequestFactory
 from rest_framework.views import APIView
 
-from tracker.api.auth import StaticTokenAuthentication, StaticTokenUser
+from tracker.api.auth import SessionAuthentication401
 from tracker.api.pagination import OptionalPagination
-
-TOKEN = "test-token-123"
 
 factory = APIRequestFactory()
 
 
 class ProtectedView(APIView):
-    """Uses project defaults: StaticTokenAuthentication + IsAuthenticated."""
+    """Uses project defaults: SessionAuthentication401 + IsAuthenticated."""
 
     def get(self, request):
         return Response(
@@ -62,10 +59,10 @@ def call_protected(authorization=None):
 
 
 class ProjectSettingsWiringTests(SimpleTestCase):
-    def test_default_authentication_is_static_token(self):
+    def test_default_authentication_is_session_accounts(self):
         self.assertEqual(
             api_settings.DEFAULT_AUTHENTICATION_CLASSES,
-            [StaticTokenAuthentication],
+            [SessionAuthentication401],
         )
 
     def test_default_permission_requires_authentication(self):
@@ -81,89 +78,17 @@ class ProjectSettingsWiringTests(SimpleTestCase):
         self.assertTrue(urls.urlpatterns)
 
 
-@override_settings(API_TOKEN=TOKEN)
-class StaticTokenAuthenticationTests(SimpleTestCase):
-    def assertUnauthorized(self, response):
-        self.assertEqual(response.status_code, 401)
-        self.assertTrue(response["WWW-Authenticate"].startswith("Bearer"))
+class SessionAuthenticationTests(SimpleTestCase):
+    """Signed-out requests get 401 with a Session challenge (the frontend then shows sign-in)."""
 
-    def test_valid_token_authenticates_in_memory_principal(self):
-        response = call_protected(f"Bearer {TOKEN}")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.data, {"user": "api-token", "is_authenticated": True}
-        )
-
-    def test_scheme_is_case_insensitive(self):
-        self.assertEqual(call_protected(f"bearer {TOKEN}").status_code, 200)
-
-    def test_missing_header_returns_401_with_bearer_challenge(self):
+    def test_signed_out_request_is_401_with_session_challenge(self):
         response = call_protected()
-        self.assertUnauthorized(response)
-        self.assertEqual(response["WWW-Authenticate"], 'Bearer realm="api"')
-
-    def test_wrong_token_rejected(self):
-        self.assertUnauthorized(call_protected("Bearer wrong-token"))
-
-    def test_token_prefix_and_extension_rejected(self):
-        self.assertUnauthorized(call_protected(f"Bearer {TOKEN[:-1]}"))
-        self.assertUnauthorized(call_protected(f"Bearer {TOKEN}x"))
-
-    def test_wrong_scheme_rejected(self):
-        self.assertUnauthorized(call_protected(f"Token {TOKEN}"))
-        self.assertUnauthorized(call_protected("Basic dXNlcjpwYXNz"))
-
-    def test_scheme_without_token_rejected(self):
-        self.assertUnauthorized(call_protected("Bearer"))
-
-    def test_token_with_spaces_rejected(self):
-        self.assertUnauthorized(call_protected(f"Bearer {TOKEN} extra"))
-
-    def test_bare_token_without_scheme_rejected(self):
-        self.assertUnauthorized(call_protected(TOKEN))
-
-    def test_non_ascii_token_rejected(self):
-        self.assertUnauthorized(call_protected("Bearer tést"))
-
-    def test_authenticate_returns_none_without_header(self):
-        request = factory.get("/protected/")
-        self.assertIsNone(StaticTokenAuthentication().authenticate(request))
-
-    def test_authenticate_returns_static_user_and_no_db_user(self):
-        request = factory.get("/protected/", HTTP_AUTHORIZATION=f"Bearer {TOKEN}")
-        user, auth = StaticTokenAuthentication().authenticate(request)
-        self.assertIsInstance(user, StaticTokenUser)
-        self.assertTrue(user.is_authenticated)
-        self.assertFalse(user.is_staff)
-        self.assertFalse(user.is_superuser)
-        self.assertIsNone(auth)
-
-
-class StaticTokenFailClosedTests(SimpleTestCase):
-    def assertRejected(self, presented):
-        response = call_protected(f"Bearer {presented}")
         self.assertEqual(response.status_code, 401)
+        self.assertEqual(response["WWW-Authenticate"], 'Session realm="api"')
 
-    @override_settings(API_TOKEN="")
-    def test_empty_configured_token_rejects_everything(self):
-        self.assertRejected("anything")
-        self.assertEqual(call_protected("Bearer ").status_code, 401)
-
-    @override_settings(API_TOKEN="   ")
-    def test_whitespace_configured_token_rejects_everything(self):
-        self.assertRejected("anything")
-
-    @override_settings(API_TOKEN=None)
-    def test_none_configured_token_rejects_everything(self):
-        self.assertRejected("None")
-
-    @override_settings()
-    def test_absent_configured_token_rejects_everything(self):
-        from django.conf import settings
-
-        del settings.API_TOKEN
-        self.assertRejected("local-dev-token")
-        self.assertEqual(call_protected().status_code, 401)
+    def test_bearer_tokens_are_no_longer_accepted(self):
+        response = call_protected("Bearer anything")
+        self.assertEqual(response.status_code, 401)
 
 
 class OptionalPaginationTests(SimpleTestCase):

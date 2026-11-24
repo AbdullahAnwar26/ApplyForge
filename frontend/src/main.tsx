@@ -10,6 +10,7 @@ import "./styles/global.css";
 import "./styles/components.css";
 import "./styles/shell.css";
 import "./styles/features.css";
+import "./styles/automation.css";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing #root element.");

@@ -1,7 +1,7 @@
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
-import { TokenProvider } from "../auth/TokenProvider";
+import { AuthProvider } from "../auth/AuthProvider";
 import { ToastProvider } from "../components/Toast";
 import { ThemeProvider } from "../lib/theme";
 
@@ -19,7 +19,7 @@ export function AppProviders({
     <QueryClientProvider client={queryClient}>
       <ThemeProvider>
         <ToastProvider>
-          <TokenProvider baseUrl={baseUrl}>{children}</TokenProvider>
+          <AuthProvider baseUrl={baseUrl}>{children}</AuthProvider>
         </ToastProvider>
       </ThemeProvider>
     </QueryClientProvider>

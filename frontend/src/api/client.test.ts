@@ -2,17 +2,17 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 
 import { API, server } from "../test/server";
-import { buildQueryString, createApiClient, resolveBaseUrl } from "./client";
+import { buildQueryString, createApiClient, readCsrfCookie, resolveBaseUrl } from "./client";
 import { ApiError } from "./errors";
 
-const TOKEN = "test-token-abc123";
+const CSRF = "csrf-from-cookie";
 
 function client(overrides: Partial<Parameters<typeof createApiClient>[0]> = {}) {
-  return createApiClient({ baseUrl: API, getToken: () => TOKEN, ...overrides });
+  return createApiClient({ baseUrl: API, readCsrfToken: () => CSRF, ...overrides });
 }
 
-describe("authentication header", () => {
-  it("sends the bearer token on every request and no cookies", async () => {
+describe("session cookie and CSRF", () => {
+  it("sends the CSRF token on writes only, and never an Authorization header", async () => {
     const seen: Request[] = [];
     server.use(
       http.all(`${API}/*`, ({ request }) => {
@@ -26,39 +26,58 @@ describe("authentication header", () => {
     await api.patch("jobs/1/", { status: "SKIPPED" });
     await api.delete("skills/2/");
 
-    expect(seen).toHaveLength(4);
+    expect(seen.map((r) => [r.method, r.headers.get("x-csrftoken")])).toEqual([
+      ["GET", null],
+      ["POST", CSRF],
+      ["PATCH", CSRF],
+      ["DELETE", CSRF],
+    ]);
     for (const request of seen) {
-      expect(request.headers.get("authorization")).toBe(`Bearer ${TOKEN}`);
-      expect(request.headers.get("cookie")).toBeNull();
-      expect(request.url).not.toContain(TOKEN);
+      expect(request.headers.get("authorization")).toBeNull();
+      expect(request.url).not.toContain(CSRF);
     }
   });
 
-  it("reads the current token for each request", async () => {
-    let token = "first-token";
+  it("reads the current CSRF cookie for each write", async () => {
+    let cookie = "first";
     const headers: (string | null)[] = [];
     server.use(
-      http.get(`${API}/profiles/`, ({ request }) => {
-        headers.push(request.headers.get("authorization"));
-        return HttpResponse.json([]);
+      http.post(`${API}/profiles/`, ({ request }) => {
+        headers.push(request.headers.get("x-csrftoken"));
+        return HttpResponse.json({}, { status: 201 });
       }),
     );
-    const api = client({ getToken: () => token });
-    await api.list("profiles/");
-    token = "second-token";
-    await api.list("profiles/");
-    expect(headers).toEqual(["Bearer first-token", "Bearer second-token"]);
+    const api = client({ readCsrfToken: () => cookie });
+    await api.post("profiles/", {});
+    cookie = "rotated-after-login";
+    await api.post("profiles/", {});
+    expect(headers).toEqual(["first", "rotated-after-login"]);
   });
 
-  it("makes no request without a token", async () => {
-    const handler = vi.fn(() => HttpResponse.json([]));
-    server.use(http.get(`${API}/profiles/`, handler));
-    const onUnauthorized = vi.fn();
-    const api = client({ getToken: () => null, onUnauthorized });
+  it("fetches the CSRF cookie once when it is missing, then sends it", async () => {
+    let cookie: string | null = null;
+    const order: string[] = [];
+    server.use(
+      http.get(`${API}/auth/csrf/`, () => {
+        order.push("csrf");
+        cookie = "fresh";
+        return HttpResponse.json({});
+      }),
+      http.post(`${API}/auth/login/`, ({ request }) => {
+        order.push(`login:${request.headers.get("x-csrftoken")}`);
+        return HttpResponse.json({ user: {} });
+      }),
+    );
+    const api = client({ readCsrfToken: () => cookie });
+    await api.post("auth/login/", { username: "riya", password: "x" });
+    await api.post("auth/login/", { username: "riya", password: "x" });
+    expect(order).toEqual(["csrf", "login:fresh", "login:fresh"]);
+  });
 
-    await expect(api.list("profiles/")).rejects.toMatchObject({ status: 401, kind: "unauthorized" });
-    expect(handler).not.toHaveBeenCalled();
-    expect(onUnauthorized).not.toHaveBeenCalled();
+  it("reads Django's csrftoken cookie", () => {
+    expect(readCsrfCookie("theme=dark; csrftoken=abc%3D123; other=1")).toBe("abc=123");
+    expect(readCsrfCookie("theme=dark")).toBeNull();
+    expect(readCsrfCookie("")).toBeNull();
   });
 
   it("sends JSON bodies with a JSON content type, and multipart uploads without one", async () => {
@@ -84,7 +103,10 @@ describe("401 handling", () => {
   it("calls onUnauthorized and throws an unauthorized ApiError", async () => {
     server.use(
       http.get(`${API}/jobs/`, () =>
-        HttpResponse.json({ detail: "Invalid token." }, { status: 401, headers: { "WWW-Authenticate": 'Bearer realm="api"' } }),
+        HttpResponse.json(
+          { detail: "Authentication credentials were not provided." },
+          { status: 401, headers: { "WWW-Authenticate": 'Session realm="api"' } },
+        ),
       ),
     );
     const onUnauthorized = vi.fn();
@@ -92,7 +114,7 @@ describe("401 handling", () => {
 
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
     expect(error).toBeInstanceOf(ApiError);
-    expect(error).toMatchObject({ status: 401, kind: "unauthorized", detail: "Invalid token." });
+    expect(error).toMatchObject({ status: 401, kind: "unauthorized", detail: "Authentication credentials were not provided." });
   });
 
   it("does not call onUnauthorized for other errors", async () => {
@@ -102,11 +124,11 @@ describe("401 handling", () => {
     expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
-  it("never includes the token in an error", async () => {
-    server.use(http.get(`${API}/jobs/`, () => HttpResponse.json({ detail: "Invalid token." }, { status: 401 })));
-    const error = (await client().list("jobs/").catch((e: unknown) => e)) as ApiError;
+  it("never includes the CSRF token in an error", async () => {
+    server.use(http.post(`${API}/jobs/`, () => HttpResponse.json({ detail: "CSRF Failed: CSRF token missing." }, { status: 403 })));
+    const error = (await client().post("jobs/", {}).catch((e: unknown) => e)) as ApiError;
     const serialized = JSON.stringify({ ...error, message: error.message, stack: error.stack });
-    expect(serialized).not.toContain(TOKEN);
+    expect(serialized).not.toContain(CSRF);
   });
 });
 
@@ -274,18 +296,18 @@ describe("uploadWithProgress (XMLHttpRequest)", () => {
     return data;
   };
 
-  it("sends the token, reports progress and returns the body", async () => {
-    let auth: string | null = null;
+  it("sends the CSRF token, reports progress and returns the body", async () => {
+    let csrf: string | null = null;
     server.use(
       http.post(`${API}/resumes/`, ({ request }) => {
-        auth = request.headers.get("authorization");
+        csrf = request.headers.get("x-csrftoken");
         return HttpResponse.json({ id: 7 }, { status: 201 });
       }),
     );
     const progress: number[] = [];
     const result = await client().uploadWithProgress("POST", "resumes/", form(), { onProgress: (f) => progress.push(f) });
     expect(result).toEqual({ id: 7 });
-    expect(auth).toBe(`Bearer ${TOKEN}`);
+    expect(csrf).toBe(CSRF);
     expect(progress.at(-1)).toBe(1);
   });
 
@@ -294,7 +316,7 @@ describe("uploadWithProgress (XMLHttpRequest)", () => {
     const error = (await client().uploadWithProgress("POST", "resumes/", form()).catch((e: unknown) => e)) as ApiError;
     expect(error.fieldMessage("file")).toBe("The file is not a valid PDF.");
 
-    server.use(http.post(`${API}/resumes/`, () => HttpResponse.json({ detail: "Invalid token." }, { status: 401 })));
+    server.use(http.post(`${API}/resumes/`, () => HttpResponse.json({ detail: "Not signed in." }, { status: 401 })));
     const onUnauthorized = vi.fn();
     await expect(client({ onUnauthorized }).uploadWithProgress("POST", "resumes/", form())).rejects.toMatchObject({
       kind: "unauthorized",
@@ -302,12 +324,9 @@ describe("uploadWithProgress (XMLHttpRequest)", () => {
     expect(onUnauthorized).toHaveBeenCalledOnce();
   });
 
-  it("makes no request without a token, and rejects absolute paths", async () => {
+  it("rejects absolute paths without making a request", async () => {
     const handler = vi.fn(() => HttpResponse.json({}));
     server.use(http.post(`${API}/resumes/`, handler));
-    await expect(client({ getToken: () => null }).uploadWithProgress("POST", "resumes/", form())).rejects.toMatchObject({
-      status: 401,
-    });
     expect(() => client().uploadWithProgress("POST", "https://evil.example/", form())).toThrow("relative");
     expect(handler).not.toHaveBeenCalled();
   });

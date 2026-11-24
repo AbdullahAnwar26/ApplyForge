@@ -14,7 +14,7 @@ import { useId, useState, type FormEvent } from "react";
 import { isApiError } from "../../api/errors";
 import { createSkill, deleteSkill, listSkillCategories, listSkills, skillKeys } from "../../api/resources";
 import type { Profile, Skill, SkillCategory, SkillCategoryOption } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/Dialog";
 import { FormErrors } from "../../components/Field";

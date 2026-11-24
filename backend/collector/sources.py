@@ -7,6 +7,7 @@ Phase 6b and must implement the same ``iter_posts`` interface.
 """
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol
@@ -40,6 +41,14 @@ class StaticPostSource:
         self.calls.append((list(keywords), limit))
         yield from self.posts[:limit]
 
+    def stream_posts(self, keywords, *, date_posted=None, stop=None, on_stage=None, max_scrolls=None):
+        """Progressive interface (collector.progressive). Records what was asked for."""
+        self.calls.append((list(keywords), {"date_posted": date_posted, "max_scrolls": max_scrolls}))
+        for post in self.posts:
+            if stop is not None and stop.is_set():
+                return
+            yield post
+
 
 class JsonFilePostSource:
     """Reads posts from a JSON file: a list of objects with ``text`` and optional
@@ -51,8 +60,10 @@ class JsonFilePostSource:
 
     name = "file"
 
-    def __init__(self, path):
+    def __init__(self, path, delay_seconds=0.0):
         self.path = Path(path)
+        # Optional pause between posts so offline runs show progress like a real source.
+        self.delay_seconds = delay_seconds
 
     def _load(self):
         try:
@@ -76,7 +87,22 @@ class JsonFilePostSource:
                 author_name=entry.get("author_name") or None,
                 author_headline=entry.get("author_headline") or None,
                 posted_at=_parse_datetime(entry.get("posted_at"), index),
+                truncated=bool(entry.get("truncated")),
             )
+
+
+    def stream_posts(self, keywords, *, date_posted=None, stop=None, on_stage=None, max_scrolls=None):
+        """Progressive interface: every entry in file order (keywords and the LinkedIn
+        date filter do not apply to a file; the runner still applies the date window)."""
+        report = on_stage or (lambda text: None)
+        report(f"Reading {self.path.name}")
+        for index, post in enumerate(self.iter_posts(keywords, 10**9)):
+            if stop is not None and stop.is_set():
+                return
+            if self.delay_seconds:
+                time.sleep(self.delay_seconds)
+            report(f"Reading post {index + 1} from {self.path.name}")
+            yield post
 
 
 def _parse_datetime(value, index):

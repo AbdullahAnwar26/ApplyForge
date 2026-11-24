@@ -318,6 +318,7 @@ describe("helpers", () => {
         experience_info: "",
         preferred_locations: "",
         preferred_work_modes: "",
+        phone_country_code: "",
         experience_years: "0",
         max_acceptable_experience_years: "0",
       },

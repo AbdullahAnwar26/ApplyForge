@@ -1,7 +1,15 @@
+from django.conf import settings
 from django.db import models
 
 
 class Profile(models.Model):
+    # The account this belongs to (accounts milestone). Every API query is limited to the
+    # signed-in user's rows. NULL only for data created before accounts existed; such rows
+    # are invisible until claimed (first account created, or `manage.py claim_unowned_data`).
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="profiles", on_delete=models.CASCADE,
+        null=True, blank=True, db_index=True,
+    )
     name = models.CharField(max_length=255)
     professional_summary = models.TextField(blank=True, null=True)
     target_roles = models.TextField(
@@ -17,6 +25,9 @@ class Profile(models.Model):
         null=True,
         help_text="Comma separated preferred locations"
     )
+    # Digits only, e.g. "91". Used for WhatsApp links when a post gives a number
+    # without its country code. Empty: such numbers need the code added by hand.
+    phone_country_code = models.CharField(max_length=4, blank=True, default="")
     preferred_work_modes = models.CharField(
         max_length=255,
         blank=True,

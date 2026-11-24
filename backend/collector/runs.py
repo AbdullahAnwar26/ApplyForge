@@ -44,13 +44,14 @@ def status_for(result):
     return CollectorRunStatus.SUCCEEDED
 
 
-def record_collection(source, *, trigger, keywords=None, profile=None, limit=None):
+def record_collection(source, *, trigger, owner=None, keywords=None, profile=None, limit=None):
     """Run a collection and record it. Returns ``(run, result)``.
 
     Input and unexpected errors are recorded as FAILED and then re-raised (with
     the run attached as ``exc.run``), so callers keep their existing error handling.
     """
     run = CollectorRun.objects.create(
+        owner=owner,
         trigger=trigger,
         source=getattr(source, "name", type(source).__name__),
         profile=profile,
@@ -58,7 +59,7 @@ def record_collection(source, *, trigger, keywords=None, profile=None, limit=Non
         limit=limit,
     )
     try:
-        result = run_collection(source, keywords=keywords, profile=profile, limit=limit)
+        result = run_collection(source, keywords=keywords, profile=profile, limit=limit, owner=owner)
     except (ScreeningInputError, CollectionInputError) as exc:
         _finish(run, CollectorRunStatus.FAILED, exc.message)
         exc.run = run
@@ -82,8 +83,12 @@ def record_collection(source, *, trigger, keywords=None, profile=None, limit=Non
 def active_run():
     """The RUNNING run that blocks a new one, if any. Stale RUNNING rows (older than
     COLLECTOR_STALE_RUN_MINUTES, e.g. left by a crash) are marked FAILED first."""
+    from .progressive import reconcile_interrupted
+
+    reconcile_interrupted()  # background runs whose heartbeat stopped
     cutoff = timezone.now() - timedelta(minutes=settings.COLLECTOR_STALE_RUN_MINUTES)
-    for stale in CollectorRun.objects.filter(status=CollectorRunStatus.RUNNING, started_at__lt=cutoff):
+    for stale in CollectorRun.objects.filter(status=CollectorRunStatus.RUNNING, heartbeat_at__isnull=True,
+                                             started_at__lt=cutoff):
         _finish(stale, CollectorRunStatus.FAILED,
                 f"Abandoned: still RUNNING after {settings.COLLECTOR_STALE_RUN_MINUTES} minutes.")
     return CollectorRun.objects.filter(status=CollectorRunStatus.RUNNING).order_by("started_at").first()

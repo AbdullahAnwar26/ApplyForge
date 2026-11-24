@@ -80,19 +80,17 @@ def check_environment():
             fail(f"A .env file exists in the release ({candidate}); remove it - production "
                  "settings come only from the systemd EnvironmentFile.")
 
-    # Secrets: real, distinct, long enough.
-    secret_key, api_token = env("SECRET_KEY"), env("API_TOKEN")
-    for name, value, minimum in (("SECRET_KEY", secret_key, 50), ("API_TOKEN", api_token, 32)):
-        if not value:
-            fail(f"{name} is not set.")
-        elif value in DEV_DEFAULTS or value.startswith("django-insecure"):
-            fail(f"{name} is a development default.")
-        elif looks_like_placeholder(value):
-            fail(f"{name} still contains a placeholder.")
-        elif len(value) < minimum:
-            fail(f"{name} must be at least {minimum} characters.")
-    if secret_key and api_token and secret_key == api_token:
-        fail("SECRET_KEY and API_TOKEN must be different.")
+    # Secret key: real and long enough. (Users sign in with their own accounts; there is
+    # no shared API token any more.)
+    secret_key = env("SECRET_KEY")
+    if not secret_key:
+        fail("SECRET_KEY is not set.")
+    elif secret_key in DEV_DEFAULTS or secret_key.startswith("django-insecure"):
+        fail("SECRET_KEY is a development default.")
+    elif looks_like_placeholder(secret_key):
+        fail("SECRET_KEY still contains a placeholder.")
+    elif len(secret_key) < 50:
+        fail("SECRET_KEY must be at least 50 characters.")
 
     # Database: PostgreSQL, filled in.
     database_url = env("DATABASE_URL")

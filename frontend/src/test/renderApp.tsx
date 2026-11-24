@@ -6,10 +6,8 @@ import { App } from "../App";
 import { createQueryClient } from "../api/queryClient";
 import type { Profile } from "../api/types";
 import { AppProviders } from "../app/AppProviders";
-import { TOKEN_STORAGE_KEY } from "../auth/tokenStorage";
-import { API } from "./server";
-
-export const TEST_TOKEN = "test-token-stage1";
+import { authGate, authHandlers, mockSession, resetMockSession, signedOutResponse } from "./mockAuth";
+import { API, server } from "./server";
 
 /** A fictional profile. */
 export function makeProfile(id: number, name: string, overrides: Partial<Profile> = {}): Profile {
@@ -31,16 +29,16 @@ export function makeProfile(id: number, name: string, overrides: Partial<Profile
 
 /** Serve GET profiles/ (plain array, as the backend does without paging). */
 export function profilesHandler(profiles: Profile[]) {
-  return http.get(`${API}/profiles/`, ({ request }) =>
-    request.headers.get("authorization") === `Bearer ${TEST_TOKEN}`
-      ? HttpResponse.json(profiles)
-      : HttpResponse.json({ detail: "Invalid token." }, { status: 401 }),
-  );
+  return http.get(`${API}/profiles/`, () => (mockSession.user ? HttpResponse.json(profiles) : signedOutResponse()));
 }
 
-/** Render the whole app at `path`, already connected unless `connected` is false. */
-export function renderApp({ path = "/", connected = true }: { path?: string; connected?: boolean } = {}) {
-  if (connected) window.sessionStorage.setItem(TOKEN_STORAGE_KEY, TEST_TOKEN);
+/**
+ * Render the whole app at `path`, already signed in (as TEST_USER) unless `signedIn` is false.
+ * Adds the fake account endpoints and the auth gate in front of handlers registered earlier.
+ */
+export function renderApp({ path = "/", signedIn = true }: { path?: string; signedIn?: boolean } = {}) {
+  resetMockSession(signedIn);
+  server.use(authGate(), ...authHandlers());
   const queryClient = createQueryClient();
   const utils = render(
     <AppProviders queryClient={queryClient} baseUrl={API}>

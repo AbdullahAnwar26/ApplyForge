@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 import type { ApplicationDetail, Contact, Skill } from "../api/types";
 import { makeApplication } from "../test/mockApplications";
 import { createMockBackend, makeResume } from "../test/mockBackend";
-import { makeRun } from "../test/mockCollector";
+import { makeItem, makeRun } from "../test/mockCollector";
 import { makeJob } from "../test/mockJobs";
 import { makeProfile, renderApp } from "../test/renderApp";
 import { API, server } from "../test/server";
@@ -133,41 +133,53 @@ describe("5. internal details stay out of the main text", () => {
 
   it("collector run detail replaces exception text, keeping it in technical details", async () => {
     setup({ runs: [makeRun(6, { status: "PARTIAL", error: "OperationalError: database is locked" })] }, "/collector/runs/6");
-    const result = await screen.findByRole("region", { name: "Result" });
-    expect(result).toHaveTextContent("An internal error occurred; the details are in the backend log.");
-    const details = within(result).getByText("Technical details").closest("details")!;
+    const progress = await screen.findByRole("region", { name: "Progress" });
+    expect(await within(progress).findByText(/An internal error occurred; the details are in the backend log\./)).toBeInTheDocument();
+    const details = within(progress).getByText("Technical details").closest("details")!;
     expect(details).toHaveTextContent("OperationalError: database is locked");
   });
 
   it("collector messages written for users stay visible, with links removed", async () => {
     setup({ runs: [makeRun(6, { status: "FAILED", counts: {}, error: "Search page https://www.linkedin.com/search/results/content/?keywords=python did not load." })] }, "/collector/runs/6");
-    const result = await screen.findByRole("region", { name: "Result" });
-    expect(result).toHaveTextContent("Reported problem: Search page [address] did not load.");
-    expect(result).not.toHaveTextContent("linkedin.com");
-    expect(within(result).queryByText("Technical details")).not.toBeInTheDocument();
+    const progress = await screen.findByRole("region", { name: "Progress" });
+    expect(await within(progress).findByText("Search page [address] did not load.")).toBeInTheDocument();
+    expect(progress).not.toHaveTextContent("linkedin.com");
+    expect(within(progress).queryByText("Technical details")).not.toBeInTheDocument();
   });
 
-  it("per-post exception reasons are replaced in the run result", async () => {
-    const { backend, user } = setup({}, "/collector");
-    server.use(
-      http.post(`${API}/collector/runs/`, async ({ request }) => {
-        backend.calls.push({ method: "POST", path: "collector/runs/", body: await request.json() });
-        const run = makeRun(80, { status: "PARTIAL", counts: { found: 1, created: 0, existing: 0, skipped: 0, invalid: 0, failed: 1 }, job_ids: [], error: "" });
-        return HttpResponse.json(
-          { run, outcomes: [{ index: 0, status: "failed", url: null, title: "Data Engineer", job_id: null, matched_by: null, screening_outcome: null, reason: "IntegrityError: UNIQUE constraint failed" }], detail: "1 post(s) failed to ingest." },
-          { status: 502 },
-        );
-      }),
+  it("per-post exception reasons are replaced in the post list", async () => {
+    setup(
+      {
+        runs: [makeRun(80, { status: "PARTIAL", counts: { found: 1, created: 0, existing: 0, skipped: 0, invalid: 0, failed: 1, out_of_range: 0 } })],
+        runItems: { 80: [makeItem(1, { status: "failed", title: "Data Engineer", job: null, reason: "IntegrityError: UNIQUE constraint failed" })] },
+      },
+      "/collector/runs/80",
     );
-    await user.click(await screen.findByRole("button", { name: "Review and start…" }));
+    const items = await screen.findByRole("region", { name: "Posts examined" });
+    expect(await within(items).findByText("Data Engineer")).toBeInTheDocument();
+    expect(items).toHaveTextContent("An internal error occurred; the details are in the backend log.");
+    expect(items).not.toHaveTextContent("IntegrityError");
+  });
+});
+
+describe("3. a finished collection refreshes companies", () => {
+  it("the Jobs company filter reloads after a collection", async () => {
+    const { backend, user } = setup({}, "/jobs");
+    await screen.findByRole("table", { name: "Jobs" });
+    await waitFor(() => expect(gets(backend, "companies/")).toBeGreaterThan(0));
+    const before = gets(backend, "companies/");
+    await user.click(nav().getByRole("link", { name: "Job Automation" }));
+    const query = await screen.findByLabelText(/Search for/);
+    await user.clear(query);
+    await user.type(query, "Python Developer");
+    await user.click(screen.getByRole("button", { name: "Start collecting" }));
     const dialog = screen.getByRole("dialog");
     await user.click(within(dialog).getByRole("checkbox"));
-    await user.click(within(dialog).getByRole("button", { name: "Start collection run" }));
-    const panel = screen.getByRole("region", { name: "Start a collection run" });
-    expect(await within(panel).findByText(/Run #80 finished\./)).toBeInTheDocument();
-    expect(panel).toHaveTextContent("1 post(s) failed to ingest.");
-    expect(panel).toHaveTextContent("An internal error occurred; the details are in the backend log.");
-    expect(panel).not.toHaveTextContent("IntegrityError");
+    await user.click(within(dialog).getByRole("button", { name: "Start collecting" }));
+    await screen.findByText(/Done: \d+ job\(s\) ready to apply/, undefined, { timeout: 5000 });
+    await user.click(nav().getByRole("link", { name: "Jobs" }));
+    await screen.findByRole("table", { name: "Jobs" });
+    await waitFor(() => expect(gets(backend, "companies/")).toBeGreaterThan(before));
   });
 });
 
@@ -211,20 +223,3 @@ describe("2. job changes refresh application data", () => {
   });
 });
 
-describe("3. a finished collector run refreshes companies", () => {
-  it("the Jobs company filter reloads after a run", async () => {
-    const { backend, user } = setup({}, "/jobs");
-    await screen.findByRole("table", { name: "Jobs" });
-    await waitFor(() => expect(gets(backend, "companies/")).toBeGreaterThan(0));
-    const before = gets(backend, "companies/");
-    await user.click(nav().getByRole("link", { name: "Collector" }));
-    await user.click(await screen.findByRole("button", { name: "Review and start…" }));
-    const dialog = screen.getByRole("dialog");
-    await user.click(within(dialog).getByRole("checkbox"));
-    await user.click(within(dialog).getByRole("button", { name: "Start collection run" }));
-    await screen.findByText(/Run #\d+ finished\./);
-    await user.click(nav().getByRole("link", { name: "Jobs" }));
-    await screen.findByRole("table", { name: "Jobs" });
-    await waitFor(() => expect(gets(backend, "companies/")).toBeGreaterThan(before));
-  });
-});

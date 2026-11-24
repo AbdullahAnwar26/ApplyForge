@@ -1,6 +1,6 @@
 /**
  * Applications of the active profile: summary counts (GET applications/summary/),
- * backend-supported filters (status, channel, company, awaiting_action) kept in the
+ * backend-supported filters (status, channel, company, awaiting_action, follow_up_due) kept in the
  * URL, and a paginated list. Nothing is generated or sent from this page.
  */
 
@@ -12,7 +12,9 @@ import {
   APPLICATIONS_PAGE_SIZE,
   applicationKeys,
   getApplicationsOverview,
+  isFollowUpDue,
   listApplications,
+  localToday,
   type ApplicationFilters,
 } from "../../api/applications";
 import { isApiError } from "../../api/errors";
@@ -25,14 +27,14 @@ import {
   type ApplicationSummary,
   type Profile,
 } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
-import { StatusBadge } from "../../components/Badge";
+import { useApi } from "../../auth/AuthProvider";
+import { Badge, StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { DataTable, type Column } from "../../components/DataTable";
 import { PageHeader } from "../../components/PageHeader";
 import { Pagination } from "../../components/Pagination";
 import { EmptyState, ErrorState, Skeleton } from "../../components/States";
-import { formatDate } from "../../lib/format";
+import { formatDate, formatDayUTC } from "../../lib/format";
 import { APPLICATION_CHANNEL, APPLICATION_STATUS } from "../../lib/labels";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
@@ -42,6 +44,8 @@ export interface ApplicationListParams {
   channel?: ApplicationChannel;
   company?: number;
   awaiting: boolean;
+  /** Only open applications whose follow-up reminder day has come. */
+  due: boolean;
   page: number;
 }
 
@@ -56,6 +60,7 @@ export function readApplicationParams(search: URLSearchParams): ApplicationListP
     channel: oneOf(search.get("channel"), APPLICATION_CHANNELS),
     company: positiveInt(search.get("company")),
     awaiting: search.get("awaiting") === "1",
+    due: search.get("due") === "1",
     page: positiveInt(search.get("page")) ?? 1,
   };
 }
@@ -68,6 +73,7 @@ export function writeApplicationParams(current: ApplicationListParams, changes: 
   if (next.channel) search.set("channel", next.channel);
   if (next.company) search.set("company", String(next.company));
   if (next.awaiting) search.set("awaiting", "1");
+  if (next.due) search.set("due", "1");
   if (next.page > 1) search.set("page", String(next.page));
   return search;
 }
@@ -78,10 +84,11 @@ function toFilters(params: ApplicationListParams, profile: number): ApplicationF
   if (params.channel) filters.channel = params.channel;
   if (params.company) filters.company = params.company;
   if (params.awaiting) filters.awaiting_action = true;
+  if (params.due) filters.follow_up_due = true;
   return filters;
 }
 
-const hasFilters = (p: ApplicationListParams) => Boolean(p.status || p.channel || p.company || p.awaiting);
+const hasFilters = (p: ApplicationListParams) => Boolean(p.status || p.channel || p.company || p.awaiting || p.due);
 
 function Summary({ profile, onPick }: { profile: Profile; onPick: (changes: Partial<ApplicationListParams>) => void }) {
   const api = useApi();
@@ -152,6 +159,7 @@ function ApplicationList({ profile }: { profile: Profile }) {
   });
   const outOfRange = isApiError(applications.error) && applications.error.kind === "not_found" && params.page > 1;
 
+  const today = localToday();
   const columns: Column<ApplicationSummary>[] = [
     {
       key: "job",
@@ -175,6 +183,18 @@ function ApplicationList({ profile }: { profile: Profile }) {
     },
     { key: "created", header: "Created", render: (a) => formatDate(a.created_at) },
     { key: "sent", header: "Sent", render: (a) => (a.sent_at ? formatDate(a.sent_at) : <span className="muted">—</span>) },
+    {
+      key: "followup",
+      header: "Follow up",
+      render: (a) =>
+        !a.follow_up_on ? (
+          <span className="muted">—</span>
+        ) : isFollowUpDue(a, today) ? (
+          <Badge tone="warning">Due {formatDayUTC(a.follow_up_on)}</Badge>
+        ) : (
+          formatDayUTC(a.follow_up_on)
+        ),
+    },
   ];
 
   let body: ReactNode;
@@ -253,6 +273,10 @@ function ApplicationList({ profile }: { profile: Profile }) {
         <label className="checkbox filter__toggle">
           <input type="checkbox" checked={params.awaiting} onChange={(e) => change({ awaiting: e.target.checked })} />
           <span>Only those waiting for me</span>
+        </label>
+        <label className="checkbox filter__toggle">
+          <input type="checkbox" checked={params.due} onChange={(e) => change({ due: e.target.checked })} />
+          <span>Follow-up due</span>
         </label>
       </section>
       <div className="list-meta" aria-live="polite">

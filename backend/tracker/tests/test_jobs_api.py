@@ -194,11 +194,11 @@ class IngestTests(JobAPITestCase):
         real = find_existing_job
         calls = []
 
-        def racing_lookup(urls, fingerprint):
+        def racing_lookup(urls, fingerprint, owner):
             calls.append(1)
             if len(calls) == 1:
                 return None, None  # simulate: the other request committed after our check
-            return real(urls, fingerprint)
+            return real(urls, fingerprint, owner)
 
         with mock.patch("tracker.ingestion.find_existing_job", side_effect=racing_lookup):
             response = self.ingest()
@@ -308,7 +308,9 @@ class JobEndpointTests(JobAPITestCase):
         for i in range(7):
             self.ingest(title=f"Job {i}", full_jd=f"Python job {i}, 2 years of experience.",
                         source_url=None, company_name=f"Co {i}", contacts=[])
-        with self.assertNumQueries(2):  # jobs+company, prefetch keywords
+        # session + user, jobs+company, prefetch keywords/contacts/applications, resumes, profiles.
+        # Constant: does not grow with the number of jobs.
+        with self.assertNumQueries(8):
             response = self.client.get("/api/v1/jobs/")
         self.assertEqual(len(response.data), 7)
         response = self.client.get("/api/v1/jobs/?page_size=5&page=2")
@@ -323,7 +325,7 @@ class JobEndpointTests(JobAPITestCase):
         self.assertIn("screening_details", response.data)
         self.assertEqual(self.client.get("/api/v1/jobs/999/").status_code, 404)
 
-    def test_patch_status_only(self):
+    def test_patch_status_and_review_fields_only(self):
         job_id = self.make_jobs()["review"]
         url = f"/api/v1/jobs/{job_id}/"
         response = self.client.patch(url, {"status": "SHORTLISTED"}, format="json")
@@ -331,8 +333,8 @@ class JobEndpointTests(JobAPITestCase):
         self.assertEqual(response.data["status"], "SHORTLISTED")
         self.assertEqual(response.data["screening_outcome"], "NEEDS_REVIEW")  # verdict untouched
 
-        for body in ({"title": "Hacked"}, {"status": "APPLIED", "screening_outcome": "SHORTLISTED"},
-                     {"jd_fingerprint": "x"}, {"status": "BOGUS"}, {}):
+        for body in ({"status": "APPLIED", "screening_outcome": "SHORTLISTED"}, {"jd_fingerprint": "x"},
+                     {"source_url": "https://example.com/x"}, {"status": "BOGUS"}, {"title": ""}, {}):
             with self.subTest(body=body):
                 self.assertEqual(self.client.patch(url, body, format="json").status_code, 400)
         job = JobOpportunity.objects.get(pk=job_id)

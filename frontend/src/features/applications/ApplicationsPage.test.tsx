@@ -124,7 +124,7 @@ describe("application list", () => {
     await screen.findByRole("table", { name: "Applications" });
     expect(Object.fromEntries(seen.at(-1)!)).toEqual({ profile: "1", channel: "EMAIL", page: "1", page_size: "25" });
 
-    await user.selectOptions(screen.getByLabelText("Status"), "Ready to send");
+    await user.selectOptions(screen.getByLabelText("Status"), "Approved");
     await user.selectOptions(screen.getByLabelText("Company"), "Globex Example");
     await user.click(screen.getByRole("checkbox", { name: "Only those waiting for me" }));
     await waitFor(() =>
@@ -191,8 +191,11 @@ describe("application list", () => {
 describe("URL params", () => {
   it("round-trips and resets the page on filter changes", () => {
     const params = readApplicationParams(new URLSearchParams("status=SENT&channel=WHATSAPP&company=4&awaiting=1&page=3"));
-    expect(params).toEqual({ status: "SENT", channel: "WHATSAPP", company: 4, awaiting: true, page: 3 });
+    expect(params).toEqual({ status: "SENT", channel: "WHATSAPP", company: 4, awaiting: true, due: false, page: 3 });
     expect(writeApplicationParams(params, { channel: undefined }).toString()).toBe("status=SENT&company=4&awaiting=1");
+    const due = readApplicationParams(new URLSearchParams("due=1&status=INTERVIEW"));
+    expect(due).toMatchObject({ due: true, status: "INTERVIEW" });
+    expect(writeApplicationParams(due, { status: undefined }).toString()).toBe("due=1");
     expect(writeApplicationParams(params, { page: 2 }).get("page")).toBe("2");
   });
 });

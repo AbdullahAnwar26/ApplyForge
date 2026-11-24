@@ -180,6 +180,21 @@ class LinkedInBrowser:
             raise BrowserError(f"Scrolling failed: {str(exc).splitlines()[0]}") from exc
         self.pause()
 
+    def load_more_results(self):
+        """Click a visible "Show more results" button, if the page has one (pagination).
+        Returns True when clicked. A normal reader action, paced like a scroll."""
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            button = self.page.locator(f"xpath={S.SHOW_MORE_RESULTS}").first
+            if button.count() == 0 or not button.is_visible():
+                return False
+            button.click(timeout=3000)
+        except PlaywrightError:
+            return False  # no usable button: scrolling continues to drive loading
+        self.pause()
+        return True
+
     def expand_see_more(self, max_clicks=15):
         """Click visible "…see more" toggles (a normal reader action). Returns clicks made."""
         from playwright.sync_api import Error as PlaywrightError

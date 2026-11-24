@@ -113,31 +113,32 @@ def normalize_phone(value):
 # Lookups
 # ---------------------------------------------------------------------------
 
-def find_existing_job(url_candidates, fingerprint):
-    """Return ``(job, matched_by)`` for an exact URL or fingerprint match."""
+def find_existing_job(url_candidates, fingerprint, owner):
+    """Return ``(job, matched_by)`` for an exact URL or fingerprint match among ``owner``'s jobs."""
+    jobs = JobOpportunity.objects.filter(owner=owner)
     urls = [u for u in url_candidates if u]
     if urls:
-        job = JobOpportunity.objects.filter(source_url__in=urls).order_by("id").first()
+        job = jobs.filter(source_url__in=urls).order_by("id").first()
         if job:
             return job, "source_url"
-    job = JobOpportunity.objects.filter(jd_fingerprint=fingerprint).order_by("id").first()
+    job = jobs.filter(jd_fingerprint=fingerprint).order_by("id").first()
     if job:
         return job, "jd_fingerprint"
     return None, None
 
 
-def get_or_create_company(name, website=None):
+def get_or_create_company(name, website=None, *, owner):
     name = normalize_whitespace(name)
     if not name:
         return None
-    existing = Company.objects.filter(normalized_name=name.lower()).order_by("id").first()
+    existing = Company.objects.filter(owner=owner, normalized_name=name.lower()).order_by("id").first()
     if existing:
         return existing  # reused as-is; never overwritten
-    return Company.objects.create(name=name, website=website or None)
+    return Company.objects.create(owner=owner, name=name, website=website or None)
 
 
-def get_or_create_contact(data, company=None):
-    """Reuse a contact by normalized email, then phone, then WhatsApp."""
+def get_or_create_contact(data, company=None, *, owner):
+    """Reuse one of ``owner``'s contacts by normalized email, then phone, then WhatsApp."""
     email = (data.get("email") or "").strip().lower()
     phone = normalize_phone(data.get("phone"))
     whatsapp = normalize_phone(data.get("whatsapp"))
@@ -149,10 +150,11 @@ def get_or_create_contact(data, company=None):
     if whatsapp:
         lookups.append({"normalized_whatsapp": whatsapp})
     for lookup in lookups:
-        existing = Contact.objects.filter(**lookup).order_by("id").first()
+        existing = Contact.objects.filter(owner=owner, **lookup).order_by("id").first()
         if existing:
             return existing
     return Contact.objects.create(
+        owner=owner,
         name=normalize_whitespace(data.get("name")) or None,
         email=data.get("email") or None,
         phone=data.get("phone") or None,
@@ -165,6 +167,28 @@ def get_or_create_contact(data, company=None):
 # Ingestion
 # ---------------------------------------------------------------------------
 
+def _complete_truncated(job, data, fingerprint):
+    """A job saved from a cut-off post gets the full text when the same post (same URL)
+    is collected again complete. Nothing else about the existing job changes."""
+    if job.jd_complete or not data.get("jd_complete", True):
+        return
+    if "full_jd" in (job.extraction or {}).get("edited_fields", []):
+        return  # the user already pasted the description; never overwrite their text
+    clash = JobOpportunity.objects.filter(owner=job.owner, jd_fingerprint=fingerprint).exclude(pk=job.pk)
+    if clash.exists():
+        return
+    extraction = dict(job.extraction or {})
+    if data.get("extraction"):
+        extraction.update({k: v for k, v in data["extraction"].items() if k != "edited_fields"})
+    job.full_jd = data["full_jd"].strip()
+    job.source_post_text = (data.get("source_post_text") or job.full_jd).strip()
+    job.jd_fingerprint = fingerprint
+    job.jd_complete = True
+    job.extraction = extraction
+    job.save(update_fields=["full_jd", "source_post_text", "jd_fingerprint", "jd_complete",
+                            "extraction", "updated_at"])
+
+
 @dataclass
 class IngestResult:
     job: JobOpportunity
@@ -176,23 +200,27 @@ def ingest_job(data, profile, skills):
     """Create and screen a job, or return the existing exact match unchanged.
 
     ``data`` is validated input (see ``JobIngestSerializer``). ``profile`` and
-    ``skills`` come from ``screening.resolve_profile``.
+    ``skills`` come from ``screening.resolve_profile``. The job belongs to the
+    profile's owner; duplicates are matched among that owner's jobs only.
     """
+    owner = profile.owner
     raw_url = (data.get("source_url") or "").strip() or None
     source_url = normalize_source_url(raw_url)
     fingerprint = jd_fingerprint(data["full_jd"])
     url_candidates = {source_url, raw_url}
 
-    existing, matched_by = find_existing_job(url_candidates, fingerprint)
+    existing, matched_by = find_existing_job(url_candidates, fingerprint, owner)
     if existing:
+        _complete_truncated(existing, data, fingerprint)
         return IngestResult(existing, created=False, matched_by=matched_by)
 
     try:
         with transaction.atomic():
             company = get_or_create_company(
-                data.get("company_name"), data.get("company_website")
+                data.get("company_name"), data.get("company_website"), owner=owner
             )
             job = JobOpportunity.objects.create(
+                owner=owner,
                 title=normalize_whitespace(data["title"]),
                 full_jd=data["full_jd"].strip(),
                 jd_fingerprint=fingerprint,
@@ -205,9 +233,14 @@ def ingest_job(data, profile, skills):
                 required_experience_text=(
                     normalize_whitespace(data.get("required_experience_text")) or None
                 ),
+                recruiter_name=normalize_whitespace(data.get("recruiter_name")),
+                recruiter_headline=normalize_whitespace(data.get("recruiter_headline")),
+                source_post_text=(data.get("source_post_text") or "").strip(),
+                jd_complete=data.get("jd_complete", True),
+                extraction=data.get("extraction") or {},
             )
             contacts = [
-                get_or_create_contact(contact, company)
+                get_or_create_contact(contact, company, owner=owner)
                 for contact in data.get("contacts") or []
             ]
             if contacts:
@@ -215,7 +248,7 @@ def ingest_job(data, profile, skills):
             screen_job(job, profile, skills)
     except IntegrityError:
         # A concurrent ingest created the same URL/fingerprint first.
-        existing, matched_by = find_existing_job(url_candidates, fingerprint)
+        existing, matched_by = find_existing_job(url_candidates, fingerprint, owner)
         if existing:
             return IngestResult(existing, created=False, matched_by=matched_by)
         raise

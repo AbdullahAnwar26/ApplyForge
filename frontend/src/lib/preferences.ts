@@ -2,7 +2,7 @@
  * Small per-browser preferences in localStorage (theme, active profile id),
  * readable from React through useSyncExternalStore.
  *
- * Never used for the API token (see auth/tokenStorage.ts). Every access is
+ * Never used for sign-in data (sessions are HttpOnly cookies). Every access is
  * wrapped: storage can be unavailable (private mode, blocked site data), in
  * which case the value lives in memory for this page only.
  */

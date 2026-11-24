@@ -51,3 +51,6 @@ backend/post_identity_debug.txt
 # Staging/production operator files (no secrets in the repository)
 deploy/hetzner/hetzner.env
 release-out/
+
+# TypeScript incremental build state
+*.tsbuildinfo

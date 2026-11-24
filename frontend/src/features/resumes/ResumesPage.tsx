@@ -9,7 +9,7 @@ import { useState } from "react";
 
 import { deleteResume, getResumeText, listResumes, resumeKeys, updateResume } from "../../api/resources";
 import type { Profile, Resume } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { Badge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { DataTable, type Column } from "../../components/DataTable";

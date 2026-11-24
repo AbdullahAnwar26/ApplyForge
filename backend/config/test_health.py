@@ -97,7 +97,7 @@ class NoInternalInformationTests(TestCase):
         db = settings.DATABASES["default"]
         forbidden = [
             str(settings.BASE_DIR), str(db.get("NAME")), db["ENGINE"], "sqlite", "postgres",
-            settings.SECRET_KEY, settings.API_TOKEN, "DATABASE_URL", "DEBUG", "version", "django",
+            settings.SECRET_KEY, "DATABASE_URL", "DEBUG", "version", "django",
         ]
         for value in forbidden:
             with self.subTest(value=value):

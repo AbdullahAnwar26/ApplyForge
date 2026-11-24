@@ -1,40 +1,42 @@
 """
-Collector API (Phase 6c), mounted at ``/api/v1/collector/``.
+Collector API, mounted at ``/api/v1/collector/``. Every query is limited to the
+signed-in user's runs.
 
-* ``GET  runs/``       run history, newest first. Filters: ``status``, ``trigger``,
-                       ``profile``. Paginated only when ``page``/``page_size`` is given.
-* ``GET  runs/{id}/``  one run.
-* ``POST runs/``       start a LinkedIn collection and wait for it (synchronous, small).
+* ``GET  runs/``                run history, newest first. Filters: ``status``,
+                                ``trigger``, ``profile``. Paginated with ``page``/``page_size``.
+* ``GET  runs/{id}/``           one run, with live progress while it is RUNNING.
+* ``GET  runs/{id}/items/``     what happened to each post the run examined.
+* ``POST runs/``                start a collection in the background; 202 with the run.
+* ``POST runs/{id}/cancel/``    ask a running collection to stop (keeps what it collected).
+* ``POST runs/{id}/continue/``  start a new run with the same search for the jobs still missing.
 
-POST body (all optional): ``keywords`` (list of strings; default: the profile's
-target roles), ``limit`` (1..COLLECTOR_API_MAX_POSTS_PER_RUN, default
-COLLECTOR_API_DEFAULT_POSTS_PER_RUN), ``profile`` (id; required when several
-profiles exist). Unknown fields are rejected - in particular there is no file
-source over HTTP. Only one run at a time (409 while another is RUNNING).
+POST runs/ body: ``query`` (required), ``target`` (number of NEW jobs wanted,
+1..COLLECTOR_API_MAX_POSTS_PER_RUN), ``date_range`` (``any``, ``past-24h``,
+``past-week``, ``past-month``, ``custom`` with ``date_from`` and optional
+``date_to``), ``profile`` (id; required when several profiles exist). Unknown
+fields are rejected. One collection runs at a time on the server (the LinkedIn
+browser profile is shared): 409 while another is RUNNING.
 
-Responses: 201 SUCCEEDED; 502 PARTIAL/FAILED (source failure or posts that
-failed to ingest - what succeeded is kept); 400 invalid input (a FAILED run is
-recorded when the collection service rejected it); 409 another run is active;
-500 unexpected error (recorded as FAILED, details only in the server log).
-Nothing is ever applied for or sent. Throttle scope: ``collector-run``.
+Nothing is ever applied for or sent. Throttle scope for starting: ``collector-run``.
 """
 
 import threading
 
 from django.conf import settings
 from rest_framework import mixins, serializers, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
 from tracker.models import Profile
+from tracker.api.ownership import OwnedModelSerializer, OwnedSerializer
 from tracker.screening import ScreeningInputError
 
-from .models import CollectorRun, CollectorRunStatus, CollectorRunTrigger
-from .runs import active_run, record_collection
-from .service import CollectionInputError
+from . import progressive
+from .models import CollectedPost, CollectedPostStatus, CollectorRun, CollectorRunStatus, CollectorRunTrigger, DateRange
+from .runs import active_run
 
-MAX_KEYWORDS = 10
-MAX_KEYWORD_LENGTH = 100
+MAX_QUERY_LENGTH = 200
 
 # One collection per process at a time; the RUNNING-row check covers other processes.
 _run_lock = threading.Lock()
@@ -49,36 +51,61 @@ def make_api_source():
     return LinkedInPostSource(browser_factory=lambda: default_browser())
 
 
-class CollectorRunSerializer(serializers.ModelSerializer):
+class CollectorRunSerializer(OwnedModelSerializer):
     duration_seconds = serializers.FloatField(read_only=True)
+    remaining = serializers.SerializerMethodField()
 
     class Meta:
         model = CollectorRun
         fields = (
             "id", "status", "trigger", "source", "profile", "keywords", "limit", "counts",
             "job_ids", "error", "started_at", "finished_at", "duration_seconds",
+            "search_query", "date_range", "date_from", "date_to", "cancel_requested",
+            "stage", "stop_reason", "heartbeat_at", "remaining",
         )
         read_only_fields = fields
 
+    def get_remaining(self, run):
+        if not run.limit:
+            return None
+        return max(0, run.limit - done_towards_target(run))
 
-class CollectorRunStartSerializer(serializers.Serializer):
-    keywords = serializers.ListField(
-        child=serializers.CharField(max_length=MAX_KEYWORD_LENGTH, trim_whitespace=True),
-        required=False, allow_empty=False, max_length=MAX_KEYWORDS,
-    )
-    limit = serializers.IntegerField(required=False, min_value=1)
+
+def done_towards_target(run):
+    """Jobs counted towards the run's target: ready to apply (runs before that count
+    existed counted every new job)."""
+    counts = run.counts or {}
+    return int(counts.get(progressive.READY, counts.get("created", 0)))
+
+
+class CollectedPostSerializer(OwnedModelSerializer):
+    class Meta:
+        model = CollectedPost
+        fields = ("id", "position", "status", "post_url", "title", "job", "matched_by", "reason",
+                  "posted_at", "truncated", "created_at")
+        read_only_fields = fields
+
+
+class CollectionStartSerializer(OwnedSerializer):
+    query = serializers.CharField(max_length=MAX_QUERY_LENGTH, trim_whitespace=True)
+    target = serializers.IntegerField(required=False, min_value=1)
+    date_range = serializers.ChoiceField(choices=DateRange.choices, required=False, default=DateRange.ANY)
+    date_from = serializers.DateField(required=False, allow_null=True)
+    date_to = serializers.DateField(required=False, allow_null=True)
     profile = serializers.PrimaryKeyRelatedField(queryset=Profile.objects.all(), required=False)
 
-    def validate_limit(self, value):
-        maximum = min(settings.COLLECTOR_API_MAX_POSTS_PER_RUN, settings.COLLECTOR_MAX_POSTS_PER_RUN)
+    def validate_target(self, value):
+        maximum = progressive.max_target()
         if value > maximum:
-            raise ValidationError(f"Ensure this value is less than or equal to {maximum}.")
+            raise ValidationError(f"Choose at most {maximum} jobs per run.")
         return value
 
     def validate(self, attrs):
         unknown = sorted(set(self.initial_data) - set(self.fields))
         if unknown:
             raise ValidationError({name: ["Unknown field."] for name in unknown})
+        if attrs.get("date_range") != DateRange.CUSTOM:
+            attrs["date_from"] = attrs["date_to"] = None
         return attrs
 
 
@@ -110,12 +137,13 @@ class CollectorRunViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, view
     lookup_value_regex = r"\d+"
 
     def get_throttles(self):
-        # Only starting a run is throttled; history reads are not.
-        self.throttle_scope = "collector-run" if self.action == "create" else None
+        # Only starting a run is throttled; reads and cancelling are not.
+        self.throttle_scope = "collector-run" if self.action in ("create", "continue_run") else None
         return super().get_throttles()
 
     def get_queryset(self):
-        queryset = CollectorRun.objects.all()
+        progressive.reconcile_interrupted()
+        queryset = CollectorRun.objects.filter(owner=self.request.user)
         if self.action != "list":
             return queryset
         filters = {
@@ -128,49 +156,78 @@ class CollectorRunViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, view
     def create(self, request):
         if not isinstance(request.data, dict):
             raise ValidationError({"non_field_errors": ["Expected a JSON object."]})
-        start = CollectorRunStartSerializer(data=request.data)
+        start = CollectionStartSerializer(data=request.data, context={"request": request})
         start.is_valid(raise_exception=True)
         data = start.validated_data
-        limit = data.get("limit", min(settings.COLLECTOR_API_DEFAULT_POSTS_PER_RUN,
-                                      settings.COLLECTOR_API_MAX_POSTS_PER_RUN))
+        default_target = min(settings.COLLECTOR_API_DEFAULT_POSTS_PER_RUN, progressive.max_target())
+        return self._start(
+            request, query=data["query"], target=data.get("target", default_target),
+            date_range=data.get("date_range") or DateRange.ANY, date_from=data.get("date_from"),
+            date_to=data.get("date_to"), profile=data.get("profile"),
+        )
 
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        run = self.get_object()
+        if run.status != CollectorRunStatus.RUNNING:
+            raise ValidationError(
+                {"status": [f"This run is not running (it is {run.get_status_display().lower()})."]}
+            )
+        progressive.request_cancel(run)
+        run.refresh_from_db()
+        return Response(CollectorRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"], url_path="continue")
+    def continue_run(self, request, pk=None):
+        """Collect the jobs a cancelled/interrupted/stopped run did not reach."""
+        run = self.get_object()
+        if run.status == CollectorRunStatus.RUNNING:
+            raise ValidationError({"status": ["This run is still running."]})
+        remaining = max(0, (run.limit or 0) - done_towards_target(run))
+        if not run.search_query or remaining < 1:
+            raise ValidationError({"status": ["Nothing is left to collect for this run."]})
+        return self._start(
+            request, query=run.search_query, target=min(remaining, progressive.max_target()),
+            date_range=run.date_range, date_from=run.date_from, date_to=run.date_to,
+            profile=run.profile,
+        )
+
+    @action(detail=True, methods=["get"])
+    def items(self, request, pk=None):
+        run = self.get_object()
+        items = run.items.order_by("position")
+        item_status = _choice_param(request, "status", CollectedPostStatus.values)
+        if item_status:
+            items = items.filter(status=item_status)
+        context = {"request": request}
+        page = self.paginate_queryset(items)
+        if page is not None:
+            return self.get_paginated_response(CollectedPostSerializer(page, many=True, context=context).data)
+        return Response(CollectedPostSerializer(items, many=True, context=context).data)
+
+    def _start(self, request, **params):
         if not _run_lock.acquire(blocking=False):
-            return self._conflict(active_run())
+            return self._conflict(active_run(), request.user)
         try:
             running = active_run()
             if running is not None:
-                return self._conflict(running)
+                return self._conflict(running, request.user)
             try:
-                run, result = record_collection(
-                    make_api_source(), trigger=CollectorRunTrigger.API,
-                    keywords=data.get("keywords"), profile=data.get("profile"), limit=limit,
-                )
-            except (ScreeningInputError, CollectionInputError) as exc:
-                return Response(
-                    {exc.field: [exc.message], "run": exc.run.pk},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            except Exception as exc:  # recorded as FAILED by record_collection (and logged)
-                return Response(
-                    {"detail": "The collector run failed unexpectedly; see the server log.",
-                     "run": getattr(getattr(exc, "run", None), "pk", None)},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
+                run = progressive.start_collection(make_api_source(), owner=request.user, **params)
+            except (ScreeningInputError, progressive.CollectionRequestError) as exc:
+                return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
         finally:
             _run_lock.release()
-
-        body = {
-            "run": CollectorRunSerializer(run).data,
-            "outcomes": result.as_dict()["outcomes"],
-        }
-        code = status.HTTP_201_CREATED if run.status == CollectorRunStatus.SUCCEEDED else status.HTTP_502_BAD_GATEWAY
-        if code != status.HTTP_201_CREATED:
-            body["detail"] = run.error or f"{run.counts.get('failed', 0)} post(s) failed to ingest."
-        return Response(body, status=code)
+        run.refresh_from_db()
+        return Response({"run": CollectorRunSerializer(run).data}, status=status.HTTP_202_ACCEPTED)
 
     @staticmethod
-    def _conflict(running):
-        return Response(
-            {"detail": "Another collector run is in progress.", "run": running.pk if running else None},
-            status=status.HTTP_409_CONFLICT,
+    def _conflict(running, user):
+        # One collection runs at a time on the server; another account's run id is not revealed.
+        mine = running is not None and running.owner_id == user.pk
+        detail = (
+            "Your previous collection is still running. Wait for it to finish or cancel it." if mine
+            else "Another collection is running on this server. Try again in a few minutes."
         )
+        return Response({"detail": detail, "run": running.pk if mine else None},
+                        status=status.HTTP_409_CONFLICT)

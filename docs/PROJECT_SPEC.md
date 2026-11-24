@@ -17,7 +17,9 @@ Every statement below is labelled as one of:
 
 ## 1. Purpose
 
-ApplyForge is a single-user, personal job-application assistant. It:
+ApplyForge is a personal job-application assistant. Several people can use one
+server, each with their own account and completely separate data (accounts
+milestone, 2026-11-23). For each user it:
 
 1. Discovers job postings (initially LinkedIn).
 2. Extracts job and recruiter details (title, company, description, experience,
@@ -65,8 +67,10 @@ These rules are fixed. Later milestones must not contradict them.
 8. **Single generation provider:** local Ollama/Qwen only, with no fallback
    provider. If generation fails, return a clear error and create **no**
    `Application` record.
-9. **Manual sending:** every application is reviewed and sent by the user.
-   ApplyForge never sends email (or any message) automatically.
+9. **Confirmed sending only:** every application is reviewed and approved by the
+   user. ApplyForge never sends email (or any message) automatically: an email is
+   sent from the user's own mailbox only after an explicit confirmation of the exact
+   preview; WhatsApp is a click-to-chat hand-off the user completes in WhatsApp.
 10. **Historical Qwen configuration:** model `qwen3:1.7b`, base URL
     `http://localhost:11434/v1` (OpenAI-compatible chat completions),
     `temperature=0.3`, `max_tokens=768`, `think=False`, timeout 180 s.
@@ -98,7 +102,7 @@ These rules are fixed. Later milestones must not contradict them.
 
 | Area | State |
 |---|---|
-| `config/settings.py` | Env-driven settings. SQLite by default; PostgreSQL via `DATABASE_URL`. CORS for Vite dev ports. `API_TOKEN`. Celery/Redis. Logging. Production hardening when `DEBUG=False`. |
+| `config/settings.py` | Env-driven settings. SQLite by default; PostgreSQL via `DATABASE_URL`. CORS for Vite dev ports. `SIGNUP_ENABLED`, session/CSRF cookie settings. Celery/Redis. Logging. Production hardening when `DEBUG=False`. |
 | `config/celery.py` | Celery app with autodiscovery. No tasks exist yet. |
 | `config/urls.py` | `admin/`, `api/v1/health/` (Milestone 8.3, unauthenticated), `api/v1/` → `tracker.api.urls`, and (Phase 6c) `api/v1/collector/` → `collector.urls`. |
 | `tracker/models/` | `Profile`, `Skill`, `SkillCategory`, `Resume`, `Company`, `Contact`, `JobOpportunity`, `JobSource`, `JobStatus`, `ScreeningOutcome`, `ScreeningReason`, `Application`, `ApplicationStatus`, `ApplicationChannel`, `ApplicationEvent`. |
@@ -182,22 +186,34 @@ Milestone 3 only added the fields above.
 ### Conventions [Verified — Milestone 1]
 
 - **Base path:** `/api/v1/`.
-- **Authentication:** `tracker.api.auth.StaticTokenAuthentication`, the
-  project-wide default, together with `IsAuthenticated`.
-  - Header: `Authorization: Bearer <API_TOKEN>`. The scheme name is
-    case-insensitive.
-  - A missing header gives `401` with
-    `WWW-Authenticate: Bearer realm="api"`.
-  - A wrong scheme, a malformed header or a wrong token gives `401`.
-  - If `API_TOKEN` is unset, `None`, empty or whitespace-only, every request
-    is rejected (fail closed).
-  - Tokens are compared in constant time. Authentication does no database
-    access and creates no users. A valid token yields an in-memory
-    `StaticTokenUser` principal.
-  - Note: `settings.py` defaults `API_TOKEN` to `local-dev-token` when the
-    variable is unset and `DEBUG=True`. With `DEBUG=False`, startup refuses
-    that default. Local `.env` files should set a real token.
-    `.env.example` does not yet list `API_TOKEN`.
+- **Authentication [Verified — accounts milestone, 2026-11-23]:** Django user
+  accounts with session cookies (`tracker.api.auth.SessionAuthentication401`,
+  the project-wide default, with `IsAuthenticated`). The shared `API_TOKEN`
+  is gone.
+  - Account endpoints under `auth/`: `csrf/` (GET, sets the `csrftoken`
+    cookie), `signup/`, `login/` (`remember=false` ends the session when the
+    browser closes; otherwise 2 weeks), `logout/`, `me/`, `password/`.
+  - Signed out: `401` with `WWW-Authenticate: Session realm="api"`.
+  - Every write (and login/sign-up) needs the CSRF token in `X-CSRFToken`.
+    The session cookie is HttpOnly.
+  - Passwords follow Django's validators (length, common, numeric,
+    similarity). Wrong username or password gives one generic message.
+    Usernames are case-insensitive and unique. Login, sign-up and password
+    change are throttled (`auth`, 10/min per address).
+  - `SIGNUP_ENABLED` (default `True`) switches open sign-up off.
+- **Data ownership:** `Profile`, `JobOpportunity`, `Company`, `Contact` and
+  `CollectorRun` have an `owner`; skills, resumes, applications and events are
+  owned through their profile. Every queryset and every submitted id
+  (`profile`, `job`, `contact`, `resume`...) is limited to the signed-in user;
+  another account's ids behave exactly like ids that do not exist (404 /
+  "does not exist"). Duplicate detection (source URL, JD fingerprint,
+  possible duplicates, company and contact reuse) works within one account,
+  so two users can each save the same posting (`unique_job_owner_*`
+  constraints, migration `0010`).
+- **Existing data:** rows created before accounts have no owner and are
+  invisible until claimed: the first account created through sign-up claims
+  them automatically; otherwise `manage.py claim_unowned_data <username>`.
+  `collect_linkedin` takes `--user` (required when several accounts exist).
 - **Pagination:** `tracker.api.pagination.OptionalPagination`, the
   project-wide default.
   - Without `page` and without `page_size`, the response is a plain JSON
@@ -399,6 +415,24 @@ already existed.
 On every failure (user decision, Milestone 5), the status and any earlier
 drafts are unchanged, no event is written, and no application is created. No
 database lock is held during the model call.
+
+### Application lifecycle, reminders, notes and job search [Verified — local product review, 2026-11-22]
+
+Added after an end-to-end review of the local app (real browser, disposable database).
+Migration `0009` is additive: two new fields and two new status choices; existing rows keep their values.
+
+| Change | Behaviour |
+|---|---|
+| Statuses `INTERVIEW` ("Interviewing") and `OFFER` | Like `FOLLOW_UP`/`REJECTED`: only after sending; never back to a pre-send status. Both count as "awaiting user action". |
+| `Application.follow_up_on` (date, nullable) | Follow-up reminder day. PATCH-able (`YYYY-MM-DD` or `null`, no event written). Marking `SENT` sets it to today + `FOLLOW_UP_DEFAULT_DAYS` (7) when unset; the UI sends the user's own date with the status change. `REJECTED` clears it. Due on and after that day while the status is `SENT`, `FOLLOW_UP`, `INTERVIEW` or `OFFER`. Reminders are shown in the app only; nothing is sent (rule 9). |
+| `GET applications/?follow_up_due=true` | Open applications whose reminder is due, earliest first. Optional `today=YYYY-MM-DD` (the client's calendar day; the server's `TIME_ZONE` date otherwise). |
+| `GET applications/summary/` | Adds `sent_total` (ever sent) and `follow_ups_due: {count, items (10)}`; accepts `today=`. `by_status` has 11 keys. |
+| `POST applications/{id}/notes/` `{note}` | 201 with the event. A note without a status change: `ApplicationEvent.kind = NOTE`, `status` = the current status. Events now include `kind` (`STATUS` or `NOTE`). |
+| `GET jobs/?search=<text>` | Every word must appear (case-insensitive) in the title, company name, location or description. At most 200 characters. Combines with the other filters. |
+
+UI: one-click "Shortlist this job" on a job's Application panel; reminder control and notes on the application page;
+"Follow-up due" filter and column on Applications; dashboard outcome figures (sent, interviewing, offers, rejected) and
+follow-ups due; screening counts labelled as screening results; a search box on Jobs.
 
 ### Planned resources [Proposed]
 
@@ -664,6 +698,89 @@ most 5 posts. They wrote only to the scratch database
   (scratch database, which first needs the `collector/0001` migration).
 
 ---
+
+## 5a. Job Automation [Verified - 2026-11-23]
+
+One page (`/automation`) for the whole routine: **Search -> Collect -> Review -> Generate -> Send**.
+
+**Collect (`collector/progressive.py`).** `POST collector/runs/ {query, target, date_range,
+date_from?, date_to?, profile?}` records a RUNNING run and returns 202 at once; the run continues
+in a background thread. The source (Playwright browser) runs in its own producer thread with no
+database access; the consumer ingests each post through the existing service (validation,
+URL/fingerprint de-duplication, company/contact reuse, screening) and saves counts, stage and a
+heartbeat as it goes. `target` is the number of NEW jobs (duplicates and non-job posts do not
+count), up to `COLLECTOR_API_MAX_POSTS_PER_RUN` (default 500, a safety ceiling). A run ends at the
+target, when results are exhausted (3 scrolls without anything new, or 10 dated posts in a row
+older than the range), on cancel (`POST runs/{id}/cancel/`), at `COLLECTOR_MAX_RUN_MINUTES`, after
+`target x COLLECTOR_POSTS_EXAMINED_PER_JOB` posts, or on a source error. A run whose heartbeat is
+older than `COLLECTOR_HEARTBEAT_STALE_SECONDS` becomes INTERRUPTED; `POST runs/{id}/continue/`
+starts a new run for the remaining jobs. Each examined post is a `CollectedPost`
+(`GET runs/{id}/items/`). Date filters use LinkedIn's own "Date posted" filter (24 h / week /
+month); a custom range uses the narrowest covering filter and then keeps only posts dated inside
+it. Pagination: scrolling plus "Show more results" when the page offers it. Login walls and
+security checks stop the run with a clear error; nothing is bypassed. One collection at a time
+per server (the LinkedIn browser profile is shared).
+
+**Extraction.** "... more" is expanded, with a second pass for posts still collapsed. A post that
+still shows its "... more" control (or ends in "...") is saved with `jd_complete=False`;
+generation refuses it until the user pastes the full description (a later complete copy of the
+same post completes it, unless the user edited it). The original post text, the recruiter (post
+author) and, for every email/phone found, the line it came from (`extraction.contacts`) are kept.
+Dates, repeated digits and file names are not taken for contact details. Nothing is invented.
+
+**Review (`tracker/review.py`).** Job list/detail include `contact_summary`, `eligibility`
+(already applied, cut-off description, no contact, no resume...), `matching_resume` (title words
+vs resume name/type, else the default) and the application, if any. `PATCH jobs/{id}/` corrects
+title, company, location, recruiter, description and contacts (`edited_fields` recorded; the
+original post is never changed). `POST jobs/{id}/select/` and `POST jobs/select/` shortlist and
+create ONE application per profile and job (repeat calls return the existing one) with the
+matching resume and the best contact/channel; `POST jobs/bulk-status/` skips several jobs.
+
+**Generate (`tracker/generation.py`).** Unchanged provider and no-fallback rule. The prompt
+requires naming the role and connecting specific JD requirements to profile/resume facts, says
+whether a resume is attached, and asks for a WhatsApp message only when the contact has a number.
+Output that does not name the job's title words or company is rejected as generic; a missing or
+overlong WhatsApp message is a failure. `generation_notes` records `gaps` (requirements not
+claimed) and `unsupported_terms` (technologies in the draft that appear nowhere in the
+profile/resume), shown to the user before sending.
+
+**Send (`tracker/sending.py`).** Email goes from the user's own mailbox over SMTP
+(`SendingAccount`, password Fernet-encrypted with `CREDENTIALS_KEY` or a key derived from
+`SECRET_KEY`, never returned). `GET applications/{id}/send-preview/` returns exactly what would be
+sent and its `version`; `POST applications/{id}/send/ {version, confirm: true}` requires the
+application to be approved (`READY_TO_SEND`) or a previous send to have failed (`SEND_FAILED`),
+and refuses any change since the preview. One send at a time; never twice. Success: SENT
+(job APPLIED, follow-up set); failure: SEND_FAILED with the reason, retry allowed. WhatsApp:
+click-to-chat link (`wa.me`) with the drafted text; the user attaches the resume and sends in
+WhatsApp, then confirms (`POST whatsapp-sent/`). The WhatsApp Business Cloud API is not used (it
+needs a business number and pre-approved templates). Every attempt is a `SendRecord`. Resumes
+download only through `GET resumes/{id}/download/` (owner only); `/media/` is never served.
+
+**Hand-off (the default way to send).** The user presses Send in their own email app or WhatsApp;
+ApplyForge prepares the message and tracks it. `POST applications/{id}/compose/ {channel, method,
+version}` (approved application, the previewed version) opens it and never sends:
+`EMAIL`/`mailbox` saves the email - recipient, subject, body, resume attached - as a draft in the
+user's own mailbox over IMAP with the SMTP login (`tracker/mailbox.py`; IMAP server derived from
+the SMTP server or entered; a `mailto:` link is not used because it cannot attach files) and opens
+the provider's Drafts page (Gmail, Outlook; other providers: the user opens Drafts in their app);
+`EMAIL`/`eml` serves a draft file with `X-Unsent: 1` (`GET compose/draft/?record=`) that desktop
+email apps open as a new message with the attachment; `WHATSAPP`/`link` opens `wa.me` (the resume
+is downloaded and attached by hand). The record and the application become `COMPOSE_OPENED`
+(system-only status; opening never means sent). It ends by `compose/verify/` (read-only search of
+the mailbox's Sent folder: same Message-ID, or same recipient sent after the draft was made ->
+VERIFIED), `compose/confirm/ {record, confirm: true}` (CONFIRMED) - both make the application SENT -
+or `compose/abandon/` (ABANDONED, back to READY_TO_SEND, can be opened again). A failed draft
+(e.g. IMAP login refused) is a FAILED record and SEND_FAILED. Database constraints: one open
+hand-off per application, one sent record per channel; a second confirmation is refused (409). An
+application can be sent on both channels: the first makes it SENT, the second is a history note.
+`send_state` on application list/detail gives each channel's state (none/open/sent/failed). In
+local/test mode (`EMAIL_DRAFTS_BACKEND=local`, the default with a non-SMTP email backend) drafts go
+to `EMAIL_DRAFTS_LOCAL_PATH/<user id>/Drafts` and the Sent check reads `.../Sent`. Direct sending
+from ApplyForge (above) remains available as a secondary option with its checkbox confirmation.
+
+**Isolation.** Runs, examined posts, jobs, drafts, resumes, sending accounts and send records are
+limited to the signed-in user at the API, service and query level (tests in
+`collector/tests/test_progressive.py`, `tracker/tests/test_job_automation.py`).
 
 ## 6. Rebuild plan
 

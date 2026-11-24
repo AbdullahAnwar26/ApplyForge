@@ -1,6 +1,7 @@
 /**
- * One application: overview, status changes (backend rules), contact/channel/resume,
- * drafts (explicit generation, review, copy, saving edits) and the status history.
+ * One application: overview, status changes (backend rules), follow-up reminder,
+ * contact/channel/resume, drafts (explicit generation, review, copy, saving edits) and
+ * the history with notes.
  * Nothing on this page sends a message; "Sent" only records that the user sent it.
  */
 
@@ -9,11 +10,17 @@ import { useId, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import {
+  addApplicationNote,
+  addDays,
   allowedStatusChanges,
   applicationKeys,
+  FOLLOW_UP_DEFAULT_DAYS,
+  FOLLOW_UP_OPEN_STATUSES,
   getApplication,
   getApplicationEvents,
+  isFollowUpDue,
   isSent,
+  localToday,
   updateApplication,
   type ApplicationUpdate,
 } from "../../api/applications";
@@ -21,8 +28,8 @@ import { isApiError } from "../../api/errors";
 import { getJob, jobKeys } from "../../api/jobs";
 import { listResumes, resumeKeys } from "../../api/resources";
 import { APPLICATION_CHANNELS, type ApplicationChannel, type ApplicationDetail, type ApplicationStatus, type JobDetail } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
-import { StatusBadge } from "../../components/Badge";
+import { useApi } from "../../auth/AuthProvider";
+import { Badge, StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/Dialog";
 import { Field, FormErrors } from "../../components/Field";
@@ -30,11 +37,12 @@ import { TechnicalDetails } from "../../components/TechnicalDetails";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyState, ErrorState, Skeleton } from "../../components/States";
 import { useToast } from "../../components/Toast";
-import { formatDateTime } from "../../lib/format";
+import { formatDateTime, formatDayUTC } from "../../lib/format";
 import { APPLICATION_CHANNEL, APPLICATION_STATUS } from "../../lib/labels";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
 import { DraftsPanel } from "./DraftsPanel";
+import { SendPanel } from "./SendPanel";
 import { channelProblem, contactLabel } from "./StartApplication";
 
 function Item({ label, children }: { label: string; children: ReactNode }) {
@@ -71,11 +79,20 @@ function StatusControl({ application }: { application: ApplicationDetail }) {
   const noteId = useId();
 
   const apply = () =>
-    mutation.mutateAsync({ status: target as ApplicationStatus, ...(note.trim() ? { note: note.trim() } : {}) }).then((updated) => {
-      notify(`Status: ${APPLICATION_STATUS[updated.status].label}`, "success");
-      setTarget("");
-      setNote("");
-    });
+    mutation
+      .mutateAsync({
+        status: target as ApplicationStatus,
+        ...(note.trim() ? { note: note.trim() } : {}),
+        // The default reminder uses the user's own calendar day (the server may be in another time zone).
+        ...(target === "SENT" && !application.follow_up_on
+          ? { follow_up_on: addDays(localToday(), FOLLOW_UP_DEFAULT_DAYS) }
+          : {}),
+      })
+      .then((updated) => {
+        notify(`Status: ${APPLICATION_STATUS[updated.status].label}`, "success");
+        setTarget("");
+        setNote("");
+      });
 
   return (
     <div className="status-control">
@@ -121,8 +138,8 @@ function StatusControl({ application }: { application: ApplicationDetail }) {
       </div>
       <p className="field__hint">
         {isSent(application)
-          ? "Sent applications can move to Follow-up or Rejected."
-          : "Generated and Failed are set by draft generation. Follow-up and Rejected become available after sending."}
+          ? "After sending: record a follow-up, an interview, an offer or a rejection."
+          : "Generated and Failed are set by draft generation. Follow-up, Interviewing, Offer and Rejected become available after sending."}
       </p>
       <FormErrors error={mutation.error} />
 
@@ -137,6 +154,96 @@ function StatusControl({ application }: { application: ApplicationDetail }) {
         }}
         onCancel={() => setConfirmSent(false)}
       />
+    </div>
+  );
+}
+
+/** The follow-up reminder: a day to come back to this application. Shown as due in the app; nothing is sent. */
+function FollowUpControl({ application }: { application: ApplicationDetail }) {
+  const { notify } = useToast();
+  const mutation = useApplicationUpdate(application);
+  const [day, setDay] = useState(application.follow_up_on ?? "");
+  const baseId = useId();
+  const inputId = `${baseId}-day`;
+  const titleId = `${baseId}-title`;
+  const today = localToday();
+  const due = isFollowUpDue(application, today);
+  const open = FOLLOW_UP_OPEN_STATUSES.includes(application.status) || !isSent(application);
+  const dirty = (day || null) !== application.follow_up_on;
+  const save = (value: string | null) =>
+    mutation.mutate(
+      { follow_up_on: value },
+      { onSuccess: () => notify(value ? `Reminder set for ${formatDayUTC(value)}` : "Reminder cleared", "success") },
+    );
+
+  if (!open && !application.follow_up_on) return null;
+  return (
+    <div className="followup" role="group" aria-labelledby={titleId}>
+      <div className="followup__head">
+        <h3 id={titleId} className="followup__title">
+          Follow-up reminder
+        </h3>
+        {due ? (
+          <Badge tone="warning">
+            {application.follow_up_on! < today ? `Due since ${formatDayUTC(application.follow_up_on)}` : "Due today"}
+          </Badge>
+        ) : application.follow_up_on ? (
+          <span className="muted small">Next: {formatDayUTC(application.follow_up_on)}</span>
+        ) : (
+          <span className="muted small">None set</span>
+        )}
+      </div>
+      <form
+        className="followup__row"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (dirty && !mutation.isPending) save(day || null);
+        }}
+        noValidate
+      >
+        <div className="field">
+          <label htmlFor={inputId} className="field__label">
+            Remind me on
+          </label>
+          <input
+            id={inputId}
+            type="date"
+            className="input input--compact"
+            value={day}
+            disabled={mutation.isPending}
+            onChange={(e) => setDay(e.target.value)}
+          />
+        </div>
+        <div className="followup__quick">
+          {[3, 7, 14].map((n) => (
+            <Button key={n} size="sm" variant="ghost" disabled={mutation.isPending} onClick={() => setDay(addDays(today, n))}>
+              In {n} days
+            </Button>
+          ))}
+        </div>
+        <Button type="submit" size="sm" loading={mutation.isPending} disabled={!dirty}>
+          Save reminder
+        </Button>
+        {application.follow_up_on && (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={mutation.isPending}
+            onClick={() => {
+              setDay("");
+              save(null);
+            }}
+          >
+            Clear reminder
+          </Button>
+        )}
+      </form>
+      <p className="field__hint">
+        {isSent(application)
+          ? "Due reminders appear on the dashboard and under Applications. ApplyForge never contacts anyone."
+          : "Set automatically one week after you mark the application as sent; change it any time."}
+      </p>
+      <FormErrors error={mutation.error} />
     </div>
   );
 }
@@ -234,6 +341,52 @@ function SettingsForm({ application, job }: { application: ApplicationDetail; jo
   );
 }
 
+function NoteComposer({ applicationId }: { applicationId: number }) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  const { notify } = useToast();
+  const [text, setText] = useState("");
+  const inputId = useId();
+  const mutation = useMutation({
+    mutationFn: (note: string) => addApplicationNote(api, applicationId, note),
+    onSuccess: () => {
+      setText("");
+      notify("Note added", "success");
+      void queryClient.invalidateQueries({ queryKey: applicationKeys.events(applicationId) });
+    },
+  });
+  return (
+    <form
+      className="note-composer"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (text.trim() && !mutation.isPending) mutation.mutate(text.trim());
+      }}
+      noValidate
+    >
+      <label htmlFor={inputId} className="field__label">
+        Add a note
+      </label>
+      <div className="note-composer__row">
+        <textarea
+          id={inputId}
+          className="input"
+          rows={2}
+          maxLength={2000}
+          placeholder="e.g. Recruiter replied; the interview loop has three rounds."
+          value={text}
+          disabled={mutation.isPending}
+          onChange={(e) => setText(e.target.value)}
+        />
+        <Button type="submit" size="sm" variant="primary" loading={mutation.isPending} disabled={!text.trim()}>
+          Add note
+        </Button>
+      </div>
+      <FormErrors error={mutation.error} />
+    </form>
+  );
+}
+
 function Timeline({ applicationId }: { applicationId: number }) {
   const api = useApi();
   const events = useQuery({ queryKey: applicationKeys.events(applicationId), queryFn: ({ signal }) => getApplicationEvents(api, applicationId, signal) });
@@ -242,6 +395,7 @@ function Timeline({ applicationId }: { applicationId: number }) {
       <h2 id="history-title" className="panel__title">
         History
       </h2>
+      <NoteComposer applicationId={applicationId} />
       {events.error ? (
         <ErrorState title="Could not load the history" error={events.error} onRetry={() => void events.refetch()} />
       ) : !events.data ? (
@@ -251,9 +405,9 @@ function Timeline({ applicationId }: { applicationId: number }) {
       ) : (
         <ol className="timeline">
           {events.data.map((event) => (
-            <li key={event.id} className="timeline__item">
+            <li key={event.id} className={event.kind === "NOTE" ? "timeline__item timeline__item--note" : "timeline__item"}>
               <div className="timeline__head">
-                <StatusBadge kind="application" value={event.status} />
+                {event.kind === "NOTE" ? <Badge tone="info">Note</Badge> : <StatusBadge kind="application" value={event.status} />}
                 <time dateTime={event.timestamp} className="muted small">
                   {formatDateTime(event.timestamp)}
                 </time>
@@ -318,6 +472,7 @@ function Overview({ application, job }: { application: ApplicationDetail; job: J
         <Item label="Sent">{formatDateTime(application.sent_at)}</Item>
       </dl>
       <StatusControl key={`${application.status}:${application.sent_at}`} application={application} />
+      <FollowUpControl key={`fu:${application.follow_up_on}:${application.status}`} application={application} />
     </section>
   );
 }
@@ -336,6 +491,7 @@ function ApplicationView({ application }: { application: ApplicationDetail }) {
       )}
       <Overview application={application} job={job.data} />
       <DraftsPanel application={application} />
+      <SendPanel application={application} />
       <section className="panel" aria-labelledby="settings-title">
         <h2 id="settings-title" className="panel__title">
           Contact, channel and resume

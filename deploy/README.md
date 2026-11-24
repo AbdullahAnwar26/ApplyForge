@@ -140,8 +140,8 @@ sudoedit /etc/applyforge/applyforge.env
 
 On upgrades the existing `/etc/applyforge/applyforge.env` is kept. Compare it with the new release's example and add any new settings by hand.
 
-- Generate `SECRET_KEY` and `API_TOKEN` separately on the server: `python3 -c "import secrets; print(secrets.token_urlsafe(64))"`.
-- The API token is what users enter in the web UI. Share it only through a trusted channel.
+- Generate `SECRET_KEY` on the server: `python3 -c "import secrets; print(secrets.token_urlsafe(64))"`.
+- Users create their own accounts in the web UI; each account sees only its own data. Set `SIGNUP_ENABLED=False` once everyone who needs an account has one.
 - `DATABASE_URL` uses the password from section 3.1. URL-encode any special characters in it.
 - `ALLOWED_HOSTS` must be the private host name. `CSRF_TRUSTED_ORIGINS` must be `https://<that host name>`.
 - Keep `DEBUG=False`, `APPLYFORGE_DOTENV=/nonexistent/applyforge-no-dotenv`, an empty `CORS_ALLOWED_ORIGINS=`, `SECURE_HSTS_INCLUDE_SUBDOMAINS=False` and `SECURE_HSTS_PRELOAD=False`.
@@ -186,7 +186,7 @@ Frontend build notes:
 
 - Leave `VITE_API_BASE_URL` **unset**. The default `/api/v1` is same-origin, which is what nginx serves.
 - Make sure no `frontend/.env*` file sets other `VITE_*` values. Vite inlines them into the public bundle.
-- The API token is never part of the build. Users enter it in the browser.
+- No credential is part of the build. Users sign in with their own accounts.
 
 Copy the three files to the server over the VPN, for example: `scp applyforge-$SHA* admin@applyforge.vpn.example:`.
 
@@ -316,7 +316,7 @@ From a VPN client, check each of these:
 
 | Check | Expected |
 |---|---|
-| `https://applyforge.vpn.example/` | App loads and asks for the API token. After entering it, the dashboard shows an empty database. |
+| `https://applyforge.vpn.example/` | App loads the sign-in page. After *Create an account*, the dashboard asks for a first profile. |
 | `curl -sI https://applyforge.vpn.example/` | `Strict-Transport-Security: max-age=31536000`, with no `includeSubDomains` and no `preload`. `Content-Security-Policy` and `X-Frame-Options: DENY` are present. |
 | `curl -s -o /dev/null -w '%{http_code}' https://applyforge.vpn.example/admin/` | `404` |
 | `curl -s -o /dev/null -w '%{http_code}' https://applyforge.vpn.example/media/x` | `404` |
@@ -422,8 +422,8 @@ The release's `frontend/dist` and `.venv` switch together with `current`, so the
 - **Logs.**
   - Application and access logs: `journalctl -u applyforge`.
   - nginx logs: `/var/log/nginx/applyforge.{access,error}.log`.
-  - Request URLs are logged. The API token travels in the `Authorization` header and is never logged.
-- **Rotating the API token or `SECRET_KEY`.** Edit `/etc/applyforge/applyforge.env`, then run `sudo systemctl restart applyforge`. Users must re-enter the new token in the browser.
+  - Request URLs are logged. Passwords and session cookies are never in URLs or logs.
+- **Rotating `SECRET_KEY`.** Edit `/etc/applyforge/applyforge.env`, then run `sudo systemctl restart applyforge`. Every session ends; users sign in again.
 - **Stopping.** `sudo systemctl stop applyforge`. nginx then answers `502` for `/api/`.
 - **Status of the sandbox.** `systemd-analyze security applyforge.service`.
   - The service can write only `/var/lib/applyforge/media` (and its private `/tmp`).
@@ -432,7 +432,7 @@ The release's `frontend/dist` and `.venv` switch together with `current`, so the
 
 ### Security assumptions
 
-- The server has no untrusted local users. Any local user can reach Gunicorn on `127.0.0.1:8000` and set `X-Forwarded-Proto` themselves. That cannot bypass the API token, but it is why Gunicorn must never listen on another interface.
+- The server has no untrusted local users. Any local user can reach Gunicorn on `127.0.0.1:8000` and set `X-Forwarded-Proto` themselves. That cannot bypass sign-in, but it is why Gunicorn must never listen on another interface.
 - The API is protected by a single static bearer token over HTTPS on a private network. Treat the token like a password.
 - `/admin` is blocked at nginx only; the Django route still exists. Don't create Django superusers on this server.
 
@@ -475,7 +475,7 @@ Each backup is **one** file, `applyforge-backup-<UTC timestamp>.tar.age`: a tar 
 
 | Inside the archive | Never inside |
 |---|---|
-| `manifest.json`: format version, UTC timestamp, host name, database name, deployed release (commit), recipients fingerprint, `pg_dump` version, service state, and the size and SHA-256 of every file | `/etc/applyforge/applyforge.env` (`SECRET_KEY`, `API_TOKEN`, `DATABASE_URL`) and any PostgreSQL credentials. The PostgreSQL tools use peer authentication. |
+| `manifest.json`: format version, UTC timestamp, host name, database name, deployed release (commit), recipients fingerprint, `pg_dump` version, service state, and the size and SHA-256 of every file | `/etc/applyforge/applyforge.env` (`SECRET_KEY`, `DATABASE_URL`) and any PostgreSQL credentials. The PostgreSQL tools use peer authentication. |
 | `database.dump`: `pg_dump --format=custom` of `DB_NAME` | Symbolic links and special files under `MEDIA_ROOT`. These are reported as a **WARNING** and listed in the manifest, never followed. |
 | `media/...`: every regular file under `MEDIA_ROOT` | Browser profiles, LinkedIn sessions, TLS keys, age identities and anything else outside `MEDIA_ROOT` |
 
@@ -1008,10 +1008,10 @@ Contain first, then investigate. Keep notes with times.
 
 | Incident | Immediate actions |
 |---|---|
-| **API token disclosed** | Generate a new `API_TOKEN` (section 3.2), restart ApplyForge, give users the new token over a trusted channel. Review the nginx access log for unexpected VPN addresses. |
-| **`SECRET_KEY` disclosed** | Replace it and restart. Signed values become invalid; API clients use the token and are not affected. |
+| **An account's password disclosed** | The user changes it on the Account page (other sessions of that account end), or an admin sets a new one: `sudo applyforge-manage "$REL" changepassword <username>`. Review the nginx access log for unexpected VPN addresses. |
+| **`SECRET_KEY` disclosed** | Replace it and restart. Every session ends; users sign in again. |
 | **Database password disclosed** | `sudo -u postgres psql -c "\password applyforge"`, update `DATABASE_URL`, restart. Confirm `listen_addresses` and `pg_hba` still limit access to localhost. |
-| **A VPN client's credentials lost** | Revoke that peer in the VPN and rotate the API token. |
+| **A VPN client's credentials lost** | Revoke that peer in the VPN, and have that user change their ApplyForge password. |
 | **age private key exposed** | Create a new key pair offline, replace the recipients file, take and verify a new backup. Treat every older archive as readable by whoever holds the key; delete them once the new backups are verified if that data must not be exposed. |
 | **age private key lost** | Create a new key pair; older archives cannot be decrypted (section 12.2). Take and verify a new backup now. |
 | **Server suspected compromised** | Disconnect it from the VPN (keep it powered for forensics if needed). Don't trust its local index; use offline hash records. Rebuild on a new server (section 12.8) from an archive verified offline. Rotate **all** secrets: token, `SECRET_KEY`, database password, TLS key, VPN keys, and the age key if it was ever on that server. |
@@ -1303,7 +1303,7 @@ applyforge-backup verify --archive "$D/$NEWEST" --identity <identity file> --exp
   - `/etc/applyforge/healthchecks.env`;
   - optionally the SSH host keys. Without them, admins must re-pin the host key after a rebuild (rehearsed: "REMOTE HOST IDENTIFICATION HAS CHANGED").
 
-  `SECRET_KEY`, `API_TOKEN` and the database password are regenerated on a rebuild; users re-enter the new API token.
+  `SECRET_KEY` and the database password are regenerated on a rebuild; users sign in again (accounts are in the restored database).
 
 ### 15.6 Monitoring (Healthchecks.io dead-man's switch)
 
@@ -1368,7 +1368,7 @@ The rehearsal killed the app server, **deleted its disk** and rebuilt it. Timing
 6. **Restore** into a new database and directory (12.6), then **switch** (12.7).
 7. **Verify** HTTPS from a device.
    - Re-pin the SSH host key (`ssh-keygen -R 10.99.0.1`) unless it was restored.
-   - Give users the new API token.
+   - Users sign in again with their existing accounts.
 8. **Take a backup** and check that it is sealed. Re-enable the timers.
 
 ---

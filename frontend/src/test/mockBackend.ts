@@ -6,11 +6,13 @@
 
 import { delay, http, HttpResponse, type HttpHandler } from "msw";
 
-import type { ApplicationDetail, ApplicationEvent, CollectorRun, Company, JobDetail, Profile, Resume, Skill, SkillCategoryOption } from "../api/types";
+import type { ApplicationDetail, ApplicationEvent, CollectedPost, CollectorRun, Company, JobDetail, Profile, Resume, SendRecord, SendingAccount, Skill, SkillCategoryOption } from "../api/types";
 import { applicationHandlers, type GenerationMode } from "./mockApplications";
 import { collectorHandlers, type CollectorMode } from "./mockCollector";
+import { sendingHandlers } from "./mockSending";
 import { jobHandlers } from "./mockJobs";
-import { makeProfile, TEST_TOKEN } from "./renderApp";
+import { mockSession, signedOutResponse } from "./mockAuth";
+import { makeProfile } from "./renderApp";
 import { API } from "./server";
 
 export const CATEGORIES: SkillCategoryOption[] = [
@@ -39,6 +41,15 @@ export interface MockState {
   applications: ApplicationDetail[];
   events: Record<number, ApplicationEvent[]>;
   runs: CollectorRun[];
+  /** Posts examined by each run (GET collector/runs/{id}/items/). */
+  runItems: Record<number, CollectedPost[]>;
+  /** When true, running runs stay RUNNING on every read (no automatic finish). */
+  holdRuns: boolean;
+  sendingAccount: SendingAccount | null;
+  sendingMode: string;
+  sendRecords: Record<number, SendRecord[]>;
+  /** compose/verify: whether the drafted email is "found" in the Sent folder. */
+  sentFolderHasDraft: boolean;
 }
 
 const NOW = "2026-03-01T10:00:00Z";
@@ -83,10 +94,8 @@ export async function parseMultipart(request: Request): Promise<Record<string, s
   return fields;
 }
 
-function unauthorized(request: Request) {
-  return request.headers.get("authorization") !== `Bearer ${TEST_TOKEN}`
-    ? HttpResponse.json({ detail: "Invalid token." }, { status: 401 })
-    : null;
+function unauthorized(_request: Request) {
+  return mockSession.user ? null : signedOutResponse();
 }
 
 function required(body: Record<string, unknown>, fields: string[]) {
@@ -113,6 +122,12 @@ export function createMockBackend(seed: Partial<MockState> = {}) {
     applications: initial.applications ?? [],
     events: initial.events ?? {},
     runs: initial.runs ?? [],
+    runItems: initial.runItems ?? {},
+    holdRuns: initial.holdRuns ?? false,
+    sendingAccount: initial.sendingAccount ?? null,
+    sendingMode: initial.sendingMode ?? "smtp",
+    sendRecords: initial.sendRecords ?? {},
+    sentFolderHasDraft: initial.sentFolderHasDraft ?? false,
   };
   const calls: Call[] = [];
   /** Optional per-test delay before each mutating response (ms). */
@@ -238,6 +253,7 @@ export function createMockBackend(seed: Partial<MockState> = {}) {
   handlers.push(...jobHandlers(state, record, options, nextId));
   handlers.push(...applicationHandlers(state, record, options, nextId));
   handlers.push(...collectorHandlers(state, record, options, nextId));
+  handlers.push(...sendingHandlers(state, record, nextId));
 
   const writes = (method: string, prefix: string) => calls.filter((c) => c.method === method && c.path.startsWith(prefix));
 

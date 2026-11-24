@@ -1,15 +1,14 @@
 /**
  * Application shell: sidebar navigation (a drawer below 768px), top bar with the
- * active-profile switcher, theme, connection indicator and Disconnect.
+ * active-profile switcher, server status, the signed-in account and Sign out.
  */
 
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import { Link, NavLink } from "react-router-dom";
 
 import { isApiError } from "../api/errors";
-import { useToken } from "../auth/TokenProvider";
+import { useAuth } from "../auth/AuthProvider";
 import { Button } from "../components/Button";
-import { ConfirmDialog } from "../components/Dialog";
 import { THEMES, useTheme, type Theme } from "../lib/theme";
 import { useActiveProfile } from "../profile/ActiveProfileProvider";
 import { ProfileSwitcher } from "../profile/ProfileControls";
@@ -36,29 +35,48 @@ function ThemeSwitcher() {
   );
 }
 
+/** Shown only when the server stops responding (signed-in state is shown by the account link). */
 function ConnectionIndicator() {
-  const { mode } = useToken();
   const { state } = useActiveProfile();
   const unreachable = state.status === "error" && isApiError(state.error) && state.error.kind === "network";
-  const label = unreachable ? "Backend unreachable" : "Connected";
-  const detail = unreachable
-    ? "The Django server did not respond."
-    : mode === "memory"
-      ? "Token kept in memory only; it is cleared on reload."
-      : "Token kept for this browser session.";
+  if (!unreachable) return null;
   return (
-    <p className={`connection ${unreachable ? "connection--down" : "connection--up"}`} title={detail}>
+    <p className="connection connection--down" title="The ApplyForge server did not respond.">
       <span className="connection__dot" aria-hidden="true" />
-      <span>{label}</span>
-      <span className="visually-hidden">. {detail}</span>
+      <span>Server unreachable</span>
     </p>
   );
 }
 
+function AccountControls() {
+  const { user, signOut } = useAuth();
+  const [busy, setBusy] = useState(false);
+  if (!user) return null;
+  return (
+    <>
+      <Link className="account-link" to="/account" title="Account and password">
+        <span className="account-link__avatar" aria-hidden="true">
+          {user.username.slice(0, 1).toUpperCase()}
+        </span>
+        <span className="account-link__name">{user.username}</span>
+        <span className="visually-hidden"> (account)</span>
+      </Link>
+      <Button
+        size="sm"
+        loading={busy}
+        onClick={() => {
+          setBusy(true);
+          void signOut().finally(() => setBusy(false));
+        }}
+      >
+        Sign out
+      </Button>
+    </>
+  );
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
-  const { disconnect } = useToken();
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const navRef = useRef<HTMLElement>(null);
   const navId = useId();
@@ -136,9 +154,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <div className="topbar__controls">
             <ProfileSwitcher />
             <ConnectionIndicator />
-            <Button size="sm" onClick={() => setConfirmDisconnect(true)}>
-              Disconnect
-            </Button>
+            <AccountControls />
           </div>
         </header>
         <main id="main" className="content" tabIndex={-1}>
@@ -146,17 +162,6 @@ export function AppShell({ children }: { children: ReactNode }) {
         </main>
       </div>
 
-      <ConfirmDialog
-        open={confirmDisconnect}
-        title="Disconnect from the backend?"
-        message="The API token is removed from this browser. You will need to enter it again to continue."
-        confirmLabel="Disconnect"
-        onConfirm={() => {
-          setConfirmDisconnect(false);
-          disconnect("user");
-        }}
-        onCancel={() => setConfirmDisconnect(false)}
-      />
     </div>
   );
 }

@@ -108,6 +108,28 @@ a {
   color: var(--text-muted);
 }
 
+/* Sign-in / sign-up (auth/AuthPages.tsx) */
+.connect__product {
+  font-weight: 700;
+  font-size: var(--text-lg, 1.1rem);
+}
+
+.auth__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.auth__show {
+  margin-top: calc(-1 * var(--space-1));
+}
+
+.auth__switch {
+  margin: 0;
+  text-align: center;
+  color: var(--text-muted);
+}
+
 .connect__modes {
   border: 0;
   margin: 0;

@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, configure } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll } from "vitest";
 
+import { clearMockSession } from "./mockAuth";
 import { server } from "./server";
 
 /**
@@ -30,6 +31,7 @@ afterEach(() => {
   cleanup();
   window.sessionStorage.clear();
   window.localStorage.clear();
+  clearMockSession();
   if (unhandled.length) {
     const list = unhandled.splice(0).join("\n  ");
     throw new Error(`Request(s) without a fake API handler:\n  ${list}`);

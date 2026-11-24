@@ -1,4 +1,4 @@
-/** The six sections, in navigation order, with small inline icons (no icon library). */
+/** The sections, in navigation order, with small inline icons (no icon library). */
 
 import type { ReactNode } from "react";
 
@@ -32,6 +32,15 @@ export const NAV_ITEMS: NavItem[] = [
     ),
   },
   {
+    to: "/automation",
+    label: "Job Automation",
+    icon: (
+      <Icon>
+        <path d="M13 3.5 5.5 13H12l-1 7.5L18.5 11H12l1-7.5Z" />
+      </Icon>
+    ),
+  },
+  {
     to: "/jobs",
     label: "Jobs",
     icon: (
@@ -53,7 +62,7 @@ export const NAV_ITEMS: NavItem[] = [
   },
   {
     to: "/collector",
-    label: "Collector",
+    label: "Collections",
     icon: (
       <Icon>
         <circle cx="11" cy="11" r="6" />

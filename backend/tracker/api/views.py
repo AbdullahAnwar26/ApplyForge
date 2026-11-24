@@ -1,7 +1,11 @@
+import os
 from collections import Counter
+from datetime import date
 
 from django.db import transaction
-from django.db.models import Count, F
+from django.http import FileResponse, HttpResponse
+from django.utils import timezone
+from django.db.models import Count, F, Prefetch, Q
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -13,9 +17,11 @@ from tracker.applications import (
     POST_SEND_STATUSES,
     ApplicationWorkflowError,
     DuplicateApplicationError,
+    add_note,
     change_status,
     check_status_change,
     create_application,
+    follow_ups_due,
     validate_relationships,
 )
 from tracker.generation import (
@@ -24,6 +30,19 @@ from tracker.generation import (
     generate_for_application,
 )
 from tracker.ingestion import ingest_job
+from tracker.review import select_job, update_job_details
+from tracker.sending import (
+    SendingError,
+    abandon_handoff,
+    attachment_name,
+    build_preview,
+    confirm_handoff,
+    confirm_whatsapp_sent,
+    draft_file,
+    open_compose,
+    send_email,
+    verify_handoff,
+)
 from tracker.models import (
     Application,
     ApplicationChannel,
@@ -37,6 +56,8 @@ from tracker.models import (
     Resume,
     ScreeningOutcome,
     ScreeningReason,
+    SendRecord,
+    SendRecordStatus,
     Skill,
     SkillCategory,
 )
@@ -48,17 +69,31 @@ from tracker.screening import (
     select_profile,
 )
 
+from .ownership import owned
+from .sending_views import (
+    ComposeRequestSerializer,
+    HandoffConfirmSerializer,
+    HandoffRecordSerializer,
+    SendRecordSerializer,
+    SendRequestSerializer,
+    WhatsAppSentSerializer,
+    sending_error_response,
+)
 from .serializers import (
     ApplicationCreateSerializer,
     ApplicationDetailSerializer,
     ApplicationEventSerializer,
     ApplicationListSerializer,
+    ApplicationNoteSerializer,
     ApplicationUpdateSerializer,
     CompanySerializer,
     ContactSerializer,
     JobDetailSerializer,
     JobIngestSerializer,
     JobListSerializer,
+    JobBulkStatusSerializer,
+    JobReviewUpdateSerializer,
+    JobSelectionSerializer,
     JobStatusUpdateSerializer,
     ProfileSelectionSerializer,
     ProfileSerializer,
@@ -92,11 +127,41 @@ def _choice_param(request, name, choices, extra=()):
     return raw
 
 
-def _resolve_profile_or_400(profile):
+def _select_profile_or_400(profile, owner):
     try:
-        return resolve_profile(profile)
+        return select_profile(profile, owner=owner)
     except ScreeningInputError as exc:
         raise ValidationError({exc.field: [exc.message]})
+
+
+def _review_context(user):
+    """Per-request data for the review fields of job serializers (one query each)."""
+    resumes = list(owned(Resume.objects.filter(is_active=True).exclude(file_path=""), user)
+                   .exclude(file_path__isnull=True).order_by("id"))
+    profiles = list(owned(Profile.objects.order_by("id"), user)[:2])
+    return {"resumes": resumes, "profile": profiles[0] if len(profiles) == 1 else None}
+
+
+def _resolve_profile_or_400(profile, owner):
+    try:
+        return resolve_profile(profile, owner=owner)
+    except ScreeningInputError as exc:
+        raise ValidationError({exc.field: [exc.message]})
+
+
+def _today_param(request):
+    """The client's calendar day (``?today=YYYY-MM-DD``) for follow-up checks, or None.
+
+    Reminders are calendar days: the browser's day is the right one for "due today".
+    Without the parameter the server's local date (settings.TIME_ZONE) is used.
+    """
+    raw = request.query_params.get("today")
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise ValidationError({"today": ["Use the format YYYY-MM-DD."]})
 
 
 def _bool_param(request, name):
@@ -124,7 +189,12 @@ def _delete_files_on_commit(files):
 
 class ProfileViewSet(viewsets.ModelViewSet):
     serializer_class = ProfileSerializer
-    queryset = Profile.objects.order_by("id")
+
+    def get_queryset(self):
+        return owned(Profile.objects.order_by("id"), self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
 
     def destroy(self, request, *args, **kwargs):
         profile = self.get_object()
@@ -153,7 +223,7 @@ class SkillViewSet(viewsets.ModelViewSet):
     serializer_class = SkillSerializer
 
     def get_queryset(self):
-        queryset = Skill.objects.order_by("profile_id", "name", "id")
+        queryset = owned(Skill.objects.order_by("profile_id", "name", "id"), self.request.user)
         profile_id = _positive_int_param(self.request, "profile")
         if profile_id is not None:
             queryset = queryset.filter(profile_id=profile_id)
@@ -188,7 +258,7 @@ class ResumeViewSet(viewsets.ModelViewSet):
     serializer_class = ResumeSerializer
 
     def get_queryset(self):
-        queryset = Resume.objects.order_by("profile_id", "-is_default", "id")
+        queryset = owned(Resume.objects.order_by("profile_id", "-is_default", "id"), self.request.user)
         profile_id = _positive_int_param(self.request, "profile")
         if profile_id is not None:
             queryset = queryset.filter(profile_id=profile_id)
@@ -210,6 +280,23 @@ class ResumeViewSet(viewsets.ModelViewSet):
             file = instance.file_path
             instance.delete()
             _delete_files_on_commit([file])
+
+    @action(detail=True, methods=["get"])
+    def download(self, request, pk=None):
+        """The stored file, for its owner only (another account's id is 404)."""
+        resume = self.get_object()
+        if not resume.file_path:
+            return Response({"detail": "This resume has no uploaded file."}, status=status.HTTP_409_CONFLICT)
+        try:
+            handle = resume.file_path.open("rb")
+        except FileNotFoundError:
+            return Response({"detail": "The resume file is missing from storage."}, status=status.HTTP_410_GONE)
+        # The same clean name as the email attachment ("<Candidate>_Resume.pdf").
+        name = attachment_name(resume.profile.name, os.path.basename(resume.file_path.name))
+        response = FileResponse(handle, as_attachment=True, filename=name)
+        response["X-Content-Type-Options"] = "nosniff"
+        response["Cache-Control"] = "private, no-store"
+        return response
 
     @action(detail=True, methods=["get"])
     def text(self, request, pk=None):
@@ -242,7 +329,9 @@ class ResumeViewSet(viewsets.ModelViewSet):
 
 class CompanyViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = CompanySerializer
-    queryset = Company.objects.order_by("name", "id")
+
+    def get_queryset(self):
+        return owned(Company.objects.order_by("name", "id"), self.request.user)
 
 
 class ContactViewSet(viewsets.ReadOnlyModelViewSet):
@@ -251,7 +340,7 @@ class ContactViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ContactSerializer
 
     def get_queryset(self):
-        queryset = Contact.objects.order_by("id")
+        queryset = owned(Contact.objects.order_by("id"), self.request.user)
         company_id = _positive_int_param(self.request, "company")
         if company_id is not None:
             queryset = queryset.filter(company_id=company_id)
@@ -274,15 +363,25 @@ class JobViewSet(
     lookup_value_regex = r"\d+"
 
     def get_queryset(self):
-        queryset = (
+        queryset = owned(
             JobOpportunity.objects.select_related("company")
-            .prefetch_related("relevant_keywords")
-            .order_by("-discovered_date", "-id")
+            .prefetch_related("relevant_keywords", "contacts", "applications")
+            .order_by("-discovered_date", "-id"),
+            self.request.user,
         )
         if self.action != "list":
-            return queryset.prefetch_related("contacts")
+            return queryset
 
         request = self.request
+        run_id = _positive_int_param(request, "run")
+        if run_id is not None:
+            # Jobs a collection run found (created or recognised as already saved).
+            queryset = queryset.filter(
+                collected_posts__run_id=run_id, collected_posts__run__owner=request.user
+            ).distinct()
+        complete = _bool_param(request, "jd_complete")
+        if complete is not None:
+            queryset = queryset.filter(jd_complete=complete)
         job_status = _choice_param(request, "status", JobStatus.values)
         if job_status:
             queryset = queryset.filter(status=job_status)
@@ -305,41 +404,124 @@ class JobViewSet(
         profile_id = _positive_int_param(request, "profile")
         if profile_id is not None:
             queryset = queryset.filter(screening_details__profile_id=profile_id)
+        search = (request.query_params.get("search") or "").strip()
+        if len(search) > 200:
+            raise ValidationError({"search": ["Use at most 200 characters."]})
+        for term in search.split():
+            # Every word must appear somewhere: title, company, location or description.
+            queryset = queryset.filter(
+                Q(title__icontains=term)
+                | Q(company__name__icontains=term)
+                | Q(location__icontains=term)
+                | Q(full_jd__icontains=term)
+            )
         return queryset
 
     def get_serializer_class(self):
         if self.action == "list":
             return JobListSerializer
         if self.action == "partial_update":
-            return JobStatusUpdateSerializer
+            return JobReviewUpdateSerializer
         return JobDetailSerializer
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["review"] = _review_context(self.request.user)
+        return context
+
+    def _detail(self, job_id):
+        return JobDetailSerializer(self.get_queryset().get(pk=job_id), context=self.get_serializer_context()).data
+
     def partial_update(self, request, *args, **kwargs):
-        unexpected = sorted(set(request.data) - {"status"})
+        allowed = set(JobReviewUpdateSerializer().fields)
+        unexpected = sorted(set(request.data) - allowed)
         if unexpected:
             raise ValidationError(
                 {field: ["This field is read-only."] for field in unexpected}
             )
+        if not request.data:
+            raise ValidationError({"non_field_errors": [f"Provide at least one of: {', '.join(sorted(allowed))}."]})
         job = self.get_object()
-        serializer = JobStatusUpdateSerializer(job, data=request.data, partial=False)
+        serializer = JobReviewUpdateSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(JobDetailSerializer(self.get_object()).data)
+        try:
+            update_job_details(job, serializer.validated_data, request.user)
+        except ApplicationWorkflowError as exc:
+            raise _workflow_error_400(exc)
+        return Response(self._detail(job.pk))
+
+    @action(detail=True, methods=["post"])
+    def select(self, request, pk=None):
+        """Select this job for application: shortlists it and creates ONE application
+        (matching resume and best contact pre-filled). 201 created / 200 already selected."""
+        job = self.get_object()
+        serializer = ProfileSelectionSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        profile = _select_profile_or_400(serializer.validated_data.get("profile"), request.user)
+        try:
+            result = select_job(job, profile)
+        except ApplicationWorkflowError as exc:
+            raise _workflow_error_400(exc)
+        return Response(
+            {"application": ApplicationDetailSerializer(result.application).data, "created": result.created,
+             "job": self._detail(job.pk)},
+            status=status.HTTP_201_CREATED if result.created else status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="select")
+    def select_many(self, request):
+        """Select several jobs at once. Already-selected jobs are reported, never duplicated."""
+        serializer = JobSelectionSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        profile = _select_profile_or_400(data.get("profile"), request.user)
+        jobs = {job.pk: job for job in self.get_queryset().filter(pk__in=data["jobs"])}
+        missing = [job_id for job_id in data["jobs"] if job_id not in jobs]
+        if missing:
+            raise ValidationError({"jobs": [f"Job {job_id} not found." for job_id in missing]})
+        results = []
+        for job_id in dict.fromkeys(data["jobs"]):
+            try:
+                result = select_job(jobs[job_id], profile)
+            except ApplicationWorkflowError as exc:
+                results.append({"job": job_id, "application": None, "created": False, "error": exc.message})
+                continue
+            results.append({"job": job_id, "application": result.application.pk, "created": result.created,
+                            "status": result.application.status})
+        return Response({
+            "results": results,
+            "created": sum(1 for r in results if r["created"]),
+            "already_selected": sum(1 for r in results if r["application"] and not r["created"]),
+        })
+
+    @action(detail=False, methods=["post"], url_path="bulk-status")
+    def bulk_status(self, request):
+        """Mark several jobs as to-review / selected / skipped (no applications are created)."""
+        serializer = JobBulkStatusSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        queryset = owned(JobOpportunity.objects.filter(pk__in=data["jobs"]), request.user)
+        found = set(queryset.values_list("pk", flat=True))
+        missing = [job_id for job_id in data["jobs"] if job_id not in found]
+        if missing:
+            raise ValidationError({"jobs": [f"Job {job_id} not found." for job_id in missing]})
+        updated = queryset.exclude(status=JobStatus.APPLIED).update(status=data["status"], updated_at=timezone.now())
+        return Response({"updated": updated})
 
     @action(detail=False, methods=["post"])
     def ingest(self, request):
         """Idempotent ingestion. 201 when created, 200 for an exact existing match."""
-        serializer = JobIngestSerializer(data=request.data)
+        serializer = JobIngestSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        profile, skills = _resolve_profile_or_400(data.get("profile"))
+        profile, skills = _resolve_profile_or_400(data.get("profile"), request.user)
         result = ingest_job(data, profile, skills)
         job = self.get_queryset().get(pk=result.job.pk)
         return Response(
             {
                 "created": result.created,
                 "matched_by": result.matched_by,
-                "job": JobDetailSerializer(job).data,
+                "job": JobDetailSerializer(job, context=self.get_serializer_context()).data,
             },
             status=status.HTTP_201_CREATED if result.created else status.HTTP_200_OK,
         )
@@ -348,22 +530,20 @@ class JobViewSet(
     def screen(self, request, pk=None):
         """Re-screen one job. Never changes ``status``."""
         job = self.get_object()
-        serializer = ProfileSelectionSerializer(data=request.data)
+        serializer = ProfileSelectionSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
-        profile, skills = _resolve_profile_or_400(serializer.validated_data.get("profile"))
+        profile, skills = _resolve_profile_or_400(serializer.validated_data.get("profile"), request.user)
         screen_job(job, profile, skills)
-        return Response(JobDetailSerializer(self.get_queryset().get(pk=job.pk)).data)
+        return Response(self._detail(job.pk))
 
     @action(detail=False, methods=["post"], url_path="screen", url_name="screen-all")
     def screen_all(self, request):
         """Re-screen all jobs, or only ``jobs: [ids]``. Returns outcome counts."""
-        serializer = ScreenAllSerializer(data=request.data)
+        serializer = ScreenAllSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
-        profile, skills = _resolve_profile_or_400(serializer.validated_data.get("profile"))
+        profile, skills = _resolve_profile_or_400(serializer.validated_data.get("profile"), request.user)
 
-        jobs = (
-            JobOpportunity.objects.select_related("company").order_by("id")
-        )
+        jobs = owned(JobOpportunity.objects.select_related("company").order_by("id"), request.user)
         requested = serializer.validated_data.get("jobs")
         if requested is not None:
             requested = set(requested)
@@ -418,11 +598,16 @@ class ApplicationViewSet(
     lookup_value_regex = r"\d+"
     throttle_scope = None  # only `generate` is throttled ("application-generation")
     DRAFT_FIELDS = ("generated_subject", "generated_body", "generated_whatsapp_message")
-    UPDATABLE_FIELDS = {"status", "channel", "contact", "resume", "note", *DRAFT_FIELDS}
+    UPDATABLE_FIELDS = {"status", "channel", "contact", "resume", "note", "follow_up_on", *DRAFT_FIELDS}
 
     def get_queryset(self):
-        queryset = Application.objects.select_related("job__company").order_by(
-            F("queue_position").asc(nulls_last=True), "-created_at", "-id"
+        queryset = owned(
+            Application.objects.select_related("job__company", "contact", "profile").prefetch_related(
+                Prefetch("send_records", queryset=SendRecord.objects.defer("body"))
+            ).order_by(
+                F("queue_position").asc(nulls_last=True), "-created_at", "-id"
+            ),
+            self.request.user,
         )
         if self.action != "list":
             return queryset
@@ -448,6 +633,8 @@ class ApplicationViewSet(
             queryset = queryset.filter(status__in=AWAITING_USER_ACTION)
         elif awaiting is False:
             queryset = queryset.exclude(status__in=AWAITING_USER_ACTION)
+        if _bool_param(request, "follow_up_due") is True:
+            queryset = follow_ups_due(queryset, today=_today_param(request))
         return queryset
 
     def get_serializer_class(self):
@@ -457,11 +644,11 @@ class ApplicationViewSet(
 
     def create(self, request):
         """Create an application for an explicitly chosen (SHORTLISTED) job."""
-        serializer = ApplicationCreateSerializer(data=request.data)
+        serializer = ApplicationCreateSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
-            profile = select_profile(data.get("profile"))
+            profile = select_profile(data.get("profile"), owner=request.user)
         except ScreeningInputError as exc:
             raise ValidationError({exc.field: [exc.message]})
         try:
@@ -486,13 +673,13 @@ class ApplicationViewSet(
         unexpected = sorted(set(request.data) - self.UPDATABLE_FIELDS)
         if unexpected:
             raise ValidationError({field: ["This field is read-only."] for field in unexpected})
-        serializer = ApplicationUpdateSerializer(data=request.data)
+        serializer = ApplicationUpdateSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         if not set(data) - {"note"}:
             raise ValidationError(
                 {"non_field_errors": [
-                    "Provide at least one of: status, channel, contact, resume, "
+                    "Provide at least one of: status, channel, contact, resume, follow_up_on, "
                     "generated_subject, generated_body, generated_whatsapp_message."
                 ]}
             )
@@ -524,7 +711,7 @@ class ApplicationViewSet(
                 )
 
             changed = False
-            for field in ("contact", "resume", "channel", *self.DRAFT_FIELDS):
+            for field in ("contact", "resume", "channel", "follow_up_on", *self.DRAFT_FIELDS):
                 if field in data and getattr(application, field) != data[field]:
                     setattr(application, field, data[field])
                     changed = True
@@ -569,6 +756,144 @@ class ApplicationViewSet(
             }
         )
 
+    @action(detail=True, methods=["get"], url_path="send-preview")
+    def send_preview(self, request, pk=None):
+        """Exactly what would be sent (recipient, sender, subject, body, attachment) and
+        its ``version``, which ``send``/``whatsapp-sent`` must echo back. Sends nothing."""
+        application = self.get_object()
+        channel = _choice_param(request, "channel", ApplicationChannel.values) or application.channel
+        return Response(build_preview(application, channel).as_dict())
+
+    @action(detail=True, methods=["post"], throttle_scope="application-send")
+    def send(self, request, pk=None):
+        """Send the approved email with the resume attached. Requires ``confirm: true`` and the
+        preview ``version``. 200 sent / 502 delivery failed (recorded, retry allowed)."""
+        application = self.get_object()
+        serializer = SendRequestSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            record = send_email(application, version=data["version"], confirm=data["confirm"])
+        except SendingError as exc:
+            return sending_error_response(exc)
+        body = {
+            "record": SendRecordSerializer(record).data,
+            "application": ApplicationDetailSerializer(self.get_queryset().get(pk=application.pk)).data,
+        }
+        if record.status != SendRecordStatus.SENT:
+            body["detail"] = record.error
+            return Response(body, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(body)
+
+    @action(detail=True, methods=["post"], url_path="whatsapp-sent", throttle_scope="application-send")
+    def whatsapp_sent(self, request, pk=None):
+        """Record that the user sent the previewed WhatsApp message themselves."""
+        application = self.get_object()
+        serializer = WhatsAppSentSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            record = confirm_whatsapp_sent(application, version=data["version"], confirm=data["confirm"])
+        except SendingError as exc:
+            return sending_error_response(exc)
+        return Response({
+            "record": SendRecordSerializer(record).data,
+            "application": ApplicationDetailSerializer(self.get_queryset().get(pk=application.pk)).data,
+        })
+
+    def _handoff_response(self, application, record, http_status=status.HTTP_200_OK, **extra):
+        body = {
+            "record": SendRecordSerializer(record).data,
+            "application": ApplicationDetailSerializer(self.get_queryset().get(pk=application.pk)).data,
+            **extra,
+        }
+        return Response(body, status=http_status)
+
+    @action(detail=True, methods=["post"], throttle_scope="application-send")
+    def compose(self, request, pk=None):
+        """Open the approved message for the user to send themselves (never sends):
+        ``{"channel": "EMAIL", "method": "mailbox"|"eml", "version"}`` or
+        ``{"channel": "WHATSAPP", "method": "link", "version"}``. 200 with the record
+        (COMPOSE_OPENED; ``open_url`` to open, ``download_url`` for an ``eml`` draft); 502
+        when the draft could not be saved (recorded, the application is SEND_FAILED)."""
+        application = self.get_object()
+        serializer = ComposeRequestSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            record = open_compose(application, channel=data["channel"], method=data["method"],
+                                  version=data.get("version"))
+        except SendingError as exc:
+            return sending_error_response(exc)
+        if record.status == SendRecordStatus.FAILED:
+            return self._handoff_response(application, record, status.HTTP_502_BAD_GATEWAY, detail=record.error)
+        download_url = (f"applications/{application.pk}/compose/draft/?record={record.pk}"
+                        if record.provider == "eml_file" else "")
+        return self._handoff_response(application, record, download_url=download_url)
+
+    @action(detail=True, methods=["post"], url_path="compose/confirm", throttle_scope="application-send")
+    def compose_confirm(self, request, pk=None):
+        """``{"record", "confirm": true}``: the user sent the opened message themselves."""
+        application = self.get_object()
+        serializer = HandoffConfirmSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        try:
+            record = confirm_handoff(application, record_id=serializer.validated_data["record"],
+                                     confirm=serializer.validated_data["confirm"])
+        except SendingError as exc:
+            return sending_error_response(exc)
+        return self._handoff_response(application, record)
+
+    @action(detail=True, methods=["post"], url_path="compose/verify", throttle_scope="application-send")
+    def compose_verify(self, request, pk=None):
+        """``{"record"}``: look for the drafted email in the mailbox's Sent folder (read only).
+        ``{"verified": true}`` marks it sent; ``false`` changes nothing."""
+        application = self.get_object()
+        serializer = HandoffRecordSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        try:
+            record, found = verify_handoff(application, record_id=serializer.validated_data["record"])
+        except SendingError as exc:
+            return sending_error_response(exc)
+        detail = "" if found else (f"No email to {record.recipient} sent after "
+                                   f"{timezone.localtime(record.created_at):%H:%M} was found in your Sent folder yet.")
+        return self._handoff_response(application, record, verified=found, detail=detail)
+
+    @action(detail=True, methods=["post"], url_path="compose/abandon", throttle_scope="application-send")
+    def compose_abandon(self, request, pk=None):
+        """``{"record"}``: the opened message was not sent; it can be opened again."""
+        application = self.get_object()
+        serializer = HandoffRecordSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        try:
+            record = abandon_handoff(application, record_id=serializer.validated_data["record"])
+        except SendingError as exc:
+            return sending_error_response(exc)
+        return self._handoff_response(application, record)
+
+    @action(detail=True, methods=["get"], url_path="compose/draft")
+    def compose_draft(self, request, pk=None):
+        """``?record=``: the open draft as an .eml file (resume attached) that desktop email
+        apps open as a new message. Owner only; nothing is sent or changed."""
+        application = self.get_object()
+        record_id = _positive_int_param(request, "record")
+        if record_id is None:
+            raise ValidationError({"record": ["This parameter is required."]})
+        try:
+            filename, content = draft_file(application, record_id)
+        except SendingError as exc:
+            return sending_error_response(exc)
+        response = HttpResponse(content, content_type="message/rfc822")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        response["X-Content-Type-Options"] = "nosniff"
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @action(detail=True, methods=["get"], url_path="send-records")
+    def send_records(self, request, pk=None):
+        application = self.get_object()
+        return Response(SendRecordSerializer(application.send_records.all(), many=True).data)
+
     @action(detail=True, methods=["get"])
     def events(self, request, pk=None):
         """Status history, newest first."""
@@ -579,10 +904,19 @@ class ApplicationViewSet(
             return self.get_paginated_response(ApplicationEventSerializer(page, many=True).data)
         return Response(ApplicationEventSerializer(events, many=True).data)
 
+    @action(detail=True, methods=["post"])
+    def notes(self, request, pk=None):
+        """Add a note to the history without changing the status. 201 with the event."""
+        application = self.get_object()
+        serializer = ApplicationNoteSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        event = add_note(application, serializer.validated_data["note"])
+        return Response(ApplicationEventSerializer(event).data, status=status.HTTP_201_CREATED)
+
     @action(detail=False, methods=["get"])
     def summary(self, request):
         """Dashboard counts. Optional ``?profile=<id>``."""
-        queryset = Application.objects.select_related("job__company")
+        queryset = owned(Application.objects.select_related("job__company"), request.user)
         profile_id = _positive_int_param(request, "profile")
         if profile_id is not None:
             queryset = queryset.filter(profile_id=profile_id)
@@ -592,10 +926,17 @@ class ApplicationViewSet(
         )
         by_status = {value: counts.get(value, 0) for value in ApplicationStatus.values}
         awaiting = queryset.filter(status__in=AWAITING_USER_ACTION)
+        due = follow_ups_due(queryset, today=_today_param(request))
         return Response(
             {
                 "total": sum(by_status.values()),
                 "by_status": by_status,
+                # Ever sent: stays counted after a later Follow-up/Interview/Offer/Rejected.
+                "sent_total": queryset.filter(sent_at__isnull=False).count(),
+                "follow_ups_due": {
+                    "count": due.count(),
+                    "items": ApplicationListSerializer(due[:10], many=True).data,
+                },
                 "awaiting_action": {
                     "count": sum(by_status[s] for s in AWAITING_USER_ACTION),
                     "statuses": list(AWAITING_USER_ACTION),

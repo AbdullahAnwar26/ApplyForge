@@ -1,12 +1,12 @@
 /**
- * Jobs list: backend-supported filters only (no text search, no sorting - the
- * backend has neither; jobs are newest-discovered first), server pagination, and
+ * Jobs list: text search and backend-supported filters (no sorting - jobs are
+ * newest-discovered first), server pagination, and
  * an explicit, confirmed "re-screen all" action. Nothing is screened on load or
  * on a profile switch.
  */
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 
 import { applicationKeys } from "../../api/applications";
@@ -23,7 +23,7 @@ import {
   type Profile,
   type ScreenAllResult,
 } from "../../api/types";
-import { useApi } from "../../auth/TokenProvider";
+import { useApi } from "../../auth/AuthProvider";
 import { StatusBadge } from "../../components/Badge";
 import { Button } from "../../components/Button";
 import { DataTable, type Column } from "../../components/DataTable";
@@ -32,7 +32,7 @@ import { PageHeader } from "../../components/PageHeader";
 import { Pagination } from "../../components/Pagination";
 import { EmptyState, ErrorState } from "../../components/States";
 import { useToast } from "../../components/Toast";
-import { formatDate } from "../../lib/format";
+import { formatDate, placeLine } from "../../lib/format";
 import { JOB_SOURCE, JOB_STATUS, SCREENING_OUTCOME, SCREENING_REASON } from "../../lib/labels";
 import { useActiveProfile } from "../../profile/ActiveProfileProvider";
 import { RequireProfile } from "../../profile/ProfileControls";
@@ -70,12 +70,54 @@ function FilterSelect({
   );
 }
 
+/** Search box: applies after a short pause in typing, or at once on Enter. */
+function SearchBox({ value, onSearch }: { value: string; onSearch: (q: string | undefined) => void }) {
+  const id = useId();
+  const [text, setText] = useState(value);
+  // Follow outside changes of the URL (e.g. "Clear filters") without fighting the user's typing.
+  const [applied, setApplied] = useState(value);
+  if (value !== applied) {
+    setApplied(value);
+    if (value !== text.trim()) setText(value);
+  }
+  useEffect(() => {
+    const next = text.trim();
+    if (next === value) return;
+    const timer = window.setTimeout(() => onSearch(next || undefined), 400);
+    return () => window.clearTimeout(timer);
+  }, [text, value, onSearch]);
+  return (
+    <form
+      className="field filters__search"
+      role="search"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSearch(text.trim() || undefined);
+      }}
+    >
+      <label htmlFor={id} className="field__label">
+        Search
+      </label>
+      <input
+        id={id}
+        type="search"
+        className="input input--compact"
+        placeholder="Title, company, location or a word from the description"
+        value={text}
+        maxLength={200}
+        onChange={(event) => setText(event.target.value)}
+      />
+    </form>
+  );
+}
+
 function Filters({ params, profile, onChange }: { params: JobListParams; profile: Profile; onChange: (changes: Partial<JobListParams>) => void }) {
   const api = useApi();
   const companies = useQuery({ queryKey: companyKeys.all, queryFn: ({ signal }) => listCompanies(api, signal) });
 
   return (
     <section className="filters" aria-label="Filters">
+      <SearchBox value={params.q ?? ""} onSearch={(q) => onChange({ q })} />
       <FilterSelect
         label="Screening"
         value={params.outcome ?? ""}
@@ -223,7 +265,7 @@ function JobList({ profile }: { profile: Profile }) {
           <Link className="job-cell__title" to={`/jobs/${job.id}`} state={{ from: location.search }}>
             {job.title}
           </Link>
-          <span className="muted">{[job.company?.name, job.location, job.work_mode].filter(Boolean).join(" · ") || "Company not given"}</span>
+          <span className="muted">{placeLine(job) || "Company not given"}</span>
         </div>
       ),
     },

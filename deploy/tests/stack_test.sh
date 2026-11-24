@@ -77,16 +77,19 @@ echo "== nginx -t (the real deployment config)"
 t "nginx -t accepts the deployment configuration" 0 "${PIPESTATUS[0]}"
 
 echo "== Django in production mode (fictional secrets, throwaway SQLite), migrate + collectstatic"
-TOKEN="fictional-stack-token-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+PW="Fictional-Stack-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 export DEBUG=False APPLYFORGE_DOTENV=/nonexistent/applyforge-no-dotenv
-export SECRET_KEY="fictional-$(od -An -N40 -tx1 /dev/urandom | tr -d ' \n')" API_TOKEN="$TOKEN"
+export SECRET_KEY="fictional-$(od -An -N40 -tx1 /dev/urandom | tr -d ' \n')"
 export DATABASE_URL="sqlite:///$S/stack.sqlite3" ALLOWED_HOSTS=applyforge.vpn.example
-export CSRF_TRUSTED_ORIGINS=https://applyforge.vpn.example CORS_ALLOWED_ORIGINS=
+# The test reaches nginx on port 18443, so that origin is trusted too (CSRF Referer/Origin check).
+export CSRF_TRUSTED_ORIGINS=https://applyforge.vpn.example,https://applyforge.vpn.example:18443 CORS_ALLOWED_ORIGINS=
 export SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https SECURE_HSTS_INCLUDE_SUBDOMAINS=False SECURE_HSTS_PRELOAD=False
 export STATIC_ROOT="$S/static" MEDIA_ROOT="$S/media" PYTHONDONTWRITEBYTECODE=1
 cd "$REPO/backend"
 "$VENV/bin/python" manage.py migrate --noinput >"$S/logs/migrate.log" 2>&1; t "migrate (throwaway SQLite)" 0 $?
 "$VENV/bin/python" manage.py collectstatic --noinput >"$S/logs/collectstatic.log" 2>&1; t "collectstatic into STATIC_ROOT" 0 $?
+STACK_PW="$PW" "$VENV/bin/python" manage.py shell -c "import os; from django.contrib.auth import get_user_model; get_user_model().objects.create_user('stack-user', password=os.environ['STACK_PW'])" >"$S/logs/user.log" 2>&1
+t "fictional test account created" 0 $?
 "$VENV/bin/python" manage.py check --deploy >"$S/logs/check.log" 2>&1
 has "check --deploy: only the two intentional HSTS warnings" "W005" "$(cat "$S/logs/check.log")"
 hasnt "check --deploy: no other warnings/errors" "W0(0[0-46-9]|1|2[02-9])|E[0-9]{3}" "$(grep -oE '\((security|[a-z_]+)\.[WE][0-9]+\)' "$S/logs/check.log" | grep -v -e W005 -e W021)"
@@ -134,24 +137,34 @@ t "exactly one HSTS header on API responses" 1 "$(grep -ci '^strict-transport-se
 has "health never cached" '^cache-control: .*no-store' "$HH"
 t "spoofed X-Forwarded-Proto: http is overwritten (no redirect)" 200 "$(code -H 'X-Forwarded-Proto: http' "$U/api/v1/health/")"
 t "spoofed X-Forwarded-Ssl/Protocol cleared (no 400)" 200 "$(code -H 'X-Forwarded-Ssl: off' -H 'X-Forwarded-Protocol: http' "$U/api/v1/health/")"
-t "API without token -> 401" 401 "$(code "$U/api/v1/profiles/")"
-t "API with token -> 200" 200 "$(code -H "Authorization: Bearer $TOKEN" "$U/api/v1/profiles/")"
-t "collector run history readable (GET) -> 200" 200 "$(code -H "Authorization: Bearer $TOKEN" "$U/api/v1/collector/runs/")"
+t "API signed out -> 401" 401 "$(code "$U/api/v1/profiles/")"
+J="$S/tmp/cookies.txt"
+$C -c "$J" -o /dev/null "$U/api/v1/auth/csrf/"
+CSRF=$(awk '$6=="csrftoken"{print $7}' "$J")
+t "login without the CSRF header -> 403" 403 "$(code -b "$J" -H 'Content-Type: application/json' -d '{"username":"stack-user","password":"x"}' "$U/api/v1/auth/login/")"
+t "sign in through nginx -> 200" 200 "$(code -b "$J" -c "$J" -H "X-CSRFToken: $CSRF" -H "Referer: $U/" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"stack-user\",\"password\":\"$PW\"}" "$U/api/v1/auth/login/")"
+has "session cookie is HttpOnly" 'HttpOnly' "$(grep -i sessionid "$J" | head -1 | cut -c1-10)"
+CSRF=$(awk '$6=="csrftoken"{print $7}' "$J")   # rotated at sign-in
+AUTH=(-b "$J" -H "X-CSRFToken: $CSRF" -H "Referer: $U/")
+t "API signed in -> 200" 200 "$(code "${AUTH[@]}" "$U/api/v1/profiles/")"
+t "collector run history readable (GET) -> 200" 200 "$(code "${AUTH[@]}" "$U/api/v1/collector/runs/")"
+t "write without the CSRF header -> 403" 403 "$(code -b "$J" -H 'Content-Type: application/json' -d '{"name":"x","target_roles":"y"}' "$U/api/v1/profiles/")"
 has "Gunicorn access log shows the real client (X-Forwarded-For)" '^127\.0\.0\.1 "GET /api/v1/health/' "$(cat "$S/logs/gunicorn.log")"
 
 echo "== collector and generation disabled at nginx (incl. bypass attempts)"
 for p in /api/v1/collector/runs/ /api/v1/collector/runs /api/v1/collector/%72uns/ //api/v1/collector/runs/ /api/v1/collector/./runs/ /api/v1/collector/runs.json; do
-  t "POST $p -> 403" 403 "$(code -X POST -H "Authorization: Bearer $TOKEN" "$U$p")"
+  t "POST $p -> 403" 403 "$(code -X POST "${AUTH[@]}" "$U$p")"
 done
 for m in PUT PATCH DELETE OPTIONS; do t "$m collector -> 403" 403 "$(code -X $m "$U/api/v1/collector/runs/")"; done
 t "collector 403 body is JSON detail" '{"detail":"Collection is disabled on this server."}' "$($C -X POST "$U/api/v1/collector/runs/")"
 for p in /api/v1/applications/1/generate/ /api/v1/applications/1/generate /api/v1/applications/%201/generate/ /api/v1/applications/1/generate.json //api/v1/applications/1/generate/; do
-  t "POST $p -> 403" 403 "$(code -X POST -H "Authorization: Bearer $TOKEN" "$U$p")"
+  t "POST $p -> 403" 403 "$(code -X POST "${AUTH[@]}" "$U$p")"
 done
 
 echo "== request limits"
 head -c $((13*1024*1024)) /dev/zero > "$S/tmp/big.bin"
-t "13 MiB upload -> 413 (client_max_body_size 12m)" 413 "$(code -X POST -H "Authorization: Bearer $TOKEN" -F "file=@$S/tmp/big.bin" "$U/api/v1/resumes/")"
+t "13 MiB upload -> 413 (client_max_body_size 12m)" 413 "$(code -X POST "${AUTH[@]}" -F "file=@$S/tmp/big.bin" "$U/api/v1/resumes/")"
 
 echo "== HTTP redirect, unknown hosts, VPN allowlist"
 t "HTTP -> 301" 301 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: applyforge.vpn.example' http://127.0.0.2:18080/jobs)"

@@ -86,7 +86,11 @@ class Command(BaseCommand):
             help="Search keywords (repeatable or comma-separated). Default: profile target roles.",
         )
         parser.add_argument("--limit", type=int, default=None, help="Maximum posts to process.")
-        parser.add_argument("--profile", type=int, default=None, help="Profile id (required if several exist).")
+        parser.add_argument(
+            "--user", default=None,
+            help="Account (username) the collected jobs belong to; required when several accounts exist.",
+        )
+        parser.add_argument("--profile", type=int, default=None, help="Profile id (required if the account has several).")
         parser.add_argument("--json", action="store_true", help="Print the full result as JSON.")
         parser.add_argument(
             "--attribute-inventory", action="store_true",
@@ -105,14 +109,15 @@ class Command(BaseCommand):
             self._inventory_only(options)
             return  # never reaches the profile lookup, run_collection or ingestion
         source = self._build_source(options)
-        profile = self._get_profile(options["profile"])
+        owner = self._get_owner(options["user"])
+        profile = self._get_profile(options["profile"], owner)
         keywords = None
         if options["keywords"]:
             keywords = [k for value in options["keywords"] for k in value.split(",")]
 
         try:
             run, result = record_collection(
-                source, trigger=CollectorRunTrigger.COMMAND,
+                source, trigger=CollectorRunTrigger.COMMAND, owner=owner,
                 keywords=keywords, profile=profile, limit=options["limit"],
             )
         except (ScreeningInputError, CollectionInputError) as exc:
@@ -192,11 +197,30 @@ class Command(BaseCommand):
             raise CommandError("--file is required with --source file.")
         return JsonFilePostSource(options["file"])
 
-    def _get_profile(self, profile_id):
+    def _get_owner(self, username):
+        """The account the run and its jobs belong to: --user, or the only account."""
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        if username:
+            user = User.objects.filter(username__iexact=username).first()
+            if user is None:
+                raise CommandError(f"No account named {username!r}.")
+            return user
+        users = list(User.objects.order_by("id")[:2])
+        if not users:
+            # Before anyone has signed up: collect into the unowned pool, which the first
+            # account to sign up receives (tracker.accounts.claim_unowned_data).
+            return None
+        if len(users) > 1:
+            raise CommandError("Several accounts exist. Pass --user <username>.")
+        return users[0]
+
+    def _get_profile(self, profile_id, owner):
         if profile_id is None:
             return None
         try:
-            return Profile.objects.get(pk=profile_id)
+            return Profile.objects.get(pk=profile_id, owner=owner)
         except Profile.DoesNotExist:
             raise CommandError(f"Profile {profile_id} does not exist.")
 
