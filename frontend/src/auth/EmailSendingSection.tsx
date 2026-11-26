@@ -101,6 +101,15 @@ function AccountForm({ account, mode, draftsMode }: { account: SendingAccount | 
             : `Test mode: this server keeps emails and drafts locally (${mode}) instead of using your mailbox.`}
         </p>
       )}
+      {account?.app_password_ok === false && (
+        <p className="notice notice--error" role="alert">
+          The saved password is not a Google app password, so Gmail refuses it. Create one at{" "}
+          <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">
+            myaccount.google.com/apppasswords
+          </a>{" "}
+          (2-Step Verification must be on), paste the 16 letters into “New app password” below and Save.
+        </p>
+      )}
       {account?.verified_at && <p className="notice notice--success">Working: test email sent {formatDateTime(account.verified_at)}.</p>}
       {account?.last_error && (
         <p className="notice notice--error" role="alert">

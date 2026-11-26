@@ -426,6 +426,8 @@ export interface SendingAccount {
   drafts_server: string;
   /** Your provider's web page listing drafts ("" = unknown, or this server's test mailbox). */
   drafts_page: string;
+  /** Gmail: false when the saved password cannot be a Google app password (Gmail will refuse it). */
+  app_password_ok?: boolean | null;
   has_password: boolean;
   verified_at: string | null;
   last_error: string;

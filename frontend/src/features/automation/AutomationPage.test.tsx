@@ -278,6 +278,14 @@ describe("3. apply in one click", () => {
     expect(backend.calls.filter((c) => c.method === "POST" && c.path === "applications/80/compose/")).toHaveLength(2);
   });
 
+  it("warns before sending when the saved Gmail password is not an app password", async () => {
+    setup({ applications: [WRITTEN], sendingAccount: { ...GMAIL, app_password_ok: false } }, "/automation?step=apply");
+    const card = within((await screen.findByRole("link", { name: "Python Backend Developer" })).closest("li")!);
+    expect(await card.findByRole("link", { name: "Replace it with an app password" })).toHaveAttribute("href", "/account#email-sending");
+    expect(card.queryByRole("button", { name: "Send email" })).not.toBeInTheDocument();
+    expect(card.getByRole("button", { name: "Send WhatsApp" })).toBeInTheDocument(); // WhatsApp needs no password
+  });
+
   it("asks for the country code instead of guessing", async () => {
     const unknown = { ...WRITTEN, recipient_phone: "98765 43210", whatsapp: { number: "", note: "", problem: "The number has no country code." } };
     setup({ applications: [unknown], sendingAccount: GMAIL }, "/automation?step=apply");

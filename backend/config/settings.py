@@ -426,7 +426,7 @@ CELERY_TIMEZONE = TIME_ZONE
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.3"))
-OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "768"))
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "1500"))  # room for a full 180-280 word email + WhatsApp
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
 
 # Follow-up reminder set when an application is marked SENT (days ahead; the user can change it).

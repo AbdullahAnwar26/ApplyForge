@@ -20,6 +20,7 @@ from tracker.generation import (
     parse_generated_content,
 )
 from tracker.models import (
+    SendingAccount,
     Application,
     ApplicationEvent,
     Company,
@@ -35,7 +36,11 @@ from tracker.models import (
 from .helpers import APITestCase, make_pdf_bytes, upload
 
 URLOPEN = "tracker.generation.urllib.request.urlopen"
-GOOD = {"subject": "Application: Backend Engineer", "body": "Dear Ms Smith,\n\nI am Jane Doe...\n\nJane Doe",
+# Neutral sentences (no job words, no technologies) that bring a test email over the minimum
+# length (generation.MIN_EMAIL_WORDS) without changing what the test checks.
+FILLER = " ".join(["I take care to communicate clearly and to keep every commitment I make to colleagues."] * 10)
+GOOD = {"subject": "Application: Backend Engineer",
+        "body": f"Dear Ms Smith,\n\nI am Jane Doe...\n\n{FILLER}\n\nJane Doe",
         "whatsapp_message": "Hi Ms Smith, I'm Jane Doe - interested in the Backend Engineer role."}
 
 
@@ -60,7 +65,7 @@ class SettingsTests(SimpleTestCase):
         self.assertEqual(settings.OLLAMA_BASE_URL, "http://localhost:11434/v1")
         self.assertEqual(settings.OLLAMA_MODEL, "qwen3:1.7b")
         self.assertEqual(settings.OLLAMA_TEMPERATURE, 0.3)
-        self.assertEqual(settings.OLLAMA_MAX_TOKENS, 768)
+        self.assertEqual(settings.OLLAMA_MAX_TOKENS, 1500)  # raised for full-length emails
         self.assertEqual(settings.OLLAMA_TIMEOUT_SECONDS, 180)
 
 
@@ -182,6 +187,49 @@ class GenerationAPITestCase(APITestCase):
 
     def reload(self):
         return Application.objects.get(pk=self.app.pk)
+
+
+class FullEmailTests(GenerationAPITestCase):
+    """A real, job-specific email: matching skills and contact in the prompt, ATS rules, and
+    a short draft is retried once (with the reason), never padded or silently accepted."""
+
+    SHORT = {"subject": "Application: Backend Engineer - Jane Doe", "body": "Dear Ms Smith,\nBackend Engineer at Acme.\nJane Doe",
+             "whatsapp_message": ""}
+
+    def prompt(self, urlopen, call=0):
+        return json.loads(urlopen.call_args_list[call].args[0].data)["messages"]
+
+    def test_prompt_has_matching_skills_contact_and_ats_rules(self):
+        SendingAccount.objects.create(owner=self.user, from_email="jane@example.org", smtp_host="smtp.example.org",
+                                      username="jane@example.org")
+        _, urlopen = self.generate()
+        system, user = (m["content"] for m in self.prompt(urlopen))
+        self.assertIn("<matching_skills>\nDjango (also in the resume), Python (profile only)\n</matching_skills>", user)
+        self.assertIn("<candidate_contact>\nEmail: jane@example.org\n</candidate_contact>", user)
+        self.assertIn("applicant tracking systems (ATS)", system)
+        self.assertIn("170-260 words", system)
+        self.assertIn("no clichés", system)
+        self.assertIn("Sound like a real person wrote it", system)
+        self.assertIn("\"leverage\"", system)
+
+    def test_short_draft_is_retried_once_with_the_reason(self):
+        replies = [ollama_reply(json.dumps(self.SHORT)), ollama_reply(json.dumps(GOOD))]
+        with mock.patch(URLOPEN, side_effect=replies) as urlopen:
+            response = self.client.post(self.url, {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(urlopen.call_count, 2)
+        retry = self.prompt(urlopen, 1)
+        self.assertEqual(retry[-2]["role"], "assistant")
+        self.assertIn("170-260 words", retry[-1]["content"])
+        self.assertEqual(self.reload().generated_body, GOOD["body"])
+
+    def test_short_twice_saves_nothing(self):
+        replies = [ollama_reply(json.dumps(self.SHORT)), ollama_reply(json.dumps(self.SHORT))]
+        with mock.patch(URLOPEN, side_effect=replies):
+            response = self.client.post(self.url, {}, format="json")
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("only", response.data["detail"])
+        self.assertIsNone(self.reload().generated_body)  # no padded or template email
 
 
 class GenerateSuccessTests(GenerationAPITestCase):
@@ -405,7 +453,7 @@ class BuildMessagesUnitTests(GenerationAPITestCase):
         self.app.contact = None
         messages, jd_cut, resume_cut = build_messages(self.app, "resume text", config())
         user = messages[1]["content"]
-        self.assertIn("Dear Hiring Team", user)
+        self.assertIn("greet with 'Hello,'", user)
         self.assertIn("Location: (not provided)", user)
         self.assertFalse(jd_cut or resume_cut)
 
@@ -436,7 +484,7 @@ class JobSpecificGenerationTests(GenerationAPITestCase):
         self.assertIn("too long", response.data["detail"])
 
     def test_generic_draft_is_rejected(self):
-        generic = {"subject": "Job application", "body": "Dear Hiring Team,\n\nPlease consider me.\n\nJane Doe",
+        generic = {"subject": "Job application", "body": f"Dear Hiring Team,\n\nPlease consider me. {FILLER}\n\nJane Doe",
                    "whatsapp_message": ""}
         response, _ = self.generate(json.dumps(generic))
         self.assertEqual(response.status_code, 502)
@@ -445,7 +493,7 @@ class JobSpecificGenerationTests(GenerationAPITestCase):
         self.assertIsNone(self.reload().generated_body)
 
     def test_company_name_counts_as_job_specific(self):
-        reply = {"subject": "Application to Acme", "body": "Dear Ms Smith,\nI would like to join Acme.\nJane Doe"}
+        reply = {"subject": "Application to Acme", "body": f"Dear Ms Smith,\nI would like to join Acme. {FILLER}\nJane Doe"}
         response, _ = self.generate(json.dumps(reply))
         self.assertEqual(response.status_code, 200, response.data)
 
@@ -458,7 +506,7 @@ class JobSpecificGenerationTests(GenerationAPITestCase):
 
     def test_gaps_and_unsupported_terms_are_recorded(self):
         reply = {**GOOD, "body": "Dear Ms Smith,\nI have built Backend Engineer systems with Django and Kubernetes "
-                                 "on AWS.\nJane Doe", "gaps": ["Kubernetes", "  PostgreSQL  ", 42]}
+                                 f"on AWS. {FILLER}\nJane Doe", "gaps": ["Kubernetes", "  PostgreSQL  ", 42]}
         response, _ = self.generate(json.dumps(reply))
         self.assertEqual(response.status_code, 200, response.data)
         notes = response.data["application"]["generation_notes"]
@@ -497,7 +545,7 @@ class JobSpecificGenerationTests(GenerationAPITestCase):
         other_job.contacts.add(self.contact)
         other = Application.objects.create(profile=self.profile, job=other_job, contact=self.contact)
         self.generate()
-        reply = {"subject": "Data Engineer application", "body": "Dear Ms Smith,\nGlobex data work.\nJane Doe"}
+        reply = {"subject": "Data Engineer application", "body": f"Dear Ms Smith,\nGlobex data work. {FILLER}\nJane Doe"}
         with mock.patch(URLOPEN, return_value=ollama_reply(json.dumps(reply))) as urlopen:
             self.client.post(f"/api/v1/applications/{other.id}/generate/", {}, format="json")
         user = json.loads(urlopen.call_args.args[0].data)["messages"][1]["content"]

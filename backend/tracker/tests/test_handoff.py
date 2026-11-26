@@ -18,7 +18,7 @@ from django.db import IntegrityError, transaction
 from django.test import override_settings
 from django.utils import timezone
 
-from tracker.credentials import decrypt
+from tracker.credentials import decrypt, encrypt
 from tracker.models import Application, ApplicationEvent, JobStatus, SendingAccount, SendRecord
 from tracker.mailbox import _parse_list, drafts_page_url, imap_host_for
 
@@ -422,6 +422,15 @@ class ImapMailboxTests(HandoffTestCase):
         self.assertEqual(decrypt(stored), "fictional-app-password")  # nothing saved
         body["password"] = "ABCD EFGH IJKL MNOP"
         self.assertEqual(self.client.put(self.account_url, body, format="json").status_code, 200)
+
+    def test_account_says_when_the_saved_gmail_password_is_not_an_app_password(self):
+        # Saved earlier (before the check existed): a normal password.
+        SendingAccount.objects.filter(owner=self.user).update(password_encrypted=encrypt("Normal#Pw9"))
+        self.assertIs(self.client.get(self.account_url).data["account"]["app_password_ok"], False)
+        SendingAccount.objects.filter(owner=self.user).update(password_encrypted=encrypt("abcd efgh ijkl mnop"))
+        self.assertIs(self.client.get(self.account_url).data["account"]["app_password_ok"], True)
+        SendingAccount.objects.filter(owner=self.user).update(smtp_host="smtp.fictional-mail.example")
+        self.assertIsNone(self.client.get(self.account_url).data["account"]["app_password_ok"])
 
     def test_login_refusal_says_what_to_do(self):
         FakeImap.fail_login = True

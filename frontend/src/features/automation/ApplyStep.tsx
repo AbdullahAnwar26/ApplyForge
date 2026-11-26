@@ -177,6 +177,14 @@ function ChannelButton({ application, channel, hasMessage }: { application: Appl
       </div>
     );
   }
+  if (email && account.data?.account?.app_password_ok === false) {
+    return (
+      <p className="apply-channel small notice notice--warning">
+        Gmail will refuse your saved password: it is not a Google app password (16 letters).{" "}
+        <Link to="/account#email-sending">Replace it with an app password</Link>
+      </p>
+    );
+  }
   const needsAccount = email && account.data && !account.data.account;
   if (needsAccount) {
     return (
@@ -215,6 +223,7 @@ function ApplyCard({ application }: { application: ApplicationSummary }) {
   });
   const d = detail.data;
   const hasWhatsApp = Boolean(d?.generated_whatsapp_message && application.recipient_phone);
+
   return (
     <li className="apply-card">
       <div className="apply-card__head">

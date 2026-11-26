@@ -28,12 +28,21 @@ from rest_framework import serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from tracker.credentials import encrypt
+from tracker.credentials import CredentialError, decrypt, encrypt
 from tracker.mailbox import app_password, drafts_page_url, imap_host_for, local_mode
 from tracker.models import SendingAccount, SendRecord, SmtpSecurity
 from tracker.sending import SendingError, check_mailbox, email_sending_mode, send_test_email
 
 from .ownership import OwnedModelSerializer, OwnedSerializer
+
+
+def is_gmail(host):
+    return (host or "").strip().lower().endswith(("gmail.com", "googlemail.com"))
+
+
+def looks_like_app_password(password):
+    """A Google app password: exactly 16 letters (shown as four groups of four)."""
+    return bool(re.fullmatch(r"[a-z]{16}", app_password(password or "").strip().lower()))
 
 
 def drafts_mode():
@@ -55,19 +64,31 @@ class SendingAccountSerializer(OwnedModelSerializer):
     drafts_server = serializers.SerializerMethodField()
     # The provider's web page listing drafts ("" = unknown provider, or the local test mailbox).
     drafts_page = serializers.SerializerMethodField()
+    # Gmail only: False when the saved password cannot be a Google app password (16 letters),
+    # so the login will be refused. None for other providers.
+    app_password_ok = serializers.SerializerMethodField()
 
     class Meta:
         model = SendingAccount
         fields = ["from_name", "from_email", "smtp_host", "smtp_port", "security", "username", "password",
-                  "imap_host", "imap_port", "drafts_server", "drafts_page", "has_password", "verified_at", "last_error",
+                  "imap_host", "imap_port", "drafts_server", "drafts_page", "app_password_ok", "has_password", "verified_at", "last_error",
                   "updated_at"]
-        read_only_fields = ["has_password", "drafts_server", "drafts_page", "verified_at", "last_error", "updated_at"]
+        read_only_fields = ["has_password", "drafts_server", "drafts_page", "app_password_ok", "verified_at", "last_error", "updated_at"]
 
     def get_has_password(self, account):
         return bool(account.password_encrypted)
 
     def get_drafts_server(self, account):
         return imap_host_for(account)
+
+    def get_app_password_ok(self, account):
+        if not is_gmail(account.smtp_host) or not account.password_encrypted:
+            return None
+        try:
+            password = decrypt(account.password_encrypted)
+        except CredentialError:
+            return False
+        return looks_like_app_password(password)
 
     def get_drafts_page(self, account):
         return "" if local_mode() else drafts_page_url(account)
@@ -139,9 +160,8 @@ class EmailAccountView(APIView):
         if account is None and not password:
             return Response({"password": ["Enter the password (an app password for Gmail/Outlook)."]},
                             status=status.HTTP_400_BAD_REQUEST)
-        host = str(data.get("smtp_host") or (account.smtp_host if account else "")).lower()
-        if password is not None and host.endswith(("gmail.com", "googlemail.com")) \
-                and not re.fullmatch(r"[a-z]{16}", app_password(password).strip().lower()):
+        host = str(data.get("smtp_host") or (account.smtp_host if account else ""))
+        if password is not None and is_gmail(host) and not looks_like_app_password(password):
             # Gmail refuses normal passwords for app logins; an app password is always 16 letters.
             return Response({"password": [
                 "This is not a Google app password (those are exactly 16 letters, e.g. “abcd efgh ijkl mnop”). "
